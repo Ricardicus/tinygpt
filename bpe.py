@@ -58,7 +58,7 @@ class BPE:
         """
 
         vocab = set(ch for word in self.data for ch in word)
-        other_chars = ['\'', '"', '<', '-', '>','?', '!']
+        other_chars = ['\'', '"', '<', '-', '>','?', '!', ':']
         for ch in other_chars:
             vocab.add(ch)
         iteration = 0

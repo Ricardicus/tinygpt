@@ -138,6 +138,9 @@ class TinyGPT(nn.Module):
         # Stack of transformer layers
         self.layers = nn.ModuleList([TransformerBlock(d_model, n_heads) for _ in range(num_layers)])
 
+        # Final normalization
+        self.final_ln = LayerNorm(d_model)
+
     def forward(self, token_ids):
         B, C = token_ids.shape
 
@@ -151,4 +154,9 @@ class TinyGPT(nn.Module):
         for layer in self.layers:
             x = layer(x)
 
-        return x
+        # Final normalization
+        x = self.final_ln(x)
+
+        # Weight-tied projection to logits
+        logits = x @ self.E.T
+        return logits

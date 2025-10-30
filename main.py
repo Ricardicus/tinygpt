@@ -5,6 +5,7 @@ import argparse
 import os
 import sys
 from itertools import islice
+import time
 
 from datareader import PagedDataReader
 from bpe import BPE
@@ -16,7 +17,7 @@ from tinygpt import TinyGPT
 # ---------------------------------------------------------
 default_tokenizer = "tokenizer.json"
 default_bpe_part = 0.01
-default_model_n_heads = 8
+default_model_n_heads = 5
 default_model_d_dim = 240
 default_vocab_size = 1920
 default_model_context_length = 64
@@ -135,8 +136,7 @@ def generate(model, bpe, prompt, max_new_tokens=50, device="cpu"):
     for _ in range(max_new_tokens):
         # Trim to context length if too long
         x = ids[:, -model.context_length:]
-        out = model(x)  # (1, C, d_model)
-        logits = out @ model.E.T  # project to vocab
+        logits = model(x)  # (1, C, d_model)
         next_token_logits = logits[:, -1, :]  # last position
         probs = torch.softmax(next_token_logits, dim=-1)
         next_id = torch.multinomial(probs, num_samples=1)
@@ -163,6 +163,7 @@ def parse_args(argv=None):
     parser.add_argument("--num-layers", type=int, default=6, help="Number of transformer layers.")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate.")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size (approximate, streaming).")
+    parser.add_argument("--model-path", type=str, default="models/model.pt", help="Where to store the model data.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device.")
 
     parser.add_argument("--model", type=str, default=None,
@@ -173,7 +174,6 @@ def parse_args(argv=None):
                     help="Maximum number of tokens to generate during inference.")
     return parser.parse_args(argv)
 
-
 def main(argv=None):
     args = parse_args(argv)
 
@@ -182,9 +182,89 @@ def main(argv=None):
         print(f"Vocab size: {args.vocab_size}")
         print(f"Context length: {args.context_length}")
         print(f"Num layers: {args.num_layers}")
+        print(f"Embedding dimension: {args.d_model}")
+        print(f"Heads: {args.n_heads}")
         print(f"Device: {args.device}")
 
-    # --- Data + tokenizer ---
+    # --- Initialize model ---
+    model = TinyGPT(
+        vocab_size=args.vocab_size,
+        context_length=args.context_length,
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        num_layers=args.num_layers
+    ).to(args.device)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total trainable parameters: {num_params:,}")
+
+    start_epoch = 0
+    mean_loss = 0.0
+
+    # ---------------------------------------------------------
+    # Try to load checkpoint if args.model_path exists
+    # ---------------------------------------------------------
+    if os.path.exists(args.model_path):
+        print(f"Found existing model checkpoint at: {args.model_path}")
+        try:
+            checkpoint = torch.load(args.model_path, map_location=args.device)
+
+            # Validate key hyperparameters
+            ckpt_model = checkpoint.get("model_state_dict", None)
+            if ckpt_model is not None:
+                # Attempt to infer shapes from the saved weights
+                ckpt_d_model = next(iter(ckpt_model.values())).shape[-1] if ckpt_model else None
+                ckpt_num_layers = sum(1 for k in ckpt_model.keys() if "transformer_blocks" in k and "attn" in k)
+                ckpt_n_heads = None  # can’t reliably infer from weights unless saved manually
+
+                # Compare only those we can check reliably
+                mismatch_reasons = []
+                if ckpt_d_model and ckpt_d_model != args.d_model:
+                    mismatch_reasons.append(f"d_model mismatch (checkpoint={ckpt_d_model}, current={args.d_model})")
+                if ckpt_num_layers and ckpt_num_layers != args.num_layers:
+                    mismatch_reasons.append(f"num_layers mismatch (checkpoint={ckpt_num_layers}, current={args.num_layers})")
+
+                if mismatch_reasons:
+                    print("⚠️ Checkpoint not loaded due to architecture mismatch:")
+                    for reason in mismatch_reasons:
+                        print(f"   - {reason}")
+                    print("A new model will be trained and overwrite this checkpoint.\n")
+                else:
+                    model.load_state_dict(checkpoint["model_state_dict"])
+                    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                    start_epoch = checkpoint.get("epoch", 0)
+                    mean_loss = checkpoint.get("loss", 0.0)
+                    print(f"✅ Loaded checkpoint from epoch {start_epoch}, mean loss={mean_loss:.4f}")
+            else:
+                print("⚠️ Checkpoint found but missing model_state_dict — skipping load.")
+        except Exception as e:
+            print(f"⚠️ Failed to load checkpoint: {e}")
+            print("A new model will be trained and overwrite the existing file.\n")
+    else:
+        print("No existing checkpoint found. Training from scratch.\n")
+
+    # ---------------------------------------------------------
+    # --- Inference mode ---
+    # ---------------------------------------------------------
+    if args.model and args.prompt:
+        model.eval()
+        bpe = getBPE([],
+                     vocab_size=args.vocab_size,
+                     verbose=args.verbose,
+                     tokenizer_path=args.tokenizer,
+                     bpe_part=args.bpe_part,
+                     lower_case=args.lower_case)
+        prompt = "[inst] " + args.prompt.lower() + " [/inst]"
+        result = generate(model, bpe, prompt, args.max_new_tokens, args.device)
+        print("\n--- Generated Text ---")
+        result = result.replace("</w>", " ")
+        print(result)
+        return  # skip training
+
+    # ---------------------------------------------------------
+    # --- Training setup ---
+    # ---------------------------------------------------------
     datareader = getData(verbose=args.verbose, lower_case=args.lower_case)
     bpe = getBPE(datareader,
                  vocab_size=args.vocab_size,
@@ -193,44 +273,33 @@ def main(argv=None):
                  bpe_part=args.bpe_part,
                  lower_case=args.lower_case)
 
-    # --- Inference mode ---
-    if args.model and args.prompt:
-        print(f"Loading model from {args.model} for inference...")
-        model = TinyGPT(vocab_size=args.vocab_size,
-                        context_length=args.context_length,
-                        d_model=args.d_model,
-                        n_heads=args.n_heads,
-                        num_layers=args.num_layers).to(args.device)
-        model.load_state_dict(torch.load(args.model, map_location=args.device))
-        print("Model loaded successfully.")
-        result = generate(model, bpe, args.prompt, args.max_new_tokens, args.device)
-        print("\n--- Generated Text ---")
-        print(result)
-        return  # skip training
-
-    # --- Model ---
-    model = TinyGPT(vocab_size=args.vocab_size,
-                    context_length=args.context_length,
-                    d_model=args.d_model,
-                    num_layers=args.num_layers).to(args.device)
-
     loss_fn = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total trainable parameters: {num_params:,}")
-
-    # --- Training ---
     model.train()
-    for epoch in range(args.epochs):
+
+    # ---------------------------------------------------------
+    # --- Training loop ---
+    # ---------------------------------------------------------
+    for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         total_loss, step = 0.0, 0
+        mean_loss = 0.0
 
         for x, y in stream_batches(datareader, bpe, args.context_length, args.batch_size):
             x, y = x.to(args.device), y.to(args.device)
 
-            out = model(x)  # (B, C, d_model)
-            logits = out @ model.E.T  # tied weights: (B, C, vocab_size)
+            # --- Measure inference (forward) time ---
+            if args.device.startswith("cuda"):
+                torch.cuda.synchronize()
+            start_time = time.time()
+
+            logits = model(x)  # forward pass
+
+            if args.device.startswith("cuda"):
+                torch.cuda.synchronize()
+            end_time = time.time()
+            inference_time = end_time - start_time
+
+            # --- Compute loss and backprop ---
             loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
 
             optimizer.zero_grad()
@@ -242,15 +311,21 @@ def main(argv=None):
 
             if args.verbose and step % 10 == 0:
                 avg_loss = total_loss / step
-                print(f"Step {step:6d} | Avg Loss: {avg_loss:.4f}")
+                print(f"Step {step:6d} | Avg Loss: {avg_loss:.4f} | Inference: {inference_time:.4f}s")
 
-        print(f"Epoch {epoch+1} complete | Mean loss: {total_loss / max(1, step):.4f}")
+        mean_loss = total_loss / max(1, step)
+        print(f"Epoch {epoch+1} complete | Mean loss: {mean_loss:.4f}")
 
-    # --- Save model ---
-    torch.save(model.state_dict(), "tinygpt.pt")
-    if args.verbose:
-        print("Model saved to tinygpt.pt")
+        # --- Save model checkpoint ---
+        os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
+        torch.save({
+            "epoch": epoch + 1,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "loss": mean_loss,
+        }, args.model_path)
 
+        print(f"💾 Checkpoint saved to {args.model_path}")
 
 # ---------------------------------------------------------
 if __name__ == "__main__":
