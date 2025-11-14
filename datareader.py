@@ -218,3 +218,86 @@ class PagedDataReader:
     def file_spans(self) -> List[Tuple[str, int, int]]:
         """Return a compact summary of file ranges: (filename, start_index, length)."""
         return [(fp.name, start, length) for fp, length, start in self._file_index]
+
+
+class TextCorpusReader:
+    """
+    Efficient reader for large raw text corpora.
+
+    - Can read from a folder (all .txt files) or an explicit list of file paths.
+    - Streams lines or paragraphs (depending on `delimiter`).
+    - Designed for very large datasets that cannot fit in memory.
+
+    Parameters
+    ----------
+    sources : str | List[str]
+        Folder containing text files or explicit list of paths.
+    lower_case : bool, default=True
+        Whether to convert text to lowercase.
+    delimiter : Optional[str], default=None
+        Split text on this delimiter. If None, yields one line per entry.
+    encoding : str, default="utf-8"
+        Encoding for reading text files.
+    """
+
+    def __init__(
+        self,
+        sources: Optional[List[str] | str] = "data",
+        lower_case: bool = True,
+        delimiter: Optional[str] = None,
+        encoding: str = "utf-8",
+    ):
+        self.lower_case = lower_case
+        self.delimiter = delimiter
+        self.encoding = encoding
+
+        # Resolve sources
+        if isinstance(sources, (str, Path)):
+            folder = Path(sources)
+            if not folder.exists() or not folder.is_dir():
+                raise FileNotFoundError(f"Folder {folder} does not exist or is not a directory.")
+            self.files = sorted(str(p) for p in folder.glob("*.txt"))
+        elif isinstance(sources, (list, tuple)):
+            self.files = [str(Path(p)) for p in sources]
+        else:
+            raise TypeError("sources must be a folder path or list of file paths")
+
+        if not self.files:
+            raise FileNotFoundError("No text files found.")
+
+        # Optionally precompute line counts (lazy by default)
+        self._length: Optional[int] = None
+
+    # --------------------- Iteration ---------------------
+    def __iter__(self) -> Iterator[str]:
+        for path in self.files:
+            with open(path, "r", encoding=self.encoding) as f:
+                if self.delimiter is None:
+                    for line in f:
+                        text = line.strip()
+                        if not text:
+                            continue
+                        yield text.lower() if self.lower_case else text
+                else:
+                    buffer = f.read()
+                    for chunk in buffer.split(self.delimiter):
+                        text = chunk.strip()
+                        if text:
+                            yield text.lower() if self.lower_case else text
+
+    # --------------------- Optional utilities ---------------------
+    def __len__(self) -> int:
+        """Count total text entries (lazy; reads file headers if not cached)."""
+        if self._length is None:
+            self._length = sum(1 for _ in self)
+        return self._length
+
+    def __getitem__(self, index: int) -> str:
+        """Access by index (inefficient for very large corpora)."""
+        for i, text in enumerate(self):
+            if i == index:
+                return text
+        raise IndexError("Index out of range")
+
+    def __repr__(self):
+        return f"<TextCorpusReader: {len(self.files)} files, delimiter={'lines' if not self.delimiter else repr(self.delimiter)}>"

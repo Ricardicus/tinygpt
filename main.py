@@ -7,7 +7,7 @@ import sys
 from itertools import islice
 import time
 
-from datareader import PagedDataReader
+from datareader import PagedDataReader, TextCorpusReader
 from bpe import BPE
 from tinygpt import TinyGPT
 
@@ -39,7 +39,7 @@ def str2bool(v):
 def getData(verbose=True, lower_case=True):
     if verbose:
         print("Initializing data reader...")
-    datareader = PagedDataReader("data", lower_case=lower_case)
+    datareader = TextCorpusReader("rawdata", lower_case=lower_case)
     if verbose:
         print(f"DataReader ready: {len(datareader)} entries")
     return datareader
@@ -178,6 +178,7 @@ def main(argv=None):
     args = parse_args(argv)
 
     if args.verbose:
+        print(args)
         print(f"Tokenizer path: {args.tokenizer}")
         print(f"Vocab size: {args.vocab_size}")
         print(f"Context length: {args.context_length}")
@@ -255,7 +256,7 @@ def main(argv=None):
                      tokenizer_path=args.tokenizer,
                      bpe_part=args.bpe_part,
                      lower_case=args.lower_case)
-        prompt = "[inst] " + args.prompt.lower() + " [/inst]"
+        prompt = args.prompt.lower()
         result = generate(model, bpe, prompt, args.max_new_tokens, args.device)
         print("\n--- Generated Text ---")
         result = result.replace("</w>", " ")
