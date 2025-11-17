@@ -3,13 +3,20 @@ import time
 from collections import Counter
 from datetime import timedelta, datetime
 
+
 class BPE:
-    def __init__(self, vocab_size=1000, verbose=False, model_file="bpe_model.json", lower_case=True):
+    def __init__(
+        self,
+        vocab_size=1000,
+        verbose=False,
+        model_file="bpe_model.json",
+        lower_case=True,
+    ):
         self.vocab_size = vocab_size
-        self.merges = {}          # Dict of (a, b) => freq_at_merge
-        self.vocab = {}           # Token -> ID mapping
-        self.rev_vocab = {}       # ID -> Token mapping
-        self.data = []            # Accumulated training data
+        self.merges = {}  # Dict of (a, b) => freq_at_merge
+        self.vocab = {}  # Token -> ID mapping
+        self.rev_vocab = {}  # ID -> Token mapping
+        self.data = []  # Accumulated training data
         self.verbose = verbose
         self.model_file = model_file  # default save/load path
         self.lower_case = lower_case
@@ -27,8 +34,8 @@ class BPE:
         """Count frequency of symbol pairs."""
         pairs = Counter()
         for word in self.data:
-            for i in range(len(word)-1):
-                pairs[(word[i], word[i+1])] += 1
+            for i in range(len(word) - 1):
+                pairs[(word[i], word[i + 1])] += 1
         return pairs
 
     def merge_vocab(self, pair):
@@ -39,7 +46,7 @@ class BPE:
             merged = []
             i = 0
             while i < len(word):
-                if i < len(word) - 1 and word[i] == pair[0] and word[i+1] == pair[1]:
+                if i < len(word) - 1 and word[i] == pair[0] and word[i + 1] == pair[1]:
                     merged.append(new_symbol)
                     i += 2
                 else:
@@ -58,7 +65,7 @@ class BPE:
         """
 
         vocab = set(ch for word in self.data for ch in word)
-        other_chars = ['\'', '"', '<', '-', '>','?', '!', ':']
+        other_chars = ["'", '"', "<", "-", ">", "?", "!", ":"]
         for ch in other_chars:
             vocab.add(ch)
         iteration = 0
@@ -72,7 +79,9 @@ class BPE:
                 break
 
             # Select top-k pairs to merge this round
-            top_k = sorted(pairs.items(), key=lambda x: x[1], reverse=True)[:batch_merges]
+            top_k = sorted(pairs.items(), key=lambda x: x[1], reverse=True)[
+                :batch_merges
+            ]
 
             # Merge them sequentially in descending frequency order
             for (a, b), freq in top_k:
@@ -92,7 +101,7 @@ class BPE:
                     f"\rBPE training... {pct}% "
                     f"(iteration {iteration}, merged {len(self.merges)} pairs, "
                     f"batch size={batch_merges}, time={elapsed:.2f}s)",
-                    end=""
+                    end="",
                 )
 
             # stop if we reached vocab target
@@ -104,9 +113,10 @@ class BPE:
         self.rev_vocab = {i: tok for tok, i in self.vocab.items()}
 
         if self.verbose:
-            print(f"\nBPE training complete: {len(self.vocab)} tokens, {len(self.merges)} merges.")
+            print(
+                f"\nBPE training complete: {len(self.vocab)} tokens, {len(self.merges)} merges."
+            )
         return len(vocab) == self.vocab_size
-
 
     def encode_word(self, word):
         """Encode a single word using learned merges."""
@@ -118,7 +128,7 @@ class BPE:
             i = 0
             while i < len(symbols) - 1:
                 if symbols[i] == a and symbols[i + 1] == b:
-                    symbols[i:i+2] = [a + b]
+                    symbols[i : i + 2] = [a + b]
                 else:
                     i += 1
 
@@ -141,7 +151,7 @@ class BPE:
         text = ""
         for tok in tokens:
             if tok == "</w>":
-                text += " "   # end of word → space
+                text += " "  # end of word → space
             else:
                 text += tok
         return text.strip()
@@ -188,7 +198,7 @@ class BPE:
 
         # rebuild merges as a dict { (a,b): freq }
         raw_merges = payload.get("merges", [])
-        self.merges = { (a, b): int(freq) for a, b, freq in raw_merges }
+        self.merges = {(a, b): int(freq) for a, b, freq in raw_merges}
 
         # vocab: token -> id
         self.vocab = {str(k): int(v) for k, v in payload.get("vocab", {}).items()}

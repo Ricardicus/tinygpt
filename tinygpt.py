@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+
 class LayerNorm(nn.Module):
     def __init__(self, d_model, eps=1e-5):
         super().__init__()
@@ -28,15 +29,22 @@ class LayerNorm(nn.Module):
         out = self.gamma * x_hat + self.beta
         return out
 
+
 class SelfAttention(nn.Module):
     def __init__(self, d_model):
         super().__init__()
         self.d_model = d_model
 
         # Learnable projection matrices
-        self.W_q = nn.Parameter(torch.randn(d_model, d_model) * (1 / math.sqrt(d_model)))
-        self.W_k = nn.Parameter(torch.randn(d_model, d_model) * (1 / math.sqrt(d_model)))
-        self.W_v = nn.Parameter(torch.randn(d_model, d_model) * (1 / math.sqrt(d_model)))
+        self.W_q = nn.Parameter(
+            torch.randn(d_model, d_model) * (1 / math.sqrt(d_model))
+        )
+        self.W_k = nn.Parameter(
+            torch.randn(d_model, d_model) * (1 / math.sqrt(d_model))
+        )
+        self.W_v = nn.Parameter(
+            torch.randn(d_model, d_model) * (1 / math.sqrt(d_model))
+        )
 
     def forward(self, x):
         """
@@ -50,15 +58,16 @@ class SelfAttention(nn.Module):
 
         # scaled dot-product attention
         scores = (Q @ K.transpose(-2, -1)) / math.sqrt(d)
-        
+
         # causal mask: prevent looking ahead
         mask = torch.tril(torch.ones(C, C, device=x.device))
-        scores = scores.masked_fill(mask == 0, float('-inf'))
+        scores = scores.masked_fill(mask == 0, float("-inf"))
 
         attn_weights = F.softmax(scores, dim=-1)
         attn_out = attn_weights @ V  # (B, C, d_model)
 
         return attn_out
+
 
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, d_model, num_heads):
@@ -83,11 +92,13 @@ class MultiHeadSelfAttention(nn.Module):
         Q, K, V = qkv[0], qkv[1], qkv[2]  # each (B, num_heads, C, d_head)
 
         # Compute attention scores
-        attn_scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.d_head)  # (B, num_heads, C, C)
+        attn_scores = (Q @ K.transpose(-2, -1)) / math.sqrt(
+            self.d_head
+        )  # (B, num_heads, C, C)
 
         # Apply causal mask (prevent attending to future tokens)
         mask = torch.tril(torch.ones(C, C, device=x.device))
-        attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
+        attn_scores = attn_scores.masked_fill(mask == 0, float("-inf"))
 
         # Softmax and attention output
         attn_weights = F.softmax(attn_scores, dim=-1)
@@ -99,6 +110,7 @@ class MultiHeadSelfAttention(nn.Module):
         # Final linear projection
         return self.W_o(attn_out)
 
+
 class FeedForward(nn.Module):
     def __init__(self, d_model, expansion=4):
         super().__init__()
@@ -108,6 +120,7 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.fc2(F.gelu(self.fc1(x)))
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, d_model, d_heads):
@@ -122,8 +135,11 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.ln2(x))
         return x
 
+
 class TinyGPT(nn.Module):
-    def __init__(self, vocab_size=1920, context_length=256, d_model=512, n_heads=8, num_layers=6):
+    def __init__(
+        self, vocab_size=1920, context_length=256, d_model=512, n_heads=8, num_layers=6
+    ):
         super().__init__()
         self.vocab_size = vocab_size
         self.context_length = context_length
@@ -136,7 +152,9 @@ class TinyGPT(nn.Module):
         self.pos_E = nn.Parameter(torch.randn(context_length, d_model) * 0.02)
 
         # Stack of transformer layers
-        self.layers = nn.ModuleList([TransformerBlock(d_model, n_heads) for _ in range(num_layers)])
+        self.layers = nn.ModuleList(
+            [TransformerBlock(d_model, n_heads) for _ in range(num_layers)]
+        )
 
         # Final normalization
         self.final_ln = LayerNorm(d_model)
