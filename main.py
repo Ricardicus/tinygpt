@@ -40,7 +40,9 @@ def str2bool(v):
 def getData(verbose=True, lower_case=True):
     if verbose:
         print("Initializing data reader...")
-    datareader = TextCorpusReader("rawdata", lower_case=lower_case)
+    datareader = TextCorpusReader(
+        "rawdata", lower_case=lower_case, to_new_lines=["kjv.txt"]
+    )
     if verbose:
         print(f"DataReader ready: {len(datareader)} entries")
     return datareader
@@ -215,7 +217,7 @@ def generate(model, bpe, prompt, max_new_tokens=50, device="cpu"):
 
 # ---------------------------------------------------------
 # Argument parsing
-# ---------------------------------------------------------
+# ------------------------------------self.chunked_file_readers.append(ChunkedFile(file, self.buffer_size))---------------------
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Train TinyGPT using a BPE tokenizer with streaming data."
@@ -282,7 +284,7 @@ def parse_args(argv=None):
         help="Batch size (approximate, streaming).",
     )
     parser.add_argument(
-        "--model-path",
+        "--model",
         type=str,
         default="models/model.pt",
         help="Where to store the model data.",
@@ -292,13 +294,6 @@ def parse_args(argv=None):
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Compute device.",
-    )
-
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Path to a trained model (.pt) for inference.",
     )
     parser.add_argument(
         "--prompt",
@@ -325,6 +320,7 @@ def main(argv=None):
         print(f"Context length: {args.context_length}")
         print(f"Num layers: {args.num_layers}")
         print(f"Embedding dimension: {args.d_model}")
+        print(f"Learning rate: {args.lr}")
         print(f"Heads: {args.n_heads}")
         print(f"Device: {args.device}")
 
@@ -386,12 +382,12 @@ def main(argv=None):
     mean_loss = 0.0
 
     # ---------------------------------------------------------
-    # Try to load checkpoint if args.model_path exists
+    # Try to load checkpoint if args.model exists
     # ---------------------------------------------------------
-    if os.path.exists(args.model_path):
-        print(f"Found existing model checkpoint at: {args.model_path}")
+    if os.path.exists(args.model):
+        print(f"Found existing model checkpoint at: {args.model}")
         try:
-            checkpoint = torch.load(args.model_path, map_location=args.device)
+            checkpoint = torch.load(args.model, map_location=args.device)
 
             # Validate key hyperparameters
             ckpt_model = checkpoint.get("model_state_dict", None)
@@ -506,7 +502,7 @@ def main(argv=None):
         print(f"Epoch {epoch+1} complete | Mean loss: {mean_loss:.4f}")
 
         # --- Save model checkpoint ---
-        os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
+        os.makedirs(os.path.dirname(args.model), exist_ok=True)
         torch.save(
             {
                 "epoch": epoch + 1,
@@ -514,10 +510,10 @@ def main(argv=None):
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": mean_loss,
             },
-            args.model_path,
+            args.model,
         )
 
-        print(f"💾 Checkpoint saved to {args.model_path}")
+        print(f"💾 Checkpoint saved to {args.model}")
 
 
 # ---------------------------------------------------------

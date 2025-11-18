@@ -1,8 +1,11 @@
 import os
+import sys
 import json
 import random
+import re
 from pathlib import Path
 from typing import Iterator, List, Tuple, Optional, Iterable, TypeVar
+from typing import Optional, List, Iterator
 
 T = TypeVar("T")
 
@@ -239,6 +242,95 @@ class PagedDataReader:
         return [(fp.name, start, length) for fp, length, start in self._file_index]
 
 
+class ChunkedFile:
+    def __init__(
+        self, file_path, buffer_size, to_new_line=False, round_off_at_whitespace=True
+    ):
+        self.file_path = file_path
+        self.buffer_size = buffer_size
+        self.to_new_line = to_new_line
+        self.round_off_at_whitespace = round_off_at_whitespace
+
+        # Read entire file content
+        with open(file_path, "rb") as f:
+            self.data = f.read()
+
+        if self.to_new_line:
+            # Split into lines (newline removed)
+            self.chunks = self.data.split(b"\n")
+
+            # If enabled, collapse whitespace inside each line
+            if self.round_off_at_whitespace:
+                collapsed = []
+                for line in self.chunks:
+                    # Collapse any run of whitespace into one space
+                    line = re.sub(rb"\s+", b" ", line.strip())
+                    collapsed.append(line)
+                self.chunks = collapsed
+
+            self.num_chunks = len(self.chunks)
+
+        elif self.round_off_at_whitespace:
+            # 1) Normalize whitespace: collapse runs of whitespace to a single space.
+            normalized = re.sub(rb"\s+", b" ", self.data.strip())
+
+            # 2) Build chunks that are ~buffer_size but never cut words in half.
+            self.chunks = []
+            n = len(normalized)
+            pos = 0
+
+            while pos < n:
+                # If remaining is smaller than buffer_size, take all of it.
+                if pos + self.buffer_size >= n:
+                    self.chunks.append(normalized[pos:])
+                    break
+
+                window_end = pos + self.buffer_size
+
+                # Try to find last space within [pos, window_end]
+                split_pos = normalized.rfind(b" ", pos, window_end + 1)
+
+                if split_pos == -1 or split_pos == pos:
+                    # No space in the window (e.g., very long word) or
+                    # the only space is at the start; extend to next space after window.
+                    next_space = normalized.find(b" ", window_end + 1)
+                    if next_space == -1:
+                        # No more spaces at all → last chunk
+                        self.chunks.append(normalized[pos:])
+                        break
+                    else:
+                        # Chunk up to that next space
+                        self.chunks.append(normalized[pos:next_space])
+                        pos = next_space + 1
+                else:
+                    # Found a space inside the window; cut there.
+                    self.chunks.append(normalized[pos:split_pos])
+                    pos = split_pos + 1
+
+            self.num_chunks = len(self.chunks)
+
+        else:
+            # Original fixed-size chunks
+            self.num_chunks = (len(self.data) + buffer_size - 1) // buffer_size
+
+    def __getitem__(self, index):
+        if not isinstance(index, int) or index < 0:
+            raise IndexError("Index must be a non-negative integer.")
+        if index >= self.num_chunks:
+            raise IndexError("Chunk index out of range.")
+
+        if self.to_new_line or self.round_off_at_whitespace:
+            # In both these modes we precomputed self.chunks
+            return self.chunks[index]
+        else:
+            start = index * self.buffer_size
+            end = start + self.buffer_size
+            return self.data[start:end]
+
+    def __len__(self):
+        return self.num_chunks
+
+
 # -------------------------------------------------------------
 # TextCorpusReader (raw txt files)
 # -------------------------------------------------------------
@@ -255,10 +347,16 @@ class TextCorpusReader:
         lower_case: bool = True,
         delimiter: Optional[str] = None,
         encoding: str = "utf-8",
+        buffer_size: int = 240,
+        shuffle=True,
+        to_new_lines=[],
+        round_off_at_whitespace=True,
     ):
         self.lower_case = lower_case
         self.delimiter = delimiter
         self.encoding = encoding
+        self.buffer_size = buffer_size
+        self.shuffle = shuffle
 
         if isinstance(sources, (str, Path)):
             folder = Path(sources)
@@ -275,33 +373,55 @@ class TextCorpusReader:
         if not self.files:
             raise FileNotFoundError("No text files found.")
 
+        self.chunked_file_readers = []
+        for file in self.files:
+            if os.path.basename(file) in to_new_lines:
+                self.chunked_file_readers.append(
+                    ChunkedFile(
+                        file,
+                        self.buffer_size,
+                        to_new_line=True,
+                        round_off_at_whitespace=round_off_at_whitespace,
+                    )
+                )
+            else:
+                self.chunked_file_readers.append(
+                    ChunkedFile(
+                        file,
+                        self.buffer_size,
+                        round_off_at_whitespace=round_off_at_whitespace,
+                    )
+                )
         self._length: Optional[int] = None
 
     # Iteration
     def __iter__(self) -> Iterator[str]:
-        for path in self.files:
-            with open(path, "r", encoding=self.encoding) as f:
-                if self.delimiter is None:
-                    for line in f:
-                        text = line.strip()
-                        if text:
-                            yield text.lower() if self.lower_case else text
-                else:
-                    buffer = f.read()
-                    for chunk in buffer.split(self.delimiter):
-                        text = chunk.strip()
-                        if text:
-                            yield text.lower() if self.lower_case else text
+        pairs = []
+        for i in range(len(self.chunked_file_readers)):
+            size = len(self.chunked_file_readers[i])
+            for n in range(size):
+                pairs.append((i, n))
 
-    def iter(self, shuffle=False, buffer_size=10_000):
+        if self.shuffle:
+            random.shuffle(pairs)
+
+        for pair in pairs:
+            reader, index = pair
+            data = self.chunked_file_readers[reader][index].decode(
+                self.encoding, errors="ignore"
+            )
+            if self.lower_case:
+                data = data.lower()
+            yield data
+
+    def iter(self, buffer_size=10_000):
         """Optional shuffled iteration."""
-        base = self.__iter__()
-        return shuffled_stream(base, buffer_size) if shuffle else base
+        return self.__iter__()
 
     # Length
     def __len__(self) -> int:
         if self._length is None:
-            self._length = sum(1 for _ in self)
+            self._length = sum(len(x) for x in self.chunked_file_readers)
         return self._length
 
     # Indexing (inefficient)
