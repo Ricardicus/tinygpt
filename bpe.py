@@ -177,8 +177,6 @@ class BPE:
         data = {
             "vocab_size": self.vocab_size,
             "vocab": self.vocab,
-            # save merges as list of [a, b, freq] for portability
-            "merges": [[a, b, freq] for (a, b), freq in self.merges.items()],
         }
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
