@@ -259,6 +259,13 @@ class ChunkedFile:
             # Split into lines (newline removed)
             self.chunks = self.data.split(b"\n")
 
+            # Remove almost empty lines
+            chunks = []
+            for chunk in self.chunks:
+                if len(chunk) > 2:
+                    chunks.append(chunk)
+            self.chunks = chunks
+
             # If enabled, collapse whitespace inside each line
             if self.round_off_at_whitespace:
                 collapsed = []

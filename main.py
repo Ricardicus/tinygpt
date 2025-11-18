@@ -37,11 +37,11 @@ def str2bool(v):
     raise argparse.ArgumentTypeError("Boolean value expected for --verbose")
 
 
-def getData(verbose=True, lower_case=True):
+def getData(verbose=True, lower_case=True, rawdata_folder="rawdata", oneliners=[]):
     if verbose:
         print("Initializing data reader...")
     datareader = TextCorpusReader(
-        "rawdata", lower_case=lower_case, to_new_lines=["kjv.txt"]
+        rawdata_folder, lower_case=lower_case, to_new_lines=oneliners
     )
     if verbose:
         print(f"DataReader ready: {len(datareader)} entries")
@@ -290,6 +290,18 @@ def parse_args(argv=None):
         help="Where to store the model data.",
     )
     parser.add_argument(
+        "--rawdata",
+        type=str,
+        default="rawdata",
+        help="Folder where raw text corpus data resides.",
+    )
+    parser.add_argument(
+        "--oneliners",
+        type=str,
+        default="",
+        help="Files that are best read one at a time as text corpus",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -444,7 +456,11 @@ def main(argv=None):
     # ---------------------------------------------------------
     # --- Data & tokenizer ---
     # ---------------------------------------------------------
-    datareader = getData(verbose=args.verbose, lower_case=args.lower_case)
+    oneliners = []
+    for arg in args.oneliners.split(","):
+        if len(arg) > 0:
+            oneliners.append(arg)
+    datareader = getData(verbose=args.verbose, lower_case=args.lower_case, rawdata_folder=args.rawdata, oneliners=oneliners)
     bpe = getBPE(
         datareader,
         vocab_size=args.vocab_size,
