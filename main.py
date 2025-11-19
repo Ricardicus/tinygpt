@@ -340,6 +340,16 @@ def main(argv=None):
     # --- Inference-only mode (skip training) ---
     # ---------------------------------------------------------
     if args.model and args.prompt:
+        # Load existing tokenizer
+        bpe = getBPE(
+            [],
+            vocab_size=args.vocab_size,
+            verbose=args.verbose,
+            tokenizer_path=args.tokenizer,
+            bpe_part=args.bpe_part,
+            lower_case=args.lower_case,
+        )
+        args.vocab_size = bpe.vocab_size
         # Initialize model with CLI hyperparameters
         model = TinyGPT(
             vocab_size=args.vocab_size,
@@ -358,18 +368,8 @@ def main(argv=None):
             # Allow plain state_dict as well
             model.load_state_dict(checkpoint)
 
-        # Load existing tokenizer
-        bpe = getBPE(
-            [],
-            vocab_size=args.vocab_size,
-            verbose=args.verbose,
-            tokenizer_path=args.tokenizer,
-            bpe_part=args.bpe_part,
-            lower_case=args.lower_case,
-        )
-
         prompt = args.prompt.lower() if args.lower_case else args.prompt
-        result = generate(model, bpe, prompt, args.max_new_tokens, args.device)
+        result = generate(model, bpe, prompt, args.context_length - 1, args.device)
         print("\n--- Generated Text ---")
         result = result.replace("</w>", " ")
         print(result)
@@ -378,6 +378,29 @@ def main(argv=None):
     # ---------------------------------------------------------
     # --- Training setup ---
     # ---------------------------------------------------------
+    # ---------------------------------------------------------
+    # --- Data & tokenizer ---
+    # ---------------------------------------------------------
+    oneliners = []
+    for arg in args.oneliners.split(","):
+        if len(arg) > 0:
+            oneliners.append(arg)
+    datareader = getData(
+        verbose=args.verbose,
+        lower_case=args.lower_case,
+        rawdata_folder=args.rawdata,
+        oneliners=oneliners,
+    )
+
+    bpe = getBPE(
+        datareader,
+        vocab_size=args.vocab_size,
+        verbose=args.verbose,
+        tokenizer_path=args.tokenizer,
+        bpe_part=args.bpe_part,
+        lower_case=args.lower_case,
+    )
+    args.vocab_size = bpe.vocab_size
     model = TinyGPT(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
@@ -452,23 +475,6 @@ def main(argv=None):
             print("A new model will be trained and overwrite the existing file.\n")
     else:
         print("No existing checkpoint found. Training from scratch.\n")
-
-    # ---------------------------------------------------------
-    # --- Data & tokenizer ---
-    # ---------------------------------------------------------
-    oneliners = []
-    for arg in args.oneliners.split(","):
-        if len(arg) > 0:
-            oneliners.append(arg)
-    datareader = getData(verbose=args.verbose, lower_case=args.lower_case, rawdata_folder=args.rawdata, oneliners=oneliners)
-    bpe = getBPE(
-        datareader,
-        vocab_size=args.vocab_size,
-        verbose=args.verbose,
-        tokenizer_path=args.tokenizer,
-        bpe_part=args.bpe_part,
-        lower_case=args.lower_case,
-    )
 
     loss_fn = nn.CrossEntropyLoss()
     model.train()
