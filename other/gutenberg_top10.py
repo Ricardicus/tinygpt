@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Download the 10 most-downloaded books from Project Gutenberg
+Download the most-downloaded books from Project Gutenberg
 (Top 100 EBooks last 7 days) as plain text, and save them with
 sane filenames in ./gutenberg_top10.
+
+Default: top 10
+Optional: --top50 to download the top 50.
 
 Requirements:
     pip install requests beautifulsoup4
@@ -30,6 +33,10 @@ HEADERS = {
 DOWNLOAD_DIR = "gutenberg_top10"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# Retry settings
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 10  # base delay between retries
+
 
 def slugify(text: str, maxlen: int = 80) -> str:
     """Turn a title into a filesystem-friendly slug."""
@@ -42,11 +49,51 @@ def slugify(text: str, maxlen: int = 80) -> str:
     return text[:maxlen]
 
 
-def get_top10_ebook_links():
-    """Return a list of (rank, title, url) tuples for the top 10 ebooks."""
+def get_with_retries(url: str, *, timeout: int, max_retries: int = MAX_RETRIES):
+    """
+    GET a URL with basic retry logic for transient errors (5xx, timeouts, etc).
+    Raises the last exception if all retries fail.
+    """
+    last_exc = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=timeout)
+            # Raise for 4xx/5xx
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+
+            # For non-transient 4xx errors (e.g. 404), don't bother retrying
+            if isinstance(e, requests.exceptions.HTTPError) and status is not None:
+                if 400 <= status < 500 and status != 429:
+                    print(f"  !! Non-retryable HTTP error {status} for {url}: {e}")
+                    raise
+
+            last_exc = e
+            if attempt == max_retries:
+                print(f"  !! Failed after {max_retries} attempts for {url}: {e}")
+                raise
+
+            delay = RETRY_BACKOFF_SECONDS * attempt
+            print(
+                f"  !! Error fetching {url} (attempt {attempt}/{max_retries}): {e} "
+                f"- retrying in {delay} seconds..."
+            )
+            time.sleep(delay)
+
+    # Should never get here, but just in case
+    if last_exc:
+        raise last_exc
+
+
+def get_top_ebook_links(max_rank: int = 50):
+    """
+    Return a list of (rank, title, url) tuples for the top `max_rank` ebooks.
+    """
     print(f"Fetching top list from {TOP_URL} ...")
-    resp = requests.get(TOP_URL, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
+    resp = get_with_retries(TOP_URL, timeout=30)
     soup = BeautifulSoup(resp.text, "html.parser")
 
     # Find the "Top 100 EBooks last 7 days" section, then the following <ol>
@@ -63,7 +110,7 @@ def get_top10_ebook_links():
 
     links = []
     for rank, li in enumerate(ol.find_all("li", recursive=False), start=1):
-        if rank > 10:
+        if rank > max_rank:
             break
         a = li.find("a", href=True)
         if not a:
@@ -100,8 +147,7 @@ def find_plain_text_link(ebook_page_html: str) -> str | None:
 
 def download_book(rank: int, title: str, ebook_url: str):
     print(f"[{rank:02d}] Fetching ebook page: {ebook_url}")
-    resp = requests.get(ebook_url, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
+    resp = get_with_retries(ebook_url, timeout=30)
 
     text_url = find_plain_text_link(resp.text)
     if not text_url:
@@ -109,8 +155,8 @@ def download_book(rank: int, title: str, ebook_url: str):
         return
 
     print(f"  -> Downloading plain text: {text_url}")
-    book_resp = requests.get(text_url, headers=HEADERS, timeout=60)
-    book_resp.raise_for_status()
+    # This is where you previously saw the 504; now it will retry.
+    book_resp = get_with_retries(text_url, timeout=60)
 
     # Build a nice filename: "01_Frankenstein_Or_The_Modern_Prometheus_by_Mary_Wollstonecraft_Shelley.txt"
     safe_title = slugify(title)
@@ -123,9 +169,9 @@ def download_book(rank: int, title: str, ebook_url: str):
     print(f"  -> Saved to {filepath}")
 
 
-def main():
-    top_books = get_top10_ebook_links()
-    print(f"Found {len(top_books)} top titles. Downloading the first 10...\n")
+def main(top_n: int):
+    top_books = get_top_ebook_links(max_rank=top_n)
+    print(f"Found {len(top_books)} top titles. Downloading the first {top_n}...\n")
 
     for rank, title, url in top_books:
         download_book(rank, title, url)
@@ -136,5 +182,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
 
+    parser = argparse.ArgumentParser(
+        description="Download top Project Gutenberg ebooks as plain text."
+    )
+    parser.add_argument(
+        "--top50",
+        action="store_true",
+        help="Download the top 50 instead of the default top 10.",
+    )
+
+    args = parser.parse_args()
+    top_n = 50 if args.top50 else 10
+
+    main(top_n)
