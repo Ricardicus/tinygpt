@@ -226,7 +226,7 @@ def parse_args(argv=None):
         "--tokenizer",
         type=str,
         default=default_tokenizer,
-        help="Path to tokenizer file (will load or create).",
+        help=f"Path to tokenizer file (will load or create). Default: {default_tokenizer}.",
     )
     parser.add_argument(
         "--vocab_size",
@@ -259,29 +259,34 @@ def parse_args(argv=None):
         "--context-length",
         type=int,
         default=default_model_context_length,
-        help="Context length (sequence length).",
+        help="Context length (sequence length). Default: {default_model_context_length}.",
     )
     parser.add_argument(
         "--d-model",
         type=int,
         default=default_model_d_dim,
-        help="Embedding size (model width).",
+        help=f"Embedding size (model width). Default {default_model_d_dim}",
     )
     parser.add_argument(
         "--n-heads",
         type=int,
         default=default_model_n_heads,
-        help="Number of heads in tranformer multi head self attention block.",
+        help=f"Number of heads in tranformer multi head self attention block. Default {default_model_n_heads}",
     )
     parser.add_argument(
-        "--num-layers", type=int, default=6, help="Number of transformer layers."
+        "--num-layers",
+        type=int,
+        default=6,
+        help="Number of transformer layers. Default 6.",
     )
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate.")
+    parser.add_argument(
+        "--lr", type=float, default=3e-4, help="Learning rate. Default 0.0003."
+    )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=16,
-        help="Batch size (approximate, streaming).",
+        help="Batch size (approximate, streaming). Default 16.",
     )
     parser.add_argument(
         "--model",
@@ -321,52 +326,84 @@ def parse_args(argv=None):
     )
     return parser.parse_args(argv)
 
-
 def main(argv=None):
     args = parse_args(argv)
 
     if args.verbose:
         print(args)
         print(f"Tokenizer path: {args.tokenizer}")
-        print(f"Vocab size: {args.vocab_size}")
-        print(f"Context length: {args.context_length}")
-        print(f"Num layers: {args.num_layers}")
-        print(f"Embedding dimension: {args.d_model}")
+        print(f"Vocab size (CLI): {args.vocab_size}")
+        print(f"Context length (CLI): {args.context_length}")
+        print(f"Num layers (CLI): {args.num_layers}")
+        print(f"Embedding dimension (CLI): {args.d_model}")
         print(f"Learning rate: {args.lr}")
-        print(f"Heads: {args.n_heads}")
+        print(f"Heads (CLI): {args.n_heads}")
         print(f"Device: {args.device}")
 
     # ---------------------------------------------------------
     # --- Inference-only mode (skip training) ---
     # ---------------------------------------------------------
-    if args.model and args.prompt:
-        # Load existing tokenizer
-        bpe = getBPE(
-            [],
-            vocab_size=args.vocab_size,
-            verbose=args.verbose,
-            tokenizer_path=args.tokenizer,
-            bpe_part=args.bpe_part,
-            lower_case=args.lower_case,
-        )
-        args.vocab_size = bpe.vocab_size
-        # Initialize model with CLI hyperparameters
-        model = TinyGPT(
-            vocab_size=args.vocab_size,
-            context_length=args.context_length,
-            d_model=args.d_model,
-            n_heads=args.n_heads,
-            num_layers=args.num_layers,
-        ).to(args.device)
-
-        # Load checkpoint from the provided model path
+    if args.prompt is not None:
         print(f"Loading model from '{args.model}' for inference...")
         checkpoint = torch.load(args.model, map_location=args.device)
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+
+        cfg = checkpoint.get("config") if isinstance(checkpoint, dict) else None
+
+        if cfg is not None:
+            # Use hyperparameters from checkpoint config
+            if args.verbose:
+                print("Using model config from checkpoint:")
+                print(cfg)
+
+            # Tokenizer: still driven by CLI for now, but vocab_size from cfg
+            bpe = getBPE(
+                [],
+                vocab_size=cfg["vocab_size"],
+                verbose=args.verbose,
+                tokenizer_path=args.tokenizer,
+                bpe_part=args.bpe_part,
+                lower_case=args.lower_case,
+            )
+
+            # Build model from saved config
+            model = TinyGPT(
+                vocab_size=cfg["vocab_size"],
+                context_length=cfg["context_length"],
+                d_model=cfg["d_model"],
+                n_heads=cfg["n_heads"],
+                num_layers=cfg["num_layers"],
+            ).to(args.device)
+
             model.load_state_dict(checkpoint["model_state_dict"])
+
         else:
-            # Allow plain state_dict as well
-            model.load_state_dict(checkpoint)
+            # Fallback: old checkpoints without a config, use CLI settings
+            if args.verbose:
+                print("No config found in checkpoint; falling back to CLI hyperparameters.")
+
+            bpe = getBPE(
+                [],
+                vocab_size=args.vocab_size,
+                verbose=args.verbose,
+                tokenizer_path=args.tokenizer,
+                bpe_part=args.bpe_part,
+                lower_case=args.lower_case,
+            )
+            args.vocab_size = bpe.vocab_size
+
+            model = TinyGPT(
+                vocab_size=args.vocab_size,
+                context_length=args.context_length,
+                d_model=args.d_model,
+                n_heads=args.n_heads,
+                num_layers=args.num_layers,
+            ).to(args.device)
+
+            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["model_state_dict"])
+            else:
+                # Allow plain state_dict as well
+                model.load_state_dict(checkpoint)
 
         prompt = args.prompt.lower() if args.lower_case else args.prompt
         result = generate(model, bpe, prompt, args.context_length - 1, args.device)
@@ -377,7 +414,6 @@ def main(argv=None):
 
     # ---------------------------------------------------------
     # --- Training setup ---
-    # ---------------------------------------------------------
     # ---------------------------------------------------------
     # --- Data & tokenizer ---
     # ---------------------------------------------------------
@@ -401,6 +437,8 @@ def main(argv=None):
         lower_case=args.lower_case,
     )
     args.vocab_size = bpe.vocab_size
+
+    # Build model from CLI (we may verify against checkpoint config below)
     model = TinyGPT(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
@@ -424,43 +462,67 @@ def main(argv=None):
         try:
             checkpoint = torch.load(args.model, map_location=args.device)
 
-            # Validate key hyperparameters
-            ckpt_model = checkpoint.get("model_state_dict", None)
-            if ckpt_model is not None:
-                # Attempt to infer shapes from the saved weights
-                ckpt_d_model = (
-                    next(iter(ckpt_model.values())).shape[-1] if ckpt_model else None
-                )
-                ckpt_num_layers = sum(
-                    1
-                    for k in ckpt_model.keys()
-                    if "transformer_blocks" in k and "attn" in k
-                )
-                ckpt_n_heads = (
-                    None  # can’t reliably infer from weights unless saved manually
-                )
+            ckpt_state = checkpoint.get("model_state_dict", None) if isinstance(checkpoint, dict) else None
+            ckpt_optim = checkpoint.get("optimizer_state_dict", None) if isinstance(checkpoint, dict) else None
+            ckpt_cfg = checkpoint.get("config", None) if isinstance(checkpoint, dict) else None
 
-                # Compare only those we can check reliably
+            if ckpt_state is not None:
                 mismatch_reasons = []
-                if ckpt_d_model and ckpt_d_model != args.d_model:
-                    mismatch_reasons.append(
-                        f"d_model mismatch (checkpoint={ckpt_d_model}, current={args.d_model})"
+
+                if ckpt_cfg is not None:
+                    # Prefer explicit config for compatibility checks
+                    if ckpt_cfg.get("d_model") != args.d_model:
+                        mismatch_reasons.append(
+                            f"d_model mismatch (checkpoint={ckpt_cfg.get('d_model')}, current={args.d_model})"
+                        )
+                    if ckpt_cfg.get("num_layers") != args.num_layers:
+                        mismatch_reasons.append(
+                            f"num_layers mismatch (checkpoint={ckpt_cfg.get('num_layers')}, current={args.num_layers})"
+                        )
+                    if ckpt_cfg.get("context_length") != args.context_length:
+                        mismatch_reasons.append(
+                            f"context_length mismatch (checkpoint={ckpt_cfg.get('context_length')}, current={args.context_length})"
+                        )
+                    if ckpt_cfg.get("vocab_size") != args.vocab_size:
+                        mismatch_reasons.append(
+                            f"vocab_size mismatch (checkpoint={ckpt_cfg.get('vocab_size')}, current={args.vocab_size})"
+                        )
+                    if ckpt_cfg.get("n_heads") != args.n_heads:
+                        mismatch_reasons.append(
+                            f"n_heads mismatch (checkpoint={ckpt_cfg.get('n_heads')}, current={args.n_heads})"
+                        )
+                else:
+                    # Fallback: old heuristic based on weights
+                    if args.verbose:
+                        print("No config in checkpoint; inferring architecture from weights.")
+                    ckpt_d_model = (
+                        next(iter(ckpt_state.values())).shape[-1] if ckpt_state else None
                     )
-                if ckpt_num_layers and ckpt_num_layers != args.num_layers:
-                    mismatch_reasons.append(
-                        f"num_layers mismatch (checkpoint={ckpt_num_layers}, current={args.num_layers})"
+                    ckpt_num_layers = sum(
+                        1
+                        for k in ckpt_state.keys()
+                        if "transformer_blocks" in k and "attn" in k
                     )
+                    # n_heads is still hard to infer reliably
+
+                    if ckpt_d_model and ckpt_d_model != args.d_model:
+                        mismatch_reasons.append(
+                            f"d_model mismatch (checkpoint={ckpt_d_model}, current={args.d_model})"
+                        )
+                    if ckpt_num_layers and ckpt_num_layers != args.num_layers:
+                        mismatch_reasons.append(
+                            f"num_layers mismatch (checkpoint={ckpt_num_layers}, current={args.num_layers})"
+                        )
 
                 if mismatch_reasons:
                     print("⚠️ Checkpoint not loaded due to architecture mismatch:")
                     for reason in mismatch_reasons:
                         print(f"   - {reason}")
-                    print(
-                        "A new model will be trained and overwrite this checkpoint.\n"
-                    )
+                    print("A new model will be trained and overwrite this checkpoint.\n")
                 else:
-                    model.load_state_dict(checkpoint["model_state_dict"])
-                    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                    model.load_state_dict(ckpt_state)
+                    if ckpt_optim is not None:
+                        optimizer.load_state_dict(ckpt_optim)
                     start_epoch = checkpoint.get("epoch", 0)
                     mean_loss = checkpoint.get("loss", 0.0)
                     print(
@@ -531,6 +593,13 @@ def main(argv=None):
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": mean_loss,
+                "config": {
+                    "vocab_size": model.vocab_size,
+                    "context_length": model.context_length,
+                    "d_model": model.d_model,
+                    "n_heads": model.n_heads,
+                    "num_layers": model.num_layers,
+                },
             },
             args.model,
         )
