@@ -428,6 +428,98 @@ def main(argv=None):
         oneliners=oneliners,
     )
 
+
+    start_epoch = 0
+    mean_loss = 0.0
+
+    # ---------------------------------------------------------
+    # Try to load checkpoint if args.model exists
+    # ---------------------------------------------------------
+    if os.path.exists(args.model):
+        print(f"Found existing model checkpoint at: {args.model}")
+        try:
+            checkpoint = torch.load(args.model, map_location=args.device)
+
+            if isinstance(checkpoint, dict):
+                ckpt_state = checkpoint.get("model_state_dict")
+                ckpt_optim = checkpoint.get("optimizer_state_dict")
+                ckpt_cfg   = checkpoint.get("config")
+            else:
+                ckpt_state = None
+                ckpt_optim = None
+                ckpt_cfg   = None
+
+            if ckpt_state is not None:
+                if ckpt_cfg is not None:
+                    # ✅ Use checkpoint config as source of truth
+                    if args.verbose:
+                        print("Using model hyperparameters from checkpoint:")
+                        for key in ckpt_cfg:
+                            print(f"{key} : {ckpt_cfg[key]}")
+
+                    args.vocab_size     = ckpt_cfg.get("vocab_size", args.vocab_size)
+                    args.context_length = ckpt_cfg.get("context_length", args.context_length)
+                    args.d_model        = ckpt_cfg.get("d_model", args.d_model)
+                    args.n_heads        = ckpt_cfg.get("n_heads", args.n_heads)
+                    args.num_layers     = ckpt_cfg.get("num_layers", args.num_layers)
+
+                    start_epoch = checkpoint.get("epoch", 0)
+                    mean_loss   = checkpoint.get("loss", 0.0)
+                    print(
+                        f"✅ Will resume from epoch {start_epoch}, "
+                        f"mean loss={mean_loss:.4f} using checkpoint config."
+                    )
+
+                else:
+                    # ⚠️ Old checkpoint without config → do the heuristic mismatch check
+                    mismatch_reasons = []
+
+                    if args.verbose:
+                        print("No config in checkpoint; inferring architecture from weights.")
+
+                    ckpt_d_model = (
+                        next(iter(ckpt_state.values())).shape[-1] if ckpt_state else None
+                    )
+                    ckpt_num_layers = sum(
+                        1
+                        for k in ckpt_state.keys()
+                        if "transformer_blocks" in k and "attn" in k
+                    )
+
+                    if ckpt_d_model and ckpt_d_model != args.d_model:
+                        mismatch_reasons.append(
+                            f"d_model mismatch (checkpoint={ckpt_d_model}, current={args.d_model})"
+                        )
+                    if ckpt_num_layers and ckpt_num_layers != args.num_layers:
+                        mismatch_reasons.append(
+                            f"num_layers mismatch (checkpoint={ckpt_num_layers}, current={args.num_layers})"
+                        )
+
+                    if mismatch_reasons:
+                        print("⚠️ Checkpoint will NOT be loaded due to architecture mismatch:")
+                        for reason in mismatch_reasons:
+                            print(f"   - {reason}")
+                        print("A new model will be trained and overwrite this checkpoint.\n")
+                        ckpt_state = None
+                        ckpt_optim = None
+                    else:
+                        start_epoch = checkpoint.get("epoch", 0)
+                        mean_loss   = checkpoint.get("loss", 0.0)
+                        print(
+                            f"✅ Will resume from epoch {start_epoch}, "
+                            f"mean loss={mean_loss:.4f} (no config, inferred match)."
+                        )
+            else:
+                print("⚠️ Checkpoint found but missing model_state_dict — skipping load.")
+
+        except Exception as e:
+            print(f"⚠️ Failed to load checkpoint: {e}")
+            print("A new model will be trained and overwrite the existing file.\n")
+            ckpt_state = None
+            ckpt_optim = None
+    else:
+        print("No existing checkpoint found. Training from scratch.\n")
+
     bpe = getBPE(
         datareader,
         vocab_size=args.vocab_size,
@@ -447,96 +539,14 @@ def main(argv=None):
         num_layers=args.num_layers,
     ).to(args.device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    if ckpt_state is not None:
+        model.load_state_dict(ckpt_state)
+        if ckpt_optim is not None:
+            optimizer.load_state_dict(ckpt_optim)
+        print("✅ Loaded model and optimizer state from checkpoint.")
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total trainable parameters: {num_params:,}")
-
-    start_epoch = 0
-    mean_loss = 0.0
-
-    # ---------------------------------------------------------
-    # Try to load checkpoint if args.model exists
-    # ---------------------------------------------------------
-    if os.path.exists(args.model):
-        print(f"Found existing model checkpoint at: {args.model}")
-        try:
-            checkpoint = torch.load(args.model, map_location=args.device)
-
-            ckpt_state = checkpoint.get("model_state_dict", None) if isinstance(checkpoint, dict) else None
-            ckpt_optim = checkpoint.get("optimizer_state_dict", None) if isinstance(checkpoint, dict) else None
-            ckpt_cfg = checkpoint.get("config", None) if isinstance(checkpoint, dict) else None
-
-            if ckpt_state is not None:
-                mismatch_reasons = []
-
-                if ckpt_cfg is not None:
-                    # Prefer explicit config for compatibility checks
-                    if ckpt_cfg.get("d_model") != args.d_model:
-                        mismatch_reasons.append(
-                            f"d_model mismatch (checkpoint={ckpt_cfg.get('d_model')}, current={args.d_model})"
-                        )
-                    if ckpt_cfg.get("num_layers") != args.num_layers:
-                        mismatch_reasons.append(
-                            f"num_layers mismatch (checkpoint={ckpt_cfg.get('num_layers')}, current={args.num_layers})"
-                        )
-                    if ckpt_cfg.get("context_length") != args.context_length:
-                        mismatch_reasons.append(
-                            f"context_length mismatch (checkpoint={ckpt_cfg.get('context_length')}, current={args.context_length})"
-                        )
-                    if ckpt_cfg.get("vocab_size") != args.vocab_size:
-                        mismatch_reasons.append(
-                            f"vocab_size mismatch (checkpoint={ckpt_cfg.get('vocab_size')}, current={args.vocab_size})"
-                        )
-                    if ckpt_cfg.get("n_heads") != args.n_heads:
-                        mismatch_reasons.append(
-                            f"n_heads mismatch (checkpoint={ckpt_cfg.get('n_heads')}, current={args.n_heads})"
-                        )
-                else:
-                    # Fallback: old heuristic based on weights
-                    if args.verbose:
-                        print("No config in checkpoint; inferring architecture from weights.")
-                    ckpt_d_model = (
-                        next(iter(ckpt_state.values())).shape[-1] if ckpt_state else None
-                    )
-                    ckpt_num_layers = sum(
-                        1
-                        for k in ckpt_state.keys()
-                        if "transformer_blocks" in k and "attn" in k
-                    )
-                    # n_heads is still hard to infer reliably
-
-                    if ckpt_d_model and ckpt_d_model != args.d_model:
-                        mismatch_reasons.append(
-                            f"d_model mismatch (checkpoint={ckpt_d_model}, current={args.d_model})"
-                        )
-                    if ckpt_num_layers and ckpt_num_layers != args.num_layers:
-                        mismatch_reasons.append(
-                            f"num_layers mismatch (checkpoint={ckpt_num_layers}, current={args.num_layers})"
-                        )
-
-                if mismatch_reasons:
-                    print("⚠️ Checkpoint not loaded due to architecture mismatch:")
-                    for reason in mismatch_reasons:
-                        print(f"   - {reason}")
-                    print("A new model will be trained and overwrite this checkpoint.\n")
-                else:
-                    model.load_state_dict(ckpt_state)
-                    if ckpt_optim is not None:
-                        optimizer.load_state_dict(ckpt_optim)
-                    start_epoch = checkpoint.get("epoch", 0)
-                    mean_loss = checkpoint.get("loss", 0.0)
-                    print(
-                        f"✅ Loaded checkpoint from epoch {start_epoch}, mean loss={mean_loss:.4f}"
-                    )
-            else:
-                print(
-                    "⚠️ Checkpoint found but missing model_state_dict — skipping load."
-                )
-        except Exception as e:
-            print(f"⚠️ Failed to load checkpoint: {e}")
-            print("A new model will be trained and overwrite the existing file.\n")
-    else:
-        print("No existing checkpoint found. Training from scratch.\n")
 
     loss_fn = nn.CrossEntropyLoss()
     model.train()
