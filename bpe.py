@@ -94,7 +94,7 @@ class BPE:
             iteration += 1
 
             # --- progress output ---
-            if self.verbose and iteration % 5 == 0:
+            if self.verbose:
                 elapsed = time.time() - start_time
                 pct = int(len(vocab) / max(self.vocab_size, 1) * 100)
                 print(
