@@ -435,6 +435,7 @@ def main(argv=None):
     # ---------------------------------------------------------
     # Try to load checkpoint if args.model exists
     # ---------------------------------------------------------
+    ckpt_state = None
     if os.path.exists(args.model):
         print(f"Found existing model checkpoint at: {args.model}")
         try:
