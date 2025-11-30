@@ -121,6 +121,8 @@ class BPE:
     def encode_word(self, word):
         """Encode a single word using learned merges."""
         # Start with characters + end-of-word marker
+        if self.lower_case:
+            word = word.lower()
         symbols = list(word) + ["</w>"]
 
         # Apply merges in the order they were learned
@@ -141,6 +143,8 @@ class BPE:
     def encode(self, text: str):
         """Encode text into token IDs."""
         ids = []
+        if self.lower_case:
+            text = text.lower()
         for word in text.strip().split():
             ids.extend(self.encode_word(word))
         return ids
