@@ -11,6 +11,7 @@ class BPE:
         verbose=False,
         model_file="bpe_model.json",
         lower_case=True,
+        end_of_word_mark="</w>"
     ):
         self.vocab_size = vocab_size
         self.merges = {}  # Dict of (a, b) => freq_at_merge
@@ -20,6 +21,7 @@ class BPE:
         self.verbose = verbose
         self.model_file = model_file  # default save/load path
         self.lower_case = lower_case
+        self.end_of_word_mark = end_of_word_mark
 
     def add_corpus(self, text: str):
         """Add raw text data to the training corpus."""
@@ -27,8 +29,11 @@ class BPE:
             text = text.lower()
         words = text.strip().split()
         for word in words:
-            symbols = list(word) + ["</w>"]
+            symbols = list(word) + [self.end_of_word_mark]
             self.data.append(symbols)
+
+    def get_end_of_word_mark(self):
+        return self.end_of_word_mark
 
     def get_stats(self):
         """Count frequency of symbol pairs."""
@@ -123,7 +128,7 @@ class BPE:
         # Start with characters + end-of-word marker
         if self.lower_case:
             word = word.lower()
-        symbols = list(word) + ["</w>"]
+        symbols = list(word) + [self.end_of_word_mark]
 
         # Apply merges in the order they were learned
         for (a, b), _ in self.merges.items():
@@ -154,7 +159,7 @@ class BPE:
         tokens = [self.rev_vocab[i] for i in ids]
         text = ""
         for tok in tokens:
-            if tok == "</w>":
+            if tok == self.end_of_word_mark:
                 text += " "  # end of word → space
             else:
                 text += tok
@@ -181,6 +186,7 @@ class BPE:
         data = {
             "vocab_size": self.vocab_size,
             "vocab": self.vocab,
+            "end-of-word-mark": self.end_of_word_mark,
             # save merges as list of [a, b, freq] for portability
             "merges": [[a, b, freq] for (a, b), freq in self.merges.items()],
         }
@@ -199,6 +205,7 @@ class BPE:
             payload = json.load(f)
 
         self.vocab_size = int(payload.get("vocab_size", self.vocab_size))
+        self.end_of_word_mark = payload.get("end-of-word-mark", "</w>")
 
         # rebuild merges as a dict { (a,b): freq }
         raw_merges = payload.get("merges", [])
