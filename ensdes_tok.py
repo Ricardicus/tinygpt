@@ -86,7 +86,8 @@ def main(argv=None):
     print(f"  end-of-word-mark: {bpe.get_end_of_word_mark()}")
 
     if encode is not None:
-        result = bpe.encode(encode)
+        result = ",".join([str(x) for x in bpe.encode(encode)])
+
         print(f"{encode} -> {result}")
 
     if decode is not None:

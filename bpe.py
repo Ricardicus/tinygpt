@@ -159,11 +159,8 @@ class BPE:
         tokens = [self.rev_vocab[i] for i in ids]
         text = ""
         for tok in tokens:
-            if tok == self.end_of_word_mark:
-                text += " "  # end of word → space
-            else:
-                text += tok
-        return text.strip()
+            text += tok
+        return text.rstrip()
 
     def print_merges_info(self, top_k: int = 10):
         """Print the top-K merges by frequency at merge time."""
