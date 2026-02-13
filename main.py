@@ -324,6 +324,12 @@ def parse_args(argv=None):
         default=50,
         help="Maximum number of tokens to generate during inference.",
     )
+    parser.add_argument(
+        "--log-progress",
+        type=str,
+        default=None,
+        help="Path to CSV file to append training progress (iteration, loss, mean_loss).",
+    )
     return parser.parse_args(argv)
 
 def main(argv=None):
@@ -586,9 +592,19 @@ def main(argv=None):
 
             total_loss += loss.item()
             step += 1
+            avg_loss = total_loss / step
+
+            # Log progress to CSV if requested
+            if args.log_progress:
+                import csv
+                file_exists = os.path.exists(args.log_progress)
+                with open(args.log_progress, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    if not file_exists:
+                        writer.writerow(["epoch", "step", "loss", "mean_loss"])
+                    writer.writerow([epoch + 1, step, loss.item(), avg_loss])
 
             if args.verbose and step % 10 == 0:
-                avg_loss = total_loss / step
                 print(
                     f"Step {step:6d} | Avg Loss: {avg_loss:.4f} | Inference: {inference_time:.4f}s"
                 )
