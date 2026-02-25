@@ -335,17 +335,6 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
 
-    if args.verbose:
-        print(args)
-        print(f"Tokenizer path: {args.tokenizer}")
-        print(f"Vocab size (CLI): {args.vocab_size}")
-        print(f"Context length (CLI): {args.context_length}")
-        print(f"Num layers (CLI): {args.num_layers}")
-        print(f"Embedding dimension (CLI): {args.d_model}")
-        print(f"Learning rate: {args.lr}")
-        print(f"Heads (CLI): {args.n_heads}")
-        print(f"Device: {args.device}")
-
     # ---------------------------------------------------------
     # --- Inference-only mode (skip training) ---
     # ---------------------------------------------------------
@@ -536,6 +525,17 @@ def main(argv=None):
         lower_case=args.lower_case,
     )
     args.vocab_size = bpe.vocab_size
+
+    if args.verbose:
+        print(args)
+        print(f"Tokenizer path: {args.tokenizer}")
+        print(f"Vocab size (CLI): {args.vocab_size}")
+        print(f"Context length (CLI): {args.context_length}")
+        print(f"Num layers (CLI): {args.num_layers}")
+        print(f"Embedding dimension (CLI): {args.d_model}")
+        print(f"Learning rate: {args.lr}")
+        print(f"Heads (CLI): {args.n_heads}")
+        print(f"Device: {args.device}")
 
     # Build model from CLI (we may verify against checkpoint config below)
     model = TinyGPT(
