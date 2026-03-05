@@ -37,6 +37,141 @@ def shuffled_stream(reader: Iterable[T], buffer_size: int = 10_000) -> Iterator[
 
 
 # -------------------------------------------------------------
+# TokenizedDataReader
+# -------------------------------------------------------------
+class TokenizedDataReader:
+    """
+    Reads all text files from a folder, tokenizes them with a BPE
+    tokenizer, and yields a stream of token-ID windows of length
+    ``context_size + 1`` (so the caller can split into x = w[:-1],
+    y = w[1:]).
+
+    Parameters
+    ----------
+    folder : str | Path
+        Directory containing ``.txt`` files.
+    bpe : BPE
+        A trained BPE tokenizer instance (must have ``.encode()``).
+    context_size : int
+        Number of tokens per training window.  Each yielded window
+        has length ``context_size + 1`` so that (x, y) pairs can be
+        formed.
+    shuffle : bool
+        If *True* (default), windows are yielded in random order.
+    lower_case : bool
+        Lower-case all text before tokenizing.
+    glob_pattern : str
+        Glob used to discover files (default ``"*.txt"``).
+    verbose : bool
+        Print progress while tokenizing.
+    """
+
+    def __init__(
+        self,
+        folder: str | Path,
+        bpe,
+        context_size: int,
+        shuffle: bool = True,
+        lower_case: bool = True,
+        glob_pattern: str = "*.txt",
+        verbose: bool = False,
+    ):
+        self.folder = Path(folder)
+        if not self.folder.is_dir():
+            raise FileNotFoundError(
+                f"Folder {self.folder} does not exist or is not a directory."
+            )
+
+        self.bpe = bpe
+        self.context_size = context_size
+        self.shuffle = shuffle
+        self.lower_case = lower_case
+        self.glob_pattern = glob_pattern
+        self.verbose = verbose
+
+        # Tokenize everything once into a flat list of token IDs.
+        self._tokens: List[int] = []
+        self._tokenize_folder()
+
+        # Pre-compute non-overlapping windows of length context_size + 1.
+        window = self.context_size + 1
+        n_windows = len(self._tokens) // window
+        self._windows: List[List[int]] = [
+            self._tokens[i * window : (i + 1) * window]
+            for i in range(n_windows)
+        ]
+
+        if self.verbose:
+            print(
+                f"TokenizedDataReader: {len(self._tokens):,} tokens → "
+                f"{len(self._windows):,} windows of size {window}"
+            )
+
+    # ---- internal -------------------------------------------------
+    def _tokenize_folder(self):
+        files = sorted(self.folder.glob(self.glob_pattern))
+        if not files:
+            raise FileNotFoundError(
+                f"No files matching '{self.glob_pattern}' in {self.folder}"
+            )
+
+        for fi, fp in enumerate(files):
+            text = fp.read_text(encoding="utf-8", errors="ignore")
+            if self.lower_case:
+                text = text.lower()
+            # Collapse whitespace
+            text = re.sub(r"\s+", " ", text).strip()
+            if not text:
+                continue
+            try:
+                ids = self.bpe.encode(text)
+            except ValueError:
+                if self.verbose:
+                    print(f"  [skip] {fp.name}: encoding error")
+                continue
+            self._tokens.extend(ids)
+            if self.verbose and (fi + 1) % 5 == 0:
+                print(
+                    f"  tokenized {fi + 1}/{len(files)} files "
+                    f"({len(self._tokens):,} tokens so far)"
+                )
+
+        if self.verbose:
+            print(
+                f"  done – {len(files)} files, "
+                f"{len(self._tokens):,} tokens total"
+            )
+
+    # ---- public API -----------------------------------------------
+    def __len__(self):
+        """Number of context windows available."""
+        return len(self._windows)
+
+    def __iter__(self) -> Iterator[List[int]]:
+        """
+        Yield token windows of length ``context_size + 1``.
+
+        If ``shuffle`` is *True*, windows are yielded in random order
+        (full in-memory shuffle).
+        """
+        indices = list(range(len(self._windows)))
+        if self.shuffle:
+            random.shuffle(indices)
+        for i in indices:
+            yield self._windows[i]
+
+    def __getitem__(self, index: int) -> List[int]:
+        return self._windows[index]
+
+    def __repr__(self):
+        return (
+            f"<TokenizedDataReader: {len(self._tokens):,} tokens, "
+            f"{len(self._windows):,} windows of {self.context_size + 1}, "
+            f"shuffle={self.shuffle}>"
+        )
+
+
+# -------------------------------------------------------------
 # DataReader (simple eager JSON loader)
 # -------------------------------------------------------------
 class DataReader:
@@ -440,3 +575,4 @@ class TextCorpusReader:
 
     def __repr__(self):
         return f"<TextCorpusReader: {len(self.files)} files, delimiter={'lines' if not self.delimiter else repr(self.delimiter)}>"
+

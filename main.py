@@ -7,7 +7,7 @@ import sys
 from itertools import islice
 import time
 
-from datareader import PagedDataReader, TextCorpusReader
+from datareader import PagedDataReader, TextCorpusReader, TokenizedDataReader
 from bpe import BPE
 from tinygpt import TinyGPT
 
@@ -113,81 +113,75 @@ def stream_batches(datareader, bpe, context_length, batch_size):
     """
     Generator that yields batches of (x, y) token tensors.
 
-    Strategy:
-    - Read sequentially from `datareader` (lines/files).
-    - Encode to token IDs using `bpe.encode`.
-    - Maintain a *global token buffer* across texts.
-    - Pack that continuous token stream into fixed-length
-      context windows of size `context_length` tokens.
-    - For each window, x is tokens[0:C], y is tokens[1:C+1].
+    If `datareader` is a TokenizedDataReader it already yields
+    pre-tokenized windows of length context_length + 1.
+    Otherwise falls back to on-the-fly encoding.
     """
-    token_buffer = []
-    start_idx = 0  # sliding window start within token_buffer
-
     batch_x, batch_y = [], []
 
-    def flush_batches():
+    def flush():
         nonlocal batch_x, batch_y
         if batch_x:
-            x_tensor = torch.tensor(batch_x, dtype=torch.long)
-            y_tensor = torch.tensor(batch_y, dtype=torch.long)
+            x_t = torch.tensor(batch_x, dtype=torch.long)
+            y_t = torch.tensor(batch_y, dtype=torch.long)
             batch_x, batch_y = [], []
-            return x_tensor, y_tensor
+            return x_t, y_t
         return None
+
+    if isinstance(datareader, TokenizedDataReader):
+        # Fast path: windows are already tokenised
+        for window in datareader:
+            batch_x.append(window[:-1])
+            batch_y.append(window[1:])
+            if len(batch_x) >= batch_size:
+                out = flush()
+                if out is not None:
+                    yield out
+        out = flush()
+        if out is not None:
+            yield out
+        return
+
+    # Legacy path: read raw text, tokenise on the fly
+    token_buffer = []
+    start_idx = 0
 
     for text in datareader:
         try:
             ids = bpe.encode(text)
-        except ValueError as e:
-            # Skip text with unknown symbols
-            print(f"[Discarded text: unknown symbol] {text[:80]!r} ({e})")
+        except ValueError:
             continue
-
         if not ids:
             continue
 
-        # Extend global token stream
         token_buffer.extend(ids)
 
-        # While we have enough tokens for at least one full (x,y) pair
         while len(token_buffer) - start_idx >= context_length + 1:
             window = token_buffer[start_idx : start_idx + context_length + 1]
-            x = window[:-1]
-            y = window[1:]
+            batch_x.append(window[:-1])
+            batch_y.append(window[1:])
+            start_idx += context_length
 
-            batch_x.append(x)
-            batch_y.append(y)
-
-            start_idx += context_length  # non-overlapping windows
-
-            # Yield batch when full
             if len(batch_x) >= batch_size:
-                out = flush_batches()
+                out = flush()
                 if out is not None:
                     yield out
 
-        # Periodically compact buffer to avoid unbounded growth
-        # (drop tokens we've already stepped over)
         if start_idx > 10 * context_length:
             token_buffer = token_buffer[start_idx:]
             start_idx = 0
 
-    # After we exhaust the datareader, still try to use remaining tokens
     while len(token_buffer) - start_idx >= context_length + 1:
         window = token_buffer[start_idx : start_idx + context_length + 1]
-        x = window[:-1]
-        y = window[1:]
-        batch_x.append(x)
-        batch_y.append(y)
+        batch_x.append(window[:-1])
+        batch_y.append(window[1:])
         start_idx += context_length
-
         if len(batch_x) >= batch_size:
-            out = flush_batches()
+            out = flush()
             if out is not None:
                 yield out
 
-    # Flush any remaining partial batch
-    out = flush_batches()
+    out = flush()
     if out is not None:
         yield out
 
@@ -416,12 +410,8 @@ def main(argv=None):
     for arg in args.oneliners.split(","):
         if len(arg) > 0:
             oneliners.append(arg)
-    datareader = getData(
-        verbose=args.verbose,
-        lower_case=args.lower_case,
-        rawdata_folder=args.rawdata,
-        oneliners=oneliners,
-    )
+
+    # datareader is created after BPE is ready (see below)
 
 
     start_epoch = 0
@@ -516,8 +506,15 @@ def main(argv=None):
     else:
         print("No existing checkpoint found. Training from scratch.\n")
 
+    # For BPE training we still need raw text if no tokenizer exists yet
+    raw_datareader = getData(
+        verbose=args.verbose,
+        lower_case=args.lower_case,
+        rawdata_folder=args.rawdata,
+        oneliners=oneliners,
+    )
     bpe = getBPE(
-        datareader,
+        raw_datareader,
         vocab_size=args.vocab_size,
         verbose=args.verbose,
         tokenizer_path=args.tokenizer,
@@ -525,6 +522,16 @@ def main(argv=None):
         lower_case=args.lower_case,
     )
     args.vocab_size = bpe.vocab_size
+
+    # Build the tokenized datareader (reads folder, tokenizes, yields windows)
+    datareader = TokenizedDataReader(
+        folder=args.rawdata,
+        bpe=bpe,
+        context_size=args.context_length,
+        shuffle=True,
+        lower_case=args.lower_case,
+        verbose=args.verbose,
+    )
 
     if args.verbose:
         print(args)
