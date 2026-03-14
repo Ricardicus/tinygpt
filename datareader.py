@@ -64,6 +64,14 @@ class TokenizedDataReader:
         Glob used to discover files (default ``"*.txt"``).
     verbose : bool
         Print progress while tokenizing.
+    cache : bool
+        If *True*, save tokenized data to a binary cache file after
+        the first tokenization, and load from it on subsequent runs.
+        The cache file is stored next to the source folder as
+        ``<folder_name>_tokens.bin``.  Default is *False*.
+    cache_path : str | Path | None
+        Explicit path for the cache file.  Overrides the default
+        location derived from *folder*.
     """
 
     def __init__(
@@ -75,6 +83,8 @@ class TokenizedDataReader:
         lower_case: bool = True,
         glob_pattern: str = "*.txt",
         verbose: bool = False,
+        cache: bool = False,
+        cache_path: Optional[str | Path] = None,
     ):
         self.folder = Path(folder)
         if not self.folder.is_dir():
@@ -88,10 +98,22 @@ class TokenizedDataReader:
         self.lower_case = lower_case
         self.glob_pattern = glob_pattern
         self.verbose = verbose
+        self.cache = cache
 
-        # Tokenize everything once into a flat list of token IDs.
+        # Resolve cache file path.
+        if cache_path is not None:
+            self._cache_path = Path(cache_path)
+        else:
+            self._cache_path = self.folder.parent / f"{self.folder.name}_tokens.bin"
+
+        # Tokenize (or load from cache) into a flat list of token IDs.
         self._tokens: List[int] = []
-        self._tokenize_folder()
+        if self.cache and self._cache_path.exists():
+            self._load_cache()
+        else:
+            self._tokenize_folder()
+            if self.cache:
+                self._save_cache()
 
         # Pre-compute non-overlapping windows of length context_size + 1.
         window = self.context_size + 1
@@ -105,6 +127,32 @@ class TokenizedDataReader:
             print(
                 f"TokenizedDataReader: {len(self._tokens):,} tokens → "
                 f"{len(self._windows):,} windows of size {window}"
+            )
+
+    # ---- cache I/O ------------------------------------------------
+    def _save_cache(self):
+        """Write token IDs to a compact binary file (4 bytes per token)."""
+        import struct
+        with open(self._cache_path, "wb") as f:
+            f.write(struct.pack(f"<{len(self._tokens)}I", *self._tokens))
+        if self.verbose:
+            print(
+                f"  cache saved → {self._cache_path}  "
+                f"({len(self._tokens):,} tokens, "
+                f"{self._cache_path.stat().st_size / 1024 / 1024:.1f} MB)"
+            )
+
+    def _load_cache(self):
+        """Read token IDs from a previously saved binary cache."""
+        import struct
+        size = self._cache_path.stat().st_size
+        n_tokens = size // 4
+        with open(self._cache_path, "rb") as f:
+            self._tokens = list(struct.unpack(f"<{n_tokens}I", f.read()))
+        if self.verbose:
+            print(
+                f"  cache loaded ← {self._cache_path}  "
+                f"({n_tokens:,} tokens)"
             )
 
     # ---- internal -------------------------------------------------

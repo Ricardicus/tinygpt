@@ -531,6 +531,7 @@ def main(argv=None):
         shuffle=True,
         lower_case=args.lower_case,
         verbose=args.verbose,
+        cache=True
     )
 
     if args.verbose:
