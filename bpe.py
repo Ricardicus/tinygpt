@@ -17,37 +17,37 @@ class BPE:
         self.merges = {}  # Dict of (a, b) => freq_at_merge
         self.vocab = {}  # Token -> ID mapping
         self.rev_vocab = {}  # ID -> Token mapping
-        self.data = []  # Accumulated training data
+        self.word_freq = {}  # {tuple_of_symbols: count} — memory-efficient
         self.verbose = verbose
         self.model_file = model_file  # default save/load path
         self.lower_case = lower_case
         self.end_of_word_mark = end_of_word_mark
 
     def add_corpus(self, text: str):
-        """Add raw text data to the training corpus."""
+        """Add raw text data to the training corpus (frequency-counted)."""
         if self.lower_case:
             text = text.lower()
         words = text.strip().split()
         for word in words:
-            symbols = list(word) + [self.end_of_word_mark]
-            self.data.append(symbols)
+            key = tuple(word) + (self.end_of_word_mark,)
+            self.word_freq[key] = self.word_freq.get(key, 0) + 1
 
     def get_end_of_word_mark(self):
         return self.end_of_word_mark
 
     def get_stats(self):
-        """Count frequency of symbol pairs."""
+        """Count frequency of symbol pairs, weighted by word frequency."""
         pairs = Counter()
-        for word in self.data:
+        for word, freq in self.word_freq.items():
             for i in range(len(word) - 1):
-                pairs[(word[i], word[i + 1])] += 1
+                pairs[(word[i], word[i + 1])] += freq
         return pairs
 
     def merge_vocab(self, pair):
-        """Merge a given pair everywhere in the data."""
+        """Merge a given pair everywhere in the data (frequency-aware)."""
         new_symbol = pair[0] + pair[1]
-        new_data = []
-        for word in self.data:
+        new_word_freq = {}
+        for word, freq in self.word_freq.items():
             merged = []
             i = 0
             while i < len(word):
@@ -57,8 +57,9 @@ class BPE:
                 else:
                     merged.append(word[i])
                     i += 1
-            new_data.append(merged)
-        self.data = new_data
+            key = tuple(merged)
+            new_word_freq[key] = new_word_freq.get(key, 0) + freq
+        self.word_freq = new_word_freq
         return new_symbol
 
     def train(self, batch_merges: int = 4):
@@ -69,7 +70,7 @@ class BPE:
         instead of only the single best one.
         """
 
-        vocab = set(ch for word in self.data for ch in word)
+        vocab = set(ch for word in self.word_freq for ch in word)
         other_chars = ["'", '"', "<", "-", ">", "?", "!", ":"]
         for ch in other_chars:
             vocab.add(ch)
@@ -213,7 +214,7 @@ class BPE:
         self.rev_vocab = {v: k for k, v in self.vocab.items()}
 
         # training data intentionally left empty
-        self.data = []
+        self.word_freq = {}
 
         if self.verbose:
             print(f"Loaded BPE model from {in_path}")
