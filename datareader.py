@@ -1,4 +1,8 @@
 import os
+import hashlib
+import fnmatch
+from array import array
+from corpus import discover_files, text_chunks
 import sys
 import json
 import random
@@ -49,7 +53,7 @@ class TokenizedDataReader:
     Parameters
     ----------
     folder : str | Path
-        Directory containing ``.txt`` files.
+        Corpus directory, scanned recursively using the suffix configuration.
     bpe : BPE
         A trained BPE tokenizer instance (must have ``.encode()``).
     context_size : int
@@ -61,7 +65,7 @@ class TokenizedDataReader:
     lower_case : bool
         Lower-case all text before tokenizing.
     glob_pattern : str
-        Glob used to discover files (default ``"*.txt"``).
+        Optional additional filename filter applied to accepted corpus files.
     verbose : bool
         Print progress while tokenizing.
     cache : bool
@@ -81,10 +85,11 @@ class TokenizedDataReader:
         context_size: int,
         shuffle: bool = True,
         lower_case: bool = True,
-        glob_pattern: str = "*.txt",
+        glob_pattern: Optional[str] = None,
         verbose: bool = False,
         cache: bool = False,
         cache_path: Optional[str | Path] = None,
+        corpus_config=None,
     ):
         self.folder = Path(folder)
         if not self.folder.is_dir():
@@ -92,6 +97,13 @@ class TokenizedDataReader:
                 f"Folder {self.folder} does not exist or is not a directory."
             )
 
+        self.files = discover_files(self.folder, corpus_config)
+        if glob_pattern:
+            self.files = [p for p in self.files if fnmatch.fnmatch(p.name, glob_pattern)]
+        if not self.files:
+            raise FileNotFoundError("No matching corpus files")
+        if context_size < 1:
+            raise ValueError("context_size must be positive")
         self.bpe = bpe
         self.context_size = context_size
         self.shuffle = shuffle
@@ -106,35 +118,55 @@ class TokenizedDataReader:
         else:
             self._cache_path = self.folder.parent / f"{self.folder.name}_tokens.bin"
 
-        # Tokenize (or load from cache) into a flat list of token IDs.
-        self._tokens: List[int] = []
-        if self.cache and self._cache_path.exists():
+        manifest = {
+            "version": 3,
+            "files": [(str(p.resolve()), p.stat().st_size, p.stat().st_mtime_ns) for p in self.files],
+            "vocab": bpe.vocab,
+            "merges": list(bpe.merges.items()),
+            "lower_case": lower_case,
+            "bpe_lower_case": bpe.lower_case,
+            "preserve_whitespace": bpe.preserve_whitespace,
+            "end_of_word": bpe.end_of_word_mark,
+        }
+        self._fingerprint = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        self._meta_path = Path(str(self._cache_path) + ".json")
+        self._tokens = array("I")
+        valid_cache = False
+        if self.cache and self._cache_path.exists() and self._meta_path.exists():
+            try:
+                meta = json.loads(self._meta_path.read_text())
+                valid_cache = (meta.get("fingerprint") == self._fingerprint
+                               and meta.get("bytes") == self._cache_path.stat().st_size
+                               and self._cache_path.stat().st_size % 4 == 0)
+            except (ValueError, OSError):
+                pass
+        if valid_cache:
             self._load_cache()
         else:
             self._tokenize_folder()
             if self.cache:
                 self._save_cache()
-
-        # Pre-compute non-overlapping windows of length context_size + 1.
-        window = self.context_size + 1
-        n_windows = len(self._tokens) // window
-        self._windows: List[List[int]] = [
-            self._tokens[i * window : (i + 1) * window]
-            for i in range(n_windows)
-        ]
+        self._n_windows = len(self._tokens) // (self.context_size + 1)
 
         if self.verbose:
             print(
                 f"TokenizedDataReader: {len(self._tokens):,} tokens → "
-                f"{len(self._windows):,} windows of size {window}"
+                f"{self._n_windows:,} windows of size {window}"
             )
 
     # ---- cache I/O ------------------------------------------------
     def _save_cache(self):
         """Write token IDs to a compact binary file (4 bytes per token)."""
-        import struct
         with open(self._cache_path, "wb") as f:
-            f.write(struct.pack(f"<{len(self._tokens)}I", *self._tokens))
+            if sys.byteorder != "little":
+                self._tokens.byteswap()
+            try:
+                self._tokens.tofile(f)
+            finally:
+                if sys.byteorder != "little":
+                    self._tokens.byteswap()
+        self._meta_path.write_text(json.dumps({"fingerprint": self._fingerprint,
+                                               "bytes": self._cache_path.stat().st_size}))
         if self.verbose:
             print(
                 f"  cache saved → {self._cache_path}  "
@@ -144,11 +176,11 @@ class TokenizedDataReader:
 
     def _load_cache(self):
         """Read token IDs from a previously saved binary cache."""
-        import struct
-        size = self._cache_path.stat().st_size
-        n_tokens = size // 4
+        n_tokens = self._cache_path.stat().st_size // 4
         with open(self._cache_path, "rb") as f:
-            self._tokens = list(struct.unpack(f"<{n_tokens}I", f.read()))
+            self._tokens.fromfile(f, n_tokens)
+        if sys.byteorder != "little":
+            self._tokens.byteswap()
         if self.verbose:
             print(
                 f"  cache loaded ← {self._cache_path}  "
@@ -157,32 +189,16 @@ class TokenizedDataReader:
 
     # ---- internal -------------------------------------------------
     def _tokenize_folder(self):
-        files = sorted(self.folder.glob(self.glob_pattern))
-        if not files:
-            raise FileNotFoundError(
-                f"No files matching '{self.glob_pattern}' in {self.folder}"
-            )
-
-        for fi, fp in enumerate(files):
-            text = fp.read_text(encoding="utf-8", errors="ignore")
-            if self.lower_case:
-                text = text.lower()
-            # Collapse whitespace
-            text = re.sub(r"\s+", " ", text).strip()
-            if not text:
-                continue
-            try:
-                ids = self.bpe.encode(text)
-            except ValueError:
-                if self.verbose:
-                    print(f"  [skip] {fp.name}: encoding error")
-                continue
-            self._tokens.extend(ids)
-            if self.verbose and (fi + 1) % 5 == 0:
-                print(
-                    f"  tokenized {fi + 1}/{len(files)} files "
-                    f"({len(self._tokens):,} tokens so far)"
-                )
+        files = self.files
+        for fp in files:
+            for text in text_chunks(fp):
+                if self.lower_case:
+                    text = text.lower()
+                # Report unknown characters instead of silently losing entire files.
+                try:
+                    self._tokens.extend(self.bpe.encode(text))
+                except ValueError as error:
+                    raise ValueError(f"Cannot tokenize {fp}: {error}") from error
 
         if self.verbose:
             print(
@@ -193,28 +209,33 @@ class TokenizedDataReader:
     # ---- public API -----------------------------------------------
     def __len__(self):
         """Number of context windows available."""
-        return len(self._windows)
+        return self._n_windows
 
     def __iter__(self) -> Iterator[List[int]]:
         """
         Yield token windows of length ``context_size + 1``.
 
         If ``shuffle`` is *True*, windows are yielded in random order
-        (full in-memory shuffle).
+        (compact in-memory index shuffle).
         """
-        indices = list(range(len(self._windows)))
+        indices = array("Q", range(self._n_windows))
         if self.shuffle:
             random.shuffle(indices)
         for i in indices:
-            yield self._windows[i]
+            yield self[i]
 
     def __getitem__(self, index: int) -> List[int]:
-        return self._windows[index]
+        if index < 0:
+            index += self._n_windows
+        if not 0 <= index < self._n_windows:
+            raise IndexError(index)
+        start = index * (self.context_size + 1)
+        return self._tokens[start:start + self.context_size + 1].tolist()
 
     def __repr__(self):
         return (
             f"<TokenizedDataReader: {len(self._tokens):,} tokens, "
-            f"{len(self._windows):,} windows of {self.context_size + 1}, "
+            f"{self._n_windows:,} windows of {self.context_size + 1}, "
             f"shuffle={self.shuffle}>"
         )
 
@@ -526,7 +547,7 @@ class ChunkedFile:
 # -------------------------------------------------------------
 class TextCorpusReader:
     """
-    Streams text from .txt files line-by-line or chunk-by-chunk.
+    Streams accepted corpus files in bounded, whitespace-aligned chunks.
 
     Designed for very large corpora where loading everything is impossible.
     """
@@ -541,6 +562,7 @@ class TextCorpusReader:
         shuffle=True,
         to_new_lines=[],
         round_off_at_whitespace=True,
+        corpus_config=None,
     ):
         self.lower_case = lower_case
         self.delimiter = delimiter
@@ -554,7 +576,7 @@ class TextCorpusReader:
                 raise FileNotFoundError(
                     f"Folder {folder} does not exist or is not a directory."
                 )
-            self.files = sorted(str(p) for p in folder.glob("*.txt"))
+            self.files = [str(p) for p in discover_files(folder, corpus_config)]
         elif isinstance(sources, (list, tuple)):
             self.files = [str(Path(p)) for p in sources]
         else:
@@ -563,64 +585,31 @@ class TextCorpusReader:
         if not self.files:
             raise FileNotFoundError("No text files found.")
 
-        self.chunked_file_readers = []
-        for file in self.files:
-            if os.path.basename(file) in to_new_lines:
-                self.chunked_file_readers.append(
-                    ChunkedFile(
-                        file,
-                        self.buffer_size,
-                        to_new_line=True,
-                        round_off_at_whitespace=round_off_at_whitespace,
-                    )
-                )
-            else:
-                self.chunked_file_readers.append(
-                    ChunkedFile(
-                        file,
-                        self.buffer_size,
-                        round_off_at_whitespace=round_off_at_whitespace,
-                    )
-                )
-        self._length: Optional[int] = None
+        self._length = None
 
-    # Iteration
-    def __iter__(self) -> Iterator[str]:
-        pairs = []
-        for i in range(len(self.chunked_file_readers)):
-            size = len(self.chunked_file_readers[i])
-            for n in range(size):
-                pairs.append((i, n))
-
+    def __iter__(self):
+        files = list(self.files)
         if self.shuffle:
-            random.shuffle(pairs)
-
-        for pair in pairs:
-            reader, index = pair
-            data = self.chunked_file_readers[reader][index].decode(
-                self.encoding, errors="ignore"
-            )
-            if self.lower_case:
-                data = data.lower()
-            yield data
+            random.shuffle(files)
+        for path in files:
+            for text in text_chunks(path, chunk_size=max(1024, self.buffer_size)):
+                yield text.lower() if self.lower_case else text
 
     def iter(self, buffer_size=10_000):
-        """Optional shuffled iteration."""
-        return self.__iter__()
+        return shuffled_stream(self, buffer_size) if self.shuffle else iter(self)
 
-    # Length
-    def __len__(self) -> int:
+    def __len__(self):
         if self._length is None:
-            self._length = sum(len(x) for x in self.chunked_file_readers)
+            self._length = sum(1 for _ in self)
         return self._length
 
-    # Indexing (inefficient)
-    def __getitem__(self, index: int) -> str:
+    def __getitem__(self, index):
+        if index < 0:
+            raise IndexError(index)
         for i, text in enumerate(self):
             if i == index:
                 return text
-        raise IndexError("Index out of range")
+        raise IndexError(index)
 
     def __repr__(self):
-        return f"<TextCorpusReader: {len(self.files)} files, delimiter={'lines' if not self.delimiter else repr(self.delimiter)}>"
-
+        return f"<TextCorpusReader: {len(self.files)} files>"

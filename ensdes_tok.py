@@ -94,7 +94,8 @@ def main(argv=None):
         inputs = [ int(x) for x in decode.split(",") ]
         result = bpe.decode(inputs)
         eow = bpe.get_end_of_word_mark()
-        result = result.replace(eow, " ")
+        if not bpe.preserve_whitespace:
+            result = result.replace(eow, " ")
         print(f"{inputs} -> {result}")
 
 # ---------------------------------------------------------

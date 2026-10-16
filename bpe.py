@@ -1,5 +1,7 @@
 import json
 import time
+import re
+import heapq
 from collections import Counter
 from datetime import timedelta, datetime
 
@@ -11,8 +13,17 @@ class BPE:
         verbose=False,
         model_file="bpe_model.json",
         lower_case=True,
-        end_of_word_mark="</w>"
+        end_of_word_mark="</w>",
+        max_unique_words=100_000,
+        max_word_chars=4096
     ):
+        if max_unique_words < 1 or max_word_chars < 1:
+            raise ValueError("BPE word limits must be positive")
+        self.max_unique_words = max_unique_words
+        self.max_word_chars = max_word_chars
+        self.preserve_whitespace = True
+        self.alphabet = set(" \t\r\n")
+        self.skipped_words = 0
         self.vocab_size = vocab_size
         self.merges = {}  # Dict of (a, b) => freq_at_merge
         self.vocab = {}  # Token -> ID mapping
@@ -27,9 +38,19 @@ class BPE:
         """Add raw text data to the training corpus (frequency-counted)."""
         if self.lower_case:
             text = text.lower()
-        words = text.strip().split()
-        for word in words:
-            key = tuple(word) + (self.end_of_word_mark,)
+        self.alphabet.update(text)
+        for match in re.finditer(r"\S+", text):
+            word = match.group()
+            self.alphabet.update(word)
+            if len(word) > self.max_word_chars:
+                self.skipped_words += 1
+                continue
+            key = tuple(word)
+            if not self.preserve_whitespace:
+                key += (self.end_of_word_mark,)
+            if key not in self.word_freq and len(self.word_freq) >= self.max_unique_words:
+                self.skipped_words += 1
+                continue
             self.word_freq[key] = self.word_freq.get(key, 0) + 1
 
     def get_end_of_word_mark(self):
@@ -70,7 +91,9 @@ class BPE:
         instead of only the single best one.
         """
 
-        vocab = set(ch for word in self.word_freq for ch in word)
+        if batch_merges < 1:
+            raise ValueError("batch_merges must be positive")
+        vocab = self.alphabet | set(ch for word in self.word_freq for ch in word)
         other_chars = ["'", '"', "<", "-", ">", "?", "!", ":"]
         for ch in other_chars:
             vocab.add(ch)
@@ -85,9 +108,8 @@ class BPE:
                 break
 
             # Select top-k pairs to merge this round
-            top_k = sorted(pairs.items(), key=lambda x: x[1], reverse=True)[
-                :batch_merges
-            ]
+            top_k = heapq.nlargest(batch_merges, pairs.items(), key=lambda x: x[1])
+            del pairs
 
             # Merge them sequentially in descending frequency order
             for (a, b), freq in top_k:
@@ -122,6 +144,9 @@ class BPE:
             print(
                 f"\nBPE training complete: {len(self.vocab)} tokens, {len(self.merges)} merges."
             )
+        self.word_freq.clear()
+        if self.verbose and self.skipped_words:
+            print(f"BPE sampling limits skipped {self.skipped_words:,} words.")
         return len(vocab) == self.vocab_size
 
     def encode_word(self, word):
@@ -129,7 +154,9 @@ class BPE:
         # Start with characters + end-of-word marker
         if self.lower_case:
             word = word.lower()
-        symbols = list(word) + [self.end_of_word_mark]
+        symbols = list(word)
+        if not self.preserve_whitespace:
+            symbols.append(self.end_of_word_mark)
 
         # Apply merges in the order they were learned
         for (a, b), _ in self.merges.items():
@@ -151,17 +178,25 @@ class BPE:
         ids = []
         if self.lower_case:
             text = text.lower()
-        for word in text.strip().split():
-            ids.extend(self.encode_word(word))
+        if not self.preserve_whitespace:
+            for word in text.strip().split():
+                ids.extend(self.encode_word(word))
+            return ids
+        for match in re.finditer(r"\s+|\S+", text):
+            piece = match.group()
+            if piece.isspace():
+                for char in piece:
+                    if char not in self.vocab:
+                        raise ValueError(f"Unknown whitespace during encoding: {char!r}")
+                    ids.append(self.vocab[char])
+            else:
+                ids.extend(self.encode_word(piece))
         return ids
 
     def decode(self, ids):
         """Decode token IDs back into text."""
-        tokens = [self.rev_vocab[i] for i in ids]
-        text = ""
-        for tok in tokens:
-            text += tok
-        return text.rstrip()
+        text = "".join(self.rev_vocab[i] for i in ids)
+        return text if self.preserve_whitespace else text.rstrip()
 
     def print_merges_info(self, top_k: int = 10):
         """Print the top-K merges by frequency at merge time."""
@@ -183,6 +218,8 @@ class BPE:
         out_path = path or self.model_file
         data = {
             "vocab_size": self.vocab_size,
+            "lower_case": self.lower_case,
+            "preserve_whitespace": self.preserve_whitespace,
             "vocab": self.vocab,
             "end-of-word-mark": self.end_of_word_mark,
             # save merges as list of [a, b, freq] for portability
@@ -202,6 +239,9 @@ class BPE:
         with open(in_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
 
+        # Missing flag denotes a legacy tokenizer; keep its token IDs/behavior.
+        self.preserve_whitespace = payload.get("preserve_whitespace", False)
+        self.lower_case = payload.get("lower_case", self.lower_case)
         self.vocab_size = int(payload.get("vocab_size", self.vocab_size))
         self.end_of_word_mark = payload.get("end-of-word-mark", "</w>")
 

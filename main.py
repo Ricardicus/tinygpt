@@ -9,6 +9,7 @@ import time
 
 from datareader import PagedDataReader, TextCorpusReader, TokenizedDataReader
 from bpe import BPE
+from corpus import load_config
 from tinygpt import TinyGPT
 
 
@@ -37,11 +38,12 @@ def str2bool(v):
     raise argparse.ArgumentTypeError("Boolean value expected for --verbose")
 
 
-def getData(verbose=True, lower_case=True, rawdata_folder="rawdata", oneliners=[]):
+def getData(verbose=True, lower_case=True, rawdata_folder="rawdata", oneliners=[], corpus_config=None):
     if verbose:
         print("Initializing data reader...")
     datareader = TextCorpusReader(
-        rawdata_folder, lower_case=lower_case, to_new_lines=oneliners
+        rawdata_folder, lower_case=lower_case, to_new_lines=oneliners,
+        corpus_config=corpus_config
     )
     if verbose:
         print(f"DataReader ready: {len(datareader)} entries")
@@ -55,6 +57,7 @@ def getBPE(
     tokenizer_path=None,
     bpe_part=0.01,
     lower_case=True,
+    bpe_max_words=100_000,
 ):
     """Load existing tokenizer or train a new one."""
     if tokenizer_path and os.path.exists(tokenizer_path):
@@ -85,15 +88,25 @@ def getBPE(
                 "Creating new tokenizer (no model path specified; using default inside BPE)"
             )
 
+    if not 0 < bpe_part <= 1:
+        raise ValueError("--bpe-part must be greater than 0 and at most 1")
+    bpe.max_unique_words = bpe_max_words
+    if bpe_max_words < 1:
+        raise ValueError("--bpe-max-words must be positive")
     total = len(data)
     if verbose:
         print("Feeding data to BPE...")
+    import math
+    sample_count = max(1, math.ceil(total * bpe_part))
+    # Learn merges from the sample, but include characters from every file so
+    # later pretraining files cannot fail merely because the sample missed them.
     for i, row in enumerate(data):
-        bpe.add_corpus(row)
-        if total > 0 and i / total >= bpe_part:
-            if verbose:
-                print(f"\nTraining BPE on {int(i / total * 100)}% of the dataset.")
-            break
+        if i < sample_count:
+            bpe.add_corpus(row)
+        else:
+            bpe.alphabet.update(row.lower() if lower_case else row)
+    if verbose:
+        print(f"Training BPE merges on {sample_count}/{total} chunks.")
     bpe.train()
 
     if tokenizer_path:
@@ -288,6 +301,10 @@ def parse_args(argv=None):
         default="models/model.pt",
         help="Where to store the model data.",
     )
+    parser.add_argument("--data-config", default=None,
+                        help="JSON suffix/excluded-directory config (default: training_data.json beside main.py).")
+    parser.add_argument("--bpe-max-words", type=int, default=100_000,
+                        help="Maximum unique words retained for BPE merges (default: 100000).")
     parser.add_argument(
         "--rawdata",
         type=str,
@@ -397,7 +414,8 @@ def main(argv=None):
         prompt = args.prompt.lower() if args.lower_case else args.prompt
         result = generate(model, bpe, prompt, args.context_length - 1, args.device)
         print("\n--- Generated Text ---")
-        result = result.replace("</w>", " ")
+        if not bpe.preserve_whitespace:
+            result = result.replace(bpe.get_end_of_word_mark(), " ")
         print(result)
         return  # skip training
 
@@ -507,11 +525,13 @@ def main(argv=None):
         print("No existing checkpoint found. Training from scratch.\n")
 
     # For BPE training we still need raw text if no tokenizer exists yet
+    corpus_config = load_config(args.data_config)
     raw_datareader = getData(
         verbose=args.verbose,
         lower_case=args.lower_case,
         rawdata_folder=args.rawdata,
         oneliners=oneliners,
+        corpus_config=corpus_config,
     )
     bpe = getBPE(
         raw_datareader,
@@ -520,6 +540,7 @@ def main(argv=None):
         tokenizer_path=args.tokenizer,
         bpe_part=args.bpe_part,
         lower_case=args.lower_case,
+        bpe_max_words=args.bpe_max_words,
     )
     args.vocab_size = bpe.vocab_size
 
@@ -531,7 +552,8 @@ def main(argv=None):
         shuffle=True,
         lower_case=args.lower_case,
         verbose=args.verbose,
-        cache=True
+        cache=True,
+        corpus_config=corpus_config,
     )
 
     if args.verbose:

@@ -67,3 +67,67 @@ Not sure about what data to train on? Under other/ there is a script that downlo
 the top 10 books in text format from Project Gutenberg. If you use the flag --top50 it
 instead downloads the top 50 books. That can serve as a dataset if you don't know 
 what to train on. 
+
+## Training on a cloned repository
+
+Use Python 3.10 or newer. Folder scanning is recursive, for both tokenizer
+training and model pretraining. Edit `training_data.json` to choose suffixes
+(case insensitive) and directory names to exclude:
+
+```json
+{
+  "suffixes": [".txt", ".c", ".cpp", ".md", ".h", ".hpp"],
+  "exclude_dirs": [".git", "venv", ".venv", "node_modules", "build", "dist"]
+}
+```
+
+For example, after cloning a repository into `rawdata/my-project`:
+
+```bash
+python main.py --rawdata rawdata/my-project --data-config training_data.json \
+  --tokenizer tokenizers/my-project.json --model models/my-project.pt \
+  --lower-case false --bpe-part 1 --bpe-max-words 100000
+```
+
+Use a fresh tokenizer and model path for a new corpus. Existing tokenizers are
+loaded rather than retrained; they may lack characters in new data. For source
+code, `--lower-case false` preserves case. Newly trained tokenizers preserve
+spaces, tabs, indentation, blank lines, trailing whitespace, and line endings
+(including CRLF). Whitespace uses explicit character tokens, with no synthetic
+end-of-word markers, so decoding reproduces the original formatting.
+
+Symbolic links are skipped. Files are decoded as UTF-8 with replacement for
+invalid bytes; NUL-containing data raises an error identifying the file. Check
+that the suffix list selects text files. Words longer than 4096 characters
+(such as encoded blobs) are omitted in both stages.
+
+The raw corpus now streams from disk. BPE retains at most `--bpe-max-words`
+unique words for merge learning; later unseen words are skipped for merge
+statistics, while their characters remain encodable. `--bpe-part` selects the
+fraction of chunks used for merges; all accepted text is scanned for character
+coverage, and all accepted text is used for model pretraining. The word cap
+reduces memory at the cost of less representative merge statistics; lower it
+if memory is tight. It is a sampling limit, not a fixed RAM budget.
+
+Disk streaming is used for corpus preparation. During model pretraining, all
+context windows across all accepted files share one globally shuffled index.
+Each epoch reshuffles that index and visits every complete window once, so
+batches sample across the dataset rather than walking through one file at a
+time. This is sampling without replacement within each epoch.
+
+Token IDs use four bytes each, and training windows are sliced as needed rather
+than duplicated. Token IDs and shuffle indices still reside in memory, so very
+large corpora can require substantial RAM. Token caches are rebuilt when source
+paths, sizes, modification times, or tokenizer settings change. Old caches
+without metadata are rebuilt once.
+
+Previously saved tokenizers keep their original encoding behavior for checkpoint
+compatibility. To learn formatting, train a new tokenizer and model using fresh
+paths; existing weights cannot be reused with a changed token-to-ID mapping.
+Token caches rebuild automatically for the updated text processing.
+
+Run the corpus/tokenizer and transformer regression tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```

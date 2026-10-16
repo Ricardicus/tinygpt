@@ -163,8 +163,7 @@ class TinyGPT(nn.Module):
         B, C = token_ids.shape
 
         # Input embedding
-        one_hot = F.one_hot(token_ids, num_classes=self.vocab_size).float()
-        tok_emb = one_hot @ self.E
+        tok_emb = F.embedding(token_ids, self.E)
         pos_emb = self.pos_E[:C]
         x = tok_emb + pos_emb
 

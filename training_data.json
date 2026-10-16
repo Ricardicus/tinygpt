@@ -1,0 +1,4 @@
+{
+  "suffixes": [".txt", ".c", ".cpp", ".md", ".h", ".hpp"],
+  "exclude_dirs": [".git", ".hg", ".svn", "venv", ".venv", "node_modules", "__pycache__", "build", "dist"]
+}
