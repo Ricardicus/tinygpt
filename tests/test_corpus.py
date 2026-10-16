@@ -1,4 +1,6 @@
 import json
+import io
+from contextlib import redirect_stdout
 import random
 import tempfile
 import unittest
@@ -65,8 +67,13 @@ class CorpusTests(unittest.TestCase):
             cache = Path(tmp) / 'tokens.bin'
             def read():
                 return TokenizedDataReader(root, bpe, 2, shuffle=False,
-                                           cache=True, cache_path=cache)
-            first = read()
+                                           cache=True, cache_path=cache, verbose=True)
+            with redirect_stdout(io.StringIO()) as output:
+                first = read()
+                cached = read()
+            self.assertIn("windows of size 3", output.getvalue())
+            self.assertIn("cache loaded", output.getvalue())
+            self.assertEqual(list(first), list(cached))
             self.assertEqual(list(first), list(read()))
             self.assertEqual(first[-1], list(first)[-1])
             with self.assertRaises(IndexError):

@@ -152,7 +152,7 @@ class TokenizedDataReader:
         if self.verbose:
             print(
                 f"TokenizedDataReader: {len(self._tokens):,} tokens → "
-                f"{self._n_windows:,} windows of size {window}"
+                f"{self._n_windows:,} windows of size {self.context_size + 1}"
             )
 
     # ---- cache I/O ------------------------------------------------
