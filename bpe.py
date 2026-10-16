@@ -2,7 +2,7 @@ import json
 import time
 import re
 import heapq
-from collections import Counter
+from collections import Counter, OrderedDict
 from datetime import timedelta, datetime
 
 
@@ -25,6 +25,9 @@ class BPE:
         self.alphabet = set(" \t\r\n")
         self.skipped_words = 0
         self.vocab_size = vocab_size
+        self._encoding_state = None
+        self._word_cache = OrderedDict()
+        self._merge_ranks = {}
         self.merges = {}  # Dict of (a, b) => freq_at_merge
         self.vocab = {}  # Token -> ID mapping
         self.rev_vocab = {}  # ID -> Token mapping
@@ -91,6 +94,7 @@ class BPE:
         instead of only the single best one.
         """
 
+        self._encoding_state = None
         if batch_merges < 1:
             raise ValueError("batch_merges must be positive")
         vocab = self.alphabet | set(ch for word in self.word_freq for ch in word)
@@ -154,24 +158,58 @@ class BPE:
         # Start with characters + end-of-word marker
         if self.lower_case:
             word = word.lower()
+        state = (id(self.merges), id(self.vocab), self.preserve_whitespace,
+                 self.lower_case, self.end_of_word_mark)
+        if state != self._encoding_state:
+            self._merge_ranks = {pair: rank for rank, pair in enumerate(self.merges)}
+            self._word_cache.clear()
+            self._encoding_state = state
+        cached = self._word_cache.get(word)
+        if cached is not None:
+            self._word_cache.move_to_end(word)
+            return list(cached)
+
         symbols = list(word)
         if not self.preserve_whitespace:
             symbols.append(self.end_of_word_mark)
 
-        # Apply merges in the order they were learned
-        for (a, b), _ in self.merges.items():
+        # Only inspect pairs that actually occur in this word. Advance through
+        # merge ranks monotonically to preserve the original one-pass semantics,
+        # including tokenizers trained with batches of merges.
+        last_rank = -1
+        while len(symbols) > 1:
+            best_rank = len(self._merge_ranks)
+            best_pair = None
+            for i in range(len(symbols) - 1):
+                pair = (symbols[i], symbols[i + 1])
+                rank = self._merge_ranks.get(pair)
+                if rank is not None and last_rank < rank < best_rank:
+                    best_rank, best_pair = rank, pair
+            if best_pair is None:
+                break
+            merged = []
             i = 0
-            while i < len(symbols) - 1:
-                if symbols[i] == a and symbols[i + 1] == b:
-                    symbols[i : i + 2] = [a + b]
+            while i < len(symbols):
+                if (i + 1 < len(symbols)
+                        and (symbols[i], symbols[i + 1]) == best_pair):
+                    merged.append(symbols[i] + symbols[i + 1])
+                    i += 2
                 else:
+                    merged.append(symbols[i])
                     i += 1
+            symbols = merged
+            last_rank = best_rank
 
-        # Convert symbols to IDs, raising an error if unseen
         try:
-            return [self.vocab[s] for s in symbols]
+            ids = tuple(self.vocab[s] for s in symbols)
         except KeyError as e:
-            raise ValueError(f"Unknown symbol during encoding: {e.args[0]}")
+            raise ValueError(f"Unknown symbol during encoding: {e.args[0]}") from e
+        # Bound both cache entries and per-entry word size.
+        if len(word) <= 256:
+            self._word_cache[word] = ids
+            if len(self._word_cache) > 32768:
+                self._word_cache.popitem(last=False)
+        return list(ids)
 
     def encode(self, text: str):
         """Encode text into token IDs."""
@@ -240,6 +278,7 @@ class BPE:
             payload = json.load(f)
 
         # Missing flag denotes a legacy tokenizer; keep its token IDs/behavior.
+        self._encoding_state = None
         self.preserve_whitespace = payload.get("preserve_whitespace", False)
         self.lower_case = payload.get("lower_case", self.lower_case)
         self.vocab_size = int(payload.get("vocab_size", self.vocab_size))

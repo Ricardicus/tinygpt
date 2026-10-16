@@ -139,6 +139,32 @@ class CorpusTests(unittest.TestCase):
         self.assertFalse(bpe.preserve_whitespace)
         self.assertEqual(bpe.encode('hello world'), bpe.encode('  hello\n\tworld  '))
 
+    def test_fast_encoding_matches_original_ordered_merge_pass(self):
+        rng = random.Random(17)
+        words = [''.join(rng.choices('abcde', k=rng.randint(1, 30)))
+                 for _ in range(300)] + ['aaaaaaa', 'abababab', 'abcabcabc']
+        for preserve in (True, False):
+            bpe = BPE(vocab_size=100, lower_case=False)
+            bpe.preserve_whitespace = preserve
+            if not preserve:
+                bpe.alphabet.add(bpe.end_of_word_mark)
+            bpe.add_corpus(' '.join(words))
+            bpe.train()
+            for word in words:
+                symbols = list(word) + ([] if preserve else [bpe.end_of_word_mark])
+                for a, b in bpe.merges:
+                    i = 0
+                    while i < len(symbols) - 1:
+                        if symbols[i:i + 2] == [a, b]:
+                            symbols[i:i + 2] = [a + b]
+                        else:
+                            i += 1
+                expected = [bpe.vocab[symbol] for symbol in symbols]
+                actual = bpe.encode_word(word)
+                self.assertEqual(actual, expected)
+                actual.clear()
+                self.assertEqual(bpe.encode_word(word), expected)
+
     def test_config_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'config.json'

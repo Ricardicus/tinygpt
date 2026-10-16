@@ -1,4 +1,5 @@
 import os
+import time
 import hashlib
 import fnmatch
 from array import array
@@ -190,13 +191,25 @@ class TokenizedDataReader:
     # ---- internal -------------------------------------------------
     def _tokenize_folder(self):
         files = self.files
-        for fp in files:
+        started = last_report = time.monotonic()
+        if self.verbose:
+            print(f"Tokenizing {len(files)} corpus files...", flush=True)
+        for file_index, fp in enumerate(files, 1):
+            if self.verbose:
+                print(f"  [{file_index}/{len(files)}] {fp}", flush=True)
             for text in text_chunks(fp):
                 if self.lower_case:
                     text = text.lower()
                 # Report unknown characters instead of silently losing entire files.
                 try:
                     self._tokens.extend(self.bpe.encode(text))
+                    now = time.monotonic()
+                    if self.verbose and now - last_report >= 2:
+                        elapsed = now - started
+                        print(f"    {len(self._tokens):,} tokens, "
+                              f"{len(self._tokens) / max(elapsed, 0.001):,.0f} tokens/s, "
+                              f"{elapsed:.0f}s elapsed", flush=True)
+                        last_report = now
                 except ValueError as error:
                     raise ValueError(f"Cannot tokenize {fp}: {error}") from error
 
