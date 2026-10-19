@@ -6,10 +6,15 @@ import os
 import sys
 from itertools import islice
 import time
+import tempfile
+import hashlib
+import math
+import random
+from pathlib import Path
 
 from datareader import PagedDataReader, TextCorpusReader, TokenizedDataReader
 from bpe import BPE
-from corpus import load_config
+from corpus import load_config, text_chunks
 from tinygpt import TinyGPT
 
 
@@ -38,6 +43,79 @@ def str2bool(v):
     raise argparse.ArgumentTypeError("Boolean value expected for --verbose")
 
 
+def split_validation_files(files, folder, fraction, seed):
+    """Deterministically hold out whole files without changing the global RNG."""
+    if len(files) < 2:
+        raise ValueError("Validation requires at least two corpus files; use --validation-fraction 0 to disable it.")
+    root = Path(folder).resolve()
+    ranked = sorted(files, key=lambda p: hashlib.sha256(
+        f"{seed}:{Path(p).resolve().relative_to(root).as_posix()}".encode()
+    ).digest())
+    count = min(len(files) - 1, max(1, round(len(files) * fraction)))
+    held_out = set(ranked[:count])
+    return ([p for p in files if p not in held_out],
+            [p for p in files if p in held_out])
+
+
+@torch.inference_mode()
+def evaluate(model, datareader, batch_size, max_batches, device, seed=42):
+    """Token-weighted loss over a fixed sample of held-out windows."""
+    count = min(len(datareader), batch_size * max_batches)
+    if not count:
+        raise ValueError("Validation corpus has no complete context windows; use more files or a shorter context length.")
+    indices = random.Random(seed).sample(range(len(datareader)), count)
+    was_training = model.training
+    total_loss = total_tokens = 0
+    model.eval()
+    try:
+        for start in range(0, count, batch_size):
+            windows = torch.tensor([datareader[i] for i in indices[start:start + batch_size]],
+                                   dtype=torch.long, device=device)
+            logits = model(windows[:, :-1])
+            targets = windows[:, 1:]
+            total_loss += nn.functional.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), targets.reshape(-1), reduction="sum"
+            ).item()
+            total_tokens += targets.numel()
+    finally:
+        model.train(was_training)
+    loss = total_loss / total_tokens
+    return loss, math.exp(loss) if loss < 700 else float("inf"), total_tokens
+
+
+def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0):
+    """Atomically replace the latest checkpoint; epoch counts completed epochs.
+
+    A mid-epoch checkpoint resumes weights/optimizer and restarts that epoch
+    with a new shuffle. It does not promise an exact data-position resume.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    checkpoint = {
+        "epoch": epoch,
+        "step": step,
+        "global_step": global_step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "loss": loss,
+        "config": {
+            "vocab_size": model.vocab_size,
+            "context_length": model.context_length,
+            "d_model": model.d_model,
+            "n_heads": model.n_heads,
+            "num_layers": model.num_layers,
+        },
+    }
+    descriptor, temporary = tempfile.mkstemp(prefix="checkpoint-", suffix=".tmp", dir=directory)
+    os.close(descriptor)
+    try:
+        torch.save(checkpoint, temporary)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def getData(verbose=True, lower_case=True, rawdata_folder="rawdata", oneliners=[], corpus_config=None):
     if verbose:
         print("Initializing data reader...")
@@ -58,6 +136,7 @@ def getBPE(
     bpe_part=0.01,
     lower_case=True,
     bpe_max_words=100_000,
+    character_sources=(),
 ):
     """Load existing tokenizer or train a new one."""
     if tokenizer_path and os.path.exists(tokenizer_path):
@@ -104,6 +183,10 @@ def getBPE(
         if i < sample_count:
             bpe.add_corpus(row)
         else:
+            bpe.alphabet.update(row.lower() if lower_case else row)
+    # Include held-out characters for lossless encoding, without learning their merges.
+    for path in character_sources:
+        for row in text_chunks(path):
             bpe.alphabet.update(row.lower() if lower_case else row)
     if verbose:
         print(f"Training BPE merges on {sample_count}/{total} chunks.")
@@ -341,7 +424,26 @@ def parse_args(argv=None):
         default=None,
         help="Path to CSV file to append training progress (iteration, loss, mean_loss).",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--save-every-steps", type=int, default=1000,
+        help="Save the latest model every N optimizer steps (default: 1000; 0 disables interval saves). Epoch-end saves always run.",
+    )
+    parser.add_argument("--validation-fraction", type=float, default=0,
+                        help="Fraction of whole files held out from training (default: 0, disabled).")
+    parser.add_argument("--validation-every-steps", type=int, default=1000,
+                        help="Evaluate every N optimizer steps; 0 evaluates only at start and epoch end.")
+    parser.add_argument("--validation-batches", type=int, default=100,
+                        help="Maximum batches per evaluation, using the same sampled windows (default: 100).")
+    parser.add_argument("--validation-seed", type=int, default=42,
+                        help="Seed for the file split and validation window sample (default: 42).")
+    args = parser.parse_args(argv)
+    if args.save_every_steps < 0:
+        parser.error("--save-every-steps must be nonnegative")
+    if not 0 <= args.validation_fraction < 1:
+        parser.error("--validation-fraction must be at least 0 and less than 1")
+    if args.validation_every_steps < 0 or args.validation_batches < 1:
+        parser.error("Validation interval must be nonnegative and validation batches must be positive")
+    return args
 
 def main(argv=None):
     args = parse_args(argv)
@@ -533,6 +635,19 @@ def main(argv=None):
         oneliners=oneliners,
         corpus_config=corpus_config,
     )
+    validation_files = None
+    reader_options = {}
+    if args.validation_fraction:
+        training_files, validation_files = split_validation_files(
+            raw_datareader.files, args.rawdata, args.validation_fraction, args.validation_seed)
+        raw_datareader.files = training_files
+        raw_datareader._length = None
+        folder = Path(args.rawdata)
+        reader_options = {"files": training_files,
+                          "cache_path": folder.parent / f"{folder.name}_train_tokens.bin"}
+        print(f"File split: {len(training_files):,} training, {len(validation_files):,} validation (seed {args.validation_seed}).", flush=True)
+        if ckpt_state is not None:
+            print("Validation on a resumed model may include files seen before this split was enabled.", flush=True)
     bpe = getBPE(
         raw_datareader,
         vocab_size=args.vocab_size,
@@ -541,6 +656,7 @@ def main(argv=None):
         bpe_part=args.bpe_part,
         lower_case=args.lower_case,
         bpe_max_words=args.bpe_max_words,
+        character_sources=validation_files or (),
     )
     args.vocab_size = bpe.vocab_size
 
@@ -554,7 +670,20 @@ def main(argv=None):
         verbose=args.verbose,
         cache=True,
         corpus_config=corpus_config,
+        **reader_options,
     )
+
+    validation_reader = None
+    if validation_files is not None:
+        folder = Path(args.rawdata)
+        validation_reader = TokenizedDataReader(
+            folder=args.rawdata, files=validation_files, bpe=bpe,
+            context_size=args.context_length, shuffle=False,
+            lower_case=args.lower_case, verbose=args.verbose, cache=True,
+            cache_path=folder.parent / f"{folder.name}_validation_tokens.bin",
+            corpus_config=corpus_config)
+        if not len(datareader) or not len(validation_reader):
+            raise ValueError("Training and validation each need at least one complete context window; adjust the split or context length.")
 
     if args.verbose:
         print(args)
@@ -576,17 +705,43 @@ def main(argv=None):
         num_layers=args.num_layers,
     ).to(args.device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    global_step = 0
     if ckpt_state is not None:
         model.load_state_dict(ckpt_state)
         if ckpt_optim is not None:
             optimizer.load_state_dict(ckpt_optim)
         print("✅ Loaded model and optimizer state from checkpoint.")
+        global_step = checkpoint.get("global_step", 0)
+        if checkpoint.get("step", 0):
+            print("Resuming a mid-epoch checkpoint: restarting the saved epoch with a new data shuffle.")
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total trainable parameters: {num_params:,}")
 
     loss_fn = nn.CrossEntropyLoss()
     model.train()
+
+    last_validation_step = None
+
+    def report_validation(epoch):
+        nonlocal last_validation_step
+        val_loss, perplexity, tokens = evaluate(
+            model, validation_reader, args.batch_size, args.validation_batches,
+            args.device, args.validation_seed)
+        print(f"Validation | Step {global_step:,} | Loss: {val_loss:.4f} | Perplexity: {perplexity:.2f} | Tokens: {tokens:,}", flush=True)
+        if args.log_progress:
+            import csv
+            path = args.log_progress + ".validation.csv"
+            exists = os.path.exists(path) and os.path.getsize(path) > 0
+            with open(path, "a", newline="") as output:
+                writer = csv.writer(output)
+                if not exists:
+                    writer.writerow(["epoch", "global_step", "validation_loss", "perplexity", "tokens"])
+                writer.writerow([epoch, global_step, val_loss, perplexity, tokens])
+        last_validation_step = global_step
+
+    if validation_reader is not None:
+        report_validation(start_epoch)
 
     # ---------------------------------------------------------
     # --- Training loop ---
@@ -619,10 +774,19 @@ def main(argv=None):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            global_step += 1
 
             total_loss += loss.item()
             step += 1
             avg_loss = total_loss / step
+
+            if (validation_reader is not None and args.validation_every_steps
+                    and global_step % args.validation_every_steps == 0):
+                report_validation(epoch + 1)
+
+            if args.save_every_steps and global_step % args.save_every_steps == 0:
+                save_checkpoint(args.model, model, optimizer, epoch, avg_loss, global_step, step)
+                print(f"Checkpoint saved at optimizer step {global_step:,}: {args.model}", flush=True)
 
             # Log progress to CSV if requested
             if args.log_progress:
@@ -636,30 +800,16 @@ def main(argv=None):
 
             if args.verbose and step % 10 == 0:
                 print(
-                    f"Step {step:6d} | Avg Loss: {avg_loss:.4f} | Inference: {inference_time:.4f}s"
+                    f"Epoch {epoch + 1}/{args.epochs} | Step {step:6d} | Avg Loss: {avg_loss:.4f} | Inference: {inference_time:.4f}s"
                 )
 
         mean_loss = total_loss / max(1, step)
         print(f"Epoch {epoch+1} complete | Mean loss: {mean_loss:.4f}")
+        if validation_reader is not None and last_validation_step != global_step:
+            report_validation(epoch + 1)
 
         # --- Save model checkpoint ---
-        os.makedirs(os.path.dirname(args.model), exist_ok=True)
-        torch.save(
-            {
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "loss": mean_loss,
-                "config": {
-                    "vocab_size": model.vocab_size,
-                    "context_length": model.context_length,
-                    "d_model": model.d_model,
-                    "n_heads": model.n_heads,
-                    "num_layers": model.num_layers,
-                },
-            },
-            args.model,
-        )
+        save_checkpoint(args.model, model, optimizer, epoch + 1, mean_loss, global_step)
 
         print(f"💾 Checkpoint saved to {args.model}")
 

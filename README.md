@@ -61,6 +61,45 @@ Once the tokenizer is trained, it will try to train the model on your data.
 If you provide the program with --model it will read its hyperparameters from that
 saved pytorch-file. 
 
+Training saves the latest model and optimizer to `--model` every 1,000 optimizer
+steps and at the end of each epoch. Set `--save-every-steps 500` to change the
+interval, or `0` for epoch-end saves only. Each save atomically replaces the
+previous checkpoint. Restarting with the same model path resumes saved weights
+and optimizer state; a checkpoint saved during an epoch restarts that epoch with
+a new shuffle rather than restoring the exact data position. Changes to the
+save interval apply when launching a new training process.
+
+Enable validation with `--validation-fraction 0.05` (the prepared dataset's
+`train.sh` uses this by default after refreshing helpers). A deterministic split
+holds out 5% of whole files from model training. Validation reports token-weighted
+cross-entropy loss and perplexity before training, every 1,000 optimizer steps,
+and at epoch end. Lower is better. Use `--validation-every-steps 500` to change
+the interval and `--validation-batches 100` to cap evaluation cost. Every check
+uses the same sampled windows across the held-out corpus. With `--log-progress`,
+validation records go into a separate `<log path>.validation.csv` file.
+
+The split is by file count rather than bytes and repeats with the same corpus
+and `--validation-seed` (default 42). Training and validation use separate token
+caches; enabling the split requires tokenization once. The tokenizer vocabulary
+is shared; a new tokenizer learns merges from training files and includes
+held-out characters for encoding. A prepared tokenizer may have learned merges
+from the full corpus. Models trained before validation was enabled have already
+seen the corpus, so use a fresh model path for an unseen-data evaluation.
+Disable validation with `--validation-fraction 0` (the default for `main.py`).
+
+Generate text from a trained checkpoint:
+
+```bash
+python other/inference.py --model raw-data/artifacts/model.pt \
+  --prompt "Once upon a time" --max-new-tokens 100
+```
+
+The script loads the model architecture from the checkpoint and defaults to
+`tokenizer.json` beside the model. Use `--tokenizer PATH` if it is elsewhere;
+it must be the tokenizer used during training. Omit `--prompt` to enter it
+interactively. Output includes the prompt followed by the generated text.
+Use `--seed 42` for repeatable sampling and `--device cpu` to select the CPU.
+
 # Other
 
 Not sure about what data to train on? Under other/ there is a script that downloads
@@ -69,6 +108,20 @@ instead downloads the top 50 books. That can serve as a dataset if you don't kno
 what to train on. 
 
 ## Training on a cloned repository
+
+To prepare a complete book and code corpus (20 Rust repositories, five C/C++
+repositories, and Linux), run:
+
+```bash
+python3 other/prepare_example_dataset.py
+```
+
+The script prompts for a destination folder, downloads or reuses sources, filters
+and deduplicates the text, and records source revisions and licenses. Use
+`--fresh-downloads` to download every source instead of automatically reusing
+local books and Linux. The resulting folder contains its own README and a
+`train.sh` launcher. Preparation requires Python 3.10+ and Git; model training
+requires the dependencies above.
 
 Use Python 3.10 or newer. Folder scanning is recursive, for both tokenizer
 training and model pretraining. Edit `training_data.json` to choose suffixes

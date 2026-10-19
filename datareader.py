@@ -91,6 +91,7 @@ class TokenizedDataReader:
         cache: bool = False,
         cache_path: Optional[str | Path] = None,
         corpus_config=None,
+        files=None,
     ):
         self.folder = Path(folder)
         if not self.folder.is_dir():
@@ -98,7 +99,7 @@ class TokenizedDataReader:
                 f"Folder {self.folder} does not exist or is not a directory."
             )
 
-        self.files = discover_files(self.folder, corpus_config)
+        self.files = [Path(p) for p in files] if files is not None else discover_files(self.folder, corpus_config)
         if glob_pattern:
             self.files = [p for p in self.files if fnmatch.fnmatch(p.name, glob_pattern)]
         if not self.files:

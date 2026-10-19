@@ -55,6 +55,14 @@ class CorpusTests(unittest.TestCase):
             self.assertFalse(restored.lower_case)
             self.assertEqual(restored.encode('apple'), bpe.encode('apple'))
 
+    def test_bpe_rejects_alphabet_that_leaves_no_room_for_merges(self):
+        bpe = BPE(vocab_size=16)
+        bpe.add_corpus("abcdefghijklmnopqrstuvwxyz")
+        with self.assertRaisesRegex(ValueError, "increase vocab_size"):
+            bpe.train()
+        self.assertTrue(bpe.word_freq)
+        self.assertFalse(bpe.vocab)
+
     def test_cache_invalidates_for_corpus_and_tokenizer(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'data'

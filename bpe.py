@@ -101,6 +101,11 @@ class BPE:
         other_chars = ["'", '"', "<", "-", ">", "?", "!", ":"]
         for ch in other_chars:
             vocab.add(ch)
+        if len(vocab) >= self.vocab_size:
+            raise ValueError(
+                f"BPE base alphabet requires {len(vocab):,} tokens, but vocab_size "
+                f"is {self.vocab_size:,}; increase vocab_size to leave room for merges."
+            )
         iteration = 0
 
         while len(vocab) < self.vocab_size:
