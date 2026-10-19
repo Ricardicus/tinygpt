@@ -3,6 +3,7 @@ from pathlib import Path
 import json
 import runpy
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -10,6 +11,48 @@ from other import prepare_example_dataset as builder
 
 
 class DatasetPreparationTests(unittest.TestCase):
+    def test_resume_rebuilds_partial_corpus_and_preserves_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            partial = root / "corpus/code/old.h"
+            partial.parent.mkdir(parents=True)
+            partial.write_text("partial output")
+            source = root / "sources/repos/cache.txt"
+            source.parent.mkdir(parents=True)
+            source.write_text("cached source")
+            notices = root / "metadata/licenses/NOTICE"
+            notices.parent.mkdir(parents=True)
+            notices.write_text("notice")
+            books = root / "local-books"
+            books.mkdir()
+            (books / "book.txt").write_text("book")
+            with patch.object(builder, "fetch_repositories") as fetch, \
+                 patch.object(builder, "books") as prepare_books, \
+                 patch.object(builder, "code", return_value=[]), \
+                 patch.object(builder, "write_helpers"), patch.object(builder.subprocess, "run"):
+                builder.main(["--output", directory, "--resume", "--books-dir", str(books)])
+            fetch.assert_called_once_with((root / "sources/repos").resolve(), set())
+            prepare_books.assert_called_once()
+            self.assertEqual(source.read_text(), "cached source")
+            backup, = (root / "metadata").glob("interrupted-build-*")
+            self.assertEqual((backup / "corpus/code/old.h").read_text(), "partial output")
+            self.assertEqual((backup / "licenses/NOTICE").read_text(), "notice")
+            self.assertFalse(partial.exists())
+            self.assertTrue((root / "metadata/summary.json").exists())
+
+    def test_resume_rejects_completed_dataset_without_moving_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "metadata").mkdir()
+            (root / "metadata/summary.json").write_text('{}')
+            (root / "corpus").mkdir()
+            with patch.object(builder, "fetch_repositories") as fetch:
+                with self.assertRaises(SystemExit):
+                    builder.main(["--output", directory, "--resume"])
+            fetch.assert_not_called()
+            self.assertTrue((root / "corpus").exists())
+            self.assertFalse(list((root / "metadata").glob("interrupted-build-*")))
+
     def test_refresh_helpers_does_not_fetch_or_rebuild_corpus(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -98,9 +141,9 @@ class DatasetPreparationTests(unittest.TestCase):
                 path = source / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(data)
-            answers = ["a" * 40 + "\n", ("\0".join(samples) + "\0").encode(), ""]
+            answers = ["a" * 40 + "\n"]
             records, omitted = [], []
-            with patch.object(builder, "ROOT", root / "output"), patch.object(builder, "REPOS", [("test/rust", "Rust")]), patch.object(builder.subprocess, "check_output", side_effect=answers):
+            with patch.object(builder, "ROOT", root / "output"), patch.object(builder, "REPOS", [("test/rust", "Rust")]), patch.object(builder.subprocess, "check_output", side_effect=answers), patch.object(builder, "committed_files", return_value=((name, len(data), data, False) for name, data in samples.items())):
                 repos = builder.code(root / "clones", records, omitted)
             self.assertEqual(len(records), 1)
             self.assertEqual(repos[0]["counts"]["duplicate"], 1)
@@ -108,6 +151,34 @@ class DatasetPreparationTests(unittest.TestCase):
             self.assertIn('    println!("Hi");', prepared)
             self.assertTrue(prepared.endswith("\n\n"))
             self.assertEqual(len(omitted), 5)
+
+    def test_committed_blobs_ignore_dirty_checkout_and_preserve_case_collisions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "clones/test--c"
+            source.mkdir(parents=True)
+            def git(*args, data=None):
+                return subprocess.check_output(["git", "-C", str(source), *args], input=data)
+            git("init", "-q")
+            samples = {"same.h": b"int lowercase;\n", "SAME.h": b"int uppercase;\n",
+                       "LICENSE": b"Example license\n"}
+            for name, data in samples.items():
+                oid = git("hash-object", "-w", "--stdin", data=data).decode().strip()
+                git("update-index", "--add", "--cacheinfo", f"100644,{oid},{name}")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "fixture")
+            (source / "same.h").write_text("local edit must not enter corpus")
+            before = git("status", "--porcelain")
+            records, omitted = [], []
+            with patch.object(builder, "ROOT", root / "output"), patch.object(builder, "REPOS", [("test/c", "C")]):
+                repos = builder.code(root / "clones", records, omitted)
+            self.assertEqual(len(records), 2)
+            self.assertEqual(len({r["path"].casefold() for r in records}), 2)
+            for record in records:
+                self.assertEqual(record["source_sha256"], builder.sha(samples[record["source"]]))
+                self.assertNotIn(b"local edit", (root / "output" / record["path"]).read_bytes())
+            self.assertEqual(git("status", "--porcelain"), before)
+            license_path = root / "output" / repos[0]["licenses"][0]
+            self.assertEqual(license_path.read_bytes(), samples["LICENSE"])
 
     def test_html_download_is_rejected(self):
         class Response:

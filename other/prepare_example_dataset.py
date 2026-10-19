@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tempfile
 import unicodedata
 from urllib.request import Request, urlopen
 import zlib
@@ -276,6 +277,52 @@ def books(records, omitted):
         print("Book:", source.name, flush=True)
 
 
+def committed_files(source, commit):
+    """Read regular blobs from a fixed commit, independent of checkout state."""
+    tree = subprocess.check_output(["git", "-C", str(source), "ls-tree", "-rlz", commit])
+    process = subprocess.Popen(["git", "-C", str(source), "cat-file", "--batch"],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    try:
+        for entry in sorted(filter(None, tree.split(b"\0")), key=lambda e: e.split(b"\t", 1)[1]):
+            header, filename = entry.split(b"\t", 1)
+            mode, kind, oid, size = header.split()
+            if mode not in (b"100644", b"100755") or kind != b"blob":
+                continue
+            name = filename.decode("utf-8")
+            rel = Path(name)
+            license_file = (rel.name.upper().startswith(("LICENSE", "LICENCE", "COPYING", "NOTICE", "COPYRIGHT")) or "LICENSES" in rel.parts)
+            if rel.suffix.lower() not in SUFFIXES and not license_file:
+                continue
+            size = int(size)
+            raw = None
+            if size <= 1024 * 1024 or license_file:
+                process.stdin.write(oid + b"\n")
+                process.stdin.flush()
+                response = process.stdout.readline().split()
+                if len(response) != 3 or response[1] != b"blob" or int(response[2]) != size:
+                    raise RuntimeError(f"Cannot read committed blob: {source}: {name}")
+                raw = process.stdout.read(size)
+                if len(raw) != size or process.stdout.read(1) != b"\n":
+                    raise RuntimeError(f"Truncated committed blob: {source}: {name}")
+            yield name, size, raw, license_file
+    finally:
+        process.stdin.close()
+        process.stdout.close()
+        process.wait()
+
+
+def output_relative(name, used):
+    """Avoid case-only path collisions on case-insensitive destination volumes."""
+    rel = Path(name)
+    candidate = rel
+    index = 0
+    while candidate.as_posix().casefold() in used:
+        index += 1
+        candidate = rel.with_name(f"{rel.stem}__{sha(name.encode())[:12]}_{index}{rel.suffix}")
+    used.add(candidate.as_posix().casefold())
+    return candidate
+
+
 def code(clones, records, omitted, repositories=None):
     repositories = list(repositories or [])
     completed = {r["repository"] for r in repositories}
@@ -294,25 +341,17 @@ def code(clones, records, omitted, repositories=None):
         key = repo.replace("/", "--")
         source = LINUX_SOURCE if repo == "torvalds/linux" else clones / key
         commit = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
-        tracked = subprocess.check_output(["git", "-C", str(source), "ls-files", "-z"]).decode().split("\0")
-        dirty = subprocess.check_output(["git", "-C", str(source), "status", "--porcelain", "-uno"], text=True)
-        if dirty:
-            raise RuntimeError(f"Source checkout has tracked modifications: {source}")
         counts = Counter()
         license_paths = []
-        for name in sorted(filter(None, tracked)):
+        used_names = set()
+        used_license_names = set()
+        print(f"Reading committed files: {repo} ({commit[:12]})", flush=True)
+        for name, size, raw, license_file in committed_files(source, commit):
             rel = Path(name)
-            path = source / rel
-            # Never follow source symlinks, including symlinked parents.
-            if any(p.is_symlink() for p in [path, *list(path.parents)[:len(rel.parts) - 1]]):
-                counts["symlink"] += 1
-                continue
-            if not path.is_file():
-                continue
-            if (rel.name.upper().startswith(("LICENSE", "LICENCE", "COPYING", "NOTICE", "COPYRIGHT")) or "LICENSES" in rel.parts) and ".git" not in rel.parts:
-                dest = ROOT / "metadata/licenses" / key / rel
+            if license_file:
+                dest = ROOT / "metadata/licenses" / key / output_relative(name, used_license_names)
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(path, dest)
+                dest.write_bytes(raw)
                 license_paths.append(str(dest.relative_to(ROOT)))
             if rel.suffix.lower() not in SUFFIXES:
                 continue
@@ -323,10 +362,9 @@ def code(clones, records, omitted, repositories=None):
                 reason = "compiler test fixture"
             elif set(rel.parts[:-1]) & (EXCLUDED | {"ui", "compile-fail", "compile_fail", "test_data"}):
                 reason = "excluded directory"
-            elif path.stat().st_size > 1024 * 1024:
+            elif size > 1024 * 1024:
                 reason = "over 1 MiB"
             else:
-                raw = path.read_bytes()
                 try:
                     text = raw.decode("utf-8-sig")
                 except UnicodeDecodeError:
@@ -355,7 +393,7 @@ def code(clones, records, omitted, repositories=None):
                 counts["duplicate"] += 1
                 omitted.append({"repository": repo, "source": name, "reason": "duplicate", "kept": seen[normalized]})
                 continue
-            dest = ROOT / "corpus/code" / key / rel
+            dest = ROOT / "corpus/code" / key / output_relative(name, used_names)
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
             relative = str(dest.relative_to(ROOT))
@@ -516,8 +554,15 @@ a folder name; `--output PATH` chooses one noninteractively. The standalone scri
 requires Python 3.10+ and Git. It uses local `rawdata` and the local Linux checkout
 when available; `--fresh-downloads` downloads everything. For downloaded books,
 the KJV Bible uses Gutenberg ebook 10 rather than the project's local edition.
+For an interrupted build, run with `--output PATH --resume`: cached downloads
+are reused and the corpus is rebuilt. Partial corpus and license/notice output
+is preserved under `metadata/interrupted-build-*`, outside training discovery.
+Completed datasets require `--extend` instead.
 Downloads use current upstream revisions and record hashes/commits; future builds
-can differ. Original local files and checkouts are never modified.
+can differ. Repository contents come from the recorded Git commit, ignoring staged or
+unstaged edits and avoiding case-colliding checkout files on macOS. Case-only
+output filename collisions receive a deterministic suffix; metadata retains the
+original source path. Original local files and checkouts are never modified.
 ''', encoding="utf-8")
 
 
@@ -530,9 +575,11 @@ def main(argv=None):
     parser.add_argument("--linux-source", type=Path, help="Reuse an existing Linux checkout")
     parser.add_argument("--fresh-downloads", action="store_true", help="Ignore automatic local book/Linux reuse")
     parser.add_argument("--extend", action="store_true", help="Add missing repositories to a completed dataset")
-    parser.add_argument("--resume", action="store_true", help="Reuse an interrupted download directory before corpus creation")
+    parser.add_argument("--resume", action="store_true", help="Reuse downloads and rebuild an interrupted corpus, preserving partial output in metadata")
     parser.add_argument("--refresh-helpers", action="store_true", help="Update helper scripts in a completed dataset without rebuilding its corpus")
     args = parser.parse_args(argv)
+    if args.resume and args.extend:
+        parser.error("Choose either --resume for an interrupted build or --extend for a completed dataset")
     if args.output is None:
         default = "codex-prepared-data"
         index = 2
@@ -561,10 +608,24 @@ def main(argv=None):
             parser.error("--extend requires a completed dataset")
     elif ROOT.exists() and any(ROOT.iterdir()) and not args.resume:
         parser.error("Destination is not empty; choose another folder, --extend, or --resume")
-    if (ROOT / "corpus").exists() and not args.extend:
-        parser.error("A corpus already exists; use --extend or choose another folder")
+    if args.resume and any((ROOT / "metadata" / name).exists()
+                           for name in ("summary.json", "files.jsonl")):
+        parser.error("Dataset has completion metadata; use --extend or choose another folder")
+    if (ROOT / "corpus").exists() and not (args.extend or args.resume):
+        parser.error("A corpus already exists; use --resume for an interrupted build or --extend for a completed dataset")
     ROOT.mkdir(parents=True, exist_ok=True)
     (ROOT / "metadata").mkdir(exist_ok=True)
+    if args.resume and (ROOT / "corpus").exists():
+        # Older builds have no per-repository checkpoints. Rebuild deterministically
+        # from cached sources, keeping partial outputs out of the training corpus.
+        partials = [ROOT / "corpus", ROOT / "metadata/licenses", ROOT / "metadata/book-notices"]
+        if any(path.is_symlink() for path in partials):
+            parser.error("Cannot resume through symlinked corpus or metadata directories")
+        backup = Path(tempfile.mkdtemp(prefix="interrupted-build-", dir=ROOT / "metadata"))
+        for path in partials:
+            if path.exists():
+                path.rename(backup / path.name)
+        print(f"Preserved partial output in {backup}; rebuilding from cached sources.", flush=True)
     clones = (args.clones_root or ROOT / "sources/repos").expanduser().resolve()
     local_linux = args.linux_source or (PROJECT / "code-bases/linux" if not args.fresh_downloads else clones / "torvalds--linux")
     LINUX_SOURCE = local_linux.expanduser().resolve() if local_linux.exists() else clones / "torvalds--linux"
