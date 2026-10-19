@@ -107,13 +107,44 @@ the top 10 books in text format from Project Gutenberg. If you use the flag --to
 instead downloads the top 50 books. That can serve as a dataset if you don't know 
 what to train on. 
 
-## Training on a cloned repository
+## English Wikipedia dataset
+
+English Wikipedia is a useful starting point for factual English prose. It teaches
+an encyclopedic style; pretraining alone does not teach chat or instruction following.
+The new preparation script selects the cleaned `20231101.en` snapshot from
+[Wikimedia's Wikipedia dataset](https://huggingface.co/datasets/wikimedia/wikipedia).
+Start with the default 256 MiB subset before scaling up:
+
+```bash
+python -m pip install datasets
+python other/prepare_wikipedia_dataset.py
+bash wikipedia-downloaded-data/train.sh
+```
+
+The script downloads from the internet and never reads `fullEnglish/` or other
+local source folders. Output defaults to `wikipedia-downloaded-data`; use
+`--output PATH` to choose another destination.
+The download streams with a seeded, bounded shuffle. Increase `--max-mib 1024`
+for a larger corpus, or use `--max-files 1000` to limit accepted articles.
+Preparation never starts training and refuses to overwrite a nonempty destination.
+The generated launcher uses separate tokenizer/model paths and holds out 5% of
+files for validation. The corpus config accepts only `.txt`; metadata and training
+artifacts are stored outside the corpus.
+
+The script filters recognizable code blocks, code-like paragraphs, markup and
+short fragments, and removes exact cleaned-file duplicates. English Wikipedia can
+still contain foreign quotations and snippets that these heuristics miss. No source
+repositories or books are mixed in. Article URLs and file hashes are recorded in
+`metadata/files.jsonl`. See the
+dataset card for its CC BY-SA/GFDL licensing information.
+
+## Books and source-code dataset (previous example)
 
 To prepare a complete book and code corpus (20 Rust repositories, five C/C++
 repositories, and Linux), run:
 
 ```bash
-python3 other/prepare_example_dataset.py
+python3 other/prepare_books_and_code_dataset.py
 ```
 
 The script prompts for a destination folder, downloads or reuses sources, filters
@@ -122,6 +153,11 @@ and deduplicates the text, and records source revisions and licenses. Use
 local books and Linux. The resulting folder contains its own README and a
 `train.sh` launcher. Preparation requires Python 3.10+ and Git; model training
 requires the dependencies above.
+
+This is the original dataset builder, renamed from `prepare_example_dataset.py`.
+Its books, repository list and preparation behavior are preserved.
+
+## Training on a cloned repository
 
 Use Python 3.10 or newer. Folder scanning is recursive, for both tokenizer
 training and model pretraining. Edit `training_data.json` to choose suffixes
