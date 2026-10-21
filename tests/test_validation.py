@@ -87,6 +87,12 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(steps[-1], checkpoint['global_step'])
             self.assertEqual(len(steps), len(set(steps)))
             self.assertTrue(all(math.isfinite(float(row['validation_loss'])) for row in rows))
+            with log.open() as source:
+                progress = list(csv.DictReader(source))
+            self.assertEqual(len(progress), checkpoint['global_step'])
+            for step, row in enumerate(progress, 1):
+                latest = [r for r in rows if int(r['global_step']) <= step][-1]
+                self.assertEqual(float(row['validation_loss']), float(latest['validation_loss']))
             self.assertTrue((root / 'corpus_train_tokens.bin').exists())
             self.assertTrue((root / 'corpus_validation_tokens.bin').exists())
             train_files, valid_files = training.split_validation_files(sorted(corpus.glob('*.txt')), corpus, .25, 42)
@@ -97,6 +103,31 @@ class ValidationTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 training.main(args + ['--epochs', '2'])
             self.assertEqual(torch.load(model, map_location='cpu')['epoch'], 2)
+            with log.open() as source:
+                resumed = list(csv.DictReader(source))
+            self.assertEqual(resumed[:len(progress)], progress)
+            self.assertTrue(all(math.isfinite(float(row['validation_loss'])) for row in resumed))
+
+    def test_legacy_progress_log_is_upgraded_without_inventing_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'progress.csv'
+            path.write_text('epoch,step,loss,mean_loss\n3,14575,2.049,2.176\n')
+            training.prepare_progress_log(path)
+            with path.open() as source:
+                reader = csv.DictReader(source)
+                self.assertEqual(reader.fieldnames, training.PROGRESS_COLUMNS)
+                self.assertEqual(list(reader), [dict(epoch='3', step='14575', loss='2.049',
+                                                    mean_loss='2.176', validation_loss='')])
+            before = path.read_bytes()
+            training.prepare_progress_log(path)
+            self.assertEqual(path.read_bytes(), before)
+            # A malformed old log is not replaced with a partially upgraded one.
+            path.write_text('epoch,step,loss,mean_loss\n1,1,2\n')
+            before = path.read_bytes()
+            with self.assertRaisesRegex(ValueError, 'Malformed'):
+                training.prepare_progress_log(path)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(Path(directory).iterdir()), [path])
 
     def test_invalid_options_are_rejected(self):
         for options in (['--validation-fraction', '1'], ['--validation-fraction', '-.1'],

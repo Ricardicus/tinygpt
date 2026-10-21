@@ -76,7 +76,11 @@ cross-entropy loss and perplexity before training, every 1,000 optimizer steps,
 and at epoch end. Lower is better. Use `--validation-every-steps 500` to change
 the interval and `--validation-batches 100` to cap evaluation cost. Every check
 uses the same sampled windows across the held-out corpus. With `--log-progress`,
-validation records go into a separate `<log path>.validation.csv` file.
+each progress row includes the latest `validation_loss`, carried forward between
+checks. The last row of each epoch includes that epoch's final validation result.
+The column is blank when validation is disabled. Existing four-column logs are
+upgraded automatically when training restarts; historical validation values stay
+blank. Detailed validation records also go into `<log path>.validation.csv`.
 
 The split is by file count rather than bytes and repeats with the same corpus
 and `--validation-seed` (default 42). Training and validation use separate token
@@ -100,7 +104,64 @@ it must be the tokenizer used during training. Omit `--prompt` to enter it
 interactively. Output includes the prompt followed by the generated text.
 Use `--seed 42` for repeatable sampling and `--device cpu` to select the CPU.
 
+For more conservative generation, both `main.py` and `other/inference.py` accept
+`--temperature 0.7 --top-k 40 --seed 42`. Temperature 0 selects the most probable
+token each time; the defaults (temperature 1 and top-k 0) retain unrestricted
+sampling. Start with 50–100 new tokens to assess coherence. Sampling controls
+can reduce unlikely continuations but do not establish factual accuracy.
+Inference uses the saved tokenizer's case setting, preserving case when it was
+trained with `--lower-case false`.
+
 # Other
+
+## Interactive dataset downloader
+
+Choose several sources, limits and a destination in a checkbox terminal UI:
+
+```bash
+source venv/bin/activate
+pip install -r requirements.txt
+python other/download_datasets.py
+```
+
+Available sources are English Wikipedia, Dolly 15k, FineWeb-Edu and Project
+Gutenberg's top 100 books over the last seven days. Use **Up/Down** to move,
+**Space** to toggle a source, **A** to select/deselect all, **E** to edit its
+limit, **F** for `full`, and **O** to edit the output folder. **Ctrl-U** clears
+an edit field. Press **Enter** to review the selection, then **Enter** again to
+download; **B** returns to editing and **Q** cancels. The suggested folder includes
+the source names and limits, for example
+`datasets/wikipedia-0.25gb_dolly-full_fineweb-edu-1gb_gutenberg-full`.
+It updates with your selection unless you enter a custom path.
+
+Each selected source accepts a positive decimal GB amount such as `0.25` or
+`1.5`, or `full`. Limits count saved UTF-8 training text, with **1 GB =
+1,000,000,000 bytes**, preserving whole documents; the result can be slightly
+below the cap or smaller if the source ends first. Network traffic, streaming
+buffers, caches, filesystem overhead and training RAM are additional.
+`full` processes the entire pinned source after filtering and deduplication.
+For FineWeb-Edu this means the complete collection, which is very large;
+for Gutenberg it means all 100 books in the retrieved chart.
+
+The downloader streams Hugging Face sources and stores document hashes in SQLite
+to avoid keeping a full-dataset hash set in RAM. It filters Wikipedia/FineWeb
+prose, preserves Dolly instruction/context/response pairs (including short
+answers), and keeps Gutenberg book notices. Exact duplicates across selected
+sources are omitted. Dolly is formatted as training text; the trainer still
+performs ordinary next-token prediction. Source revisions, document URLs, hashes
+and actual sizes are recorded under `metadata/`.
+
+Downloads show progress in the terminal. Existing nonempty folders are refused.
+Interrupted downloads retain their text and metadata, with a partial status in
+`metadata/summary.json`; this downloader currently requires a fresh folder to
+retry. Completion creates `training_data.json` and `train.sh`. Start training
+separately with `bash <chosen-folder>/train.sh`.
+
+For terminals without curses, use the line-based multi-selection wizard:
+
+```bash
+python other/download_datasets.py --plain
+```
 
 Not sure about what data to train on? Under other/ there is a script that downloads
 the top 10 books in text format from Project Gutenberg. If you use the flag --top50 it
@@ -137,6 +198,59 @@ still contain foreign quotations and snippets that these heuristics miss. No sou
 repositories or books are mixed in. Article URLs and file hashes are recorded in
 `metadata/files.jsonl`. See the
 dataset card for its CC BY-SA/GFDL licensing information.
+
+## English Wikipedia + 1 GiB of FineWeb-Edu
+
+Prepare a new mixed corpus and its own training launcher:
+
+```bash
+python other/prepare_wikipedia_fineweb_dataset.py
+bash wikipedia-fineweb-data/train.sh
+```
+
+The script reuses `wikipedia-downloaded-data` after verifying its manifest and
+file hashes. If absent, it downloads the same 256 MiB English Wikipedia subset
+used by the standalone script. All of the existing subset is included when reused.
+Use `--wikipedia-dir PATH` to choose a different prepared download or
+`--wikipedia-mib 1024` to increase the Wikipedia subset when downloading it anew.
+It does not use `fullEnglish/` or the old books/code corpus.
+
+FineWeb-Edu is downloaded one cached Parquet shard at a time from `sample-10BT`,
+then read locally in small batches without threaded remote Parquet reads. It uses English language
+metadata and language score >= 0.9. The default `--fineweb-mib 1024` adds up to
+1 GiB (1,073,741,824 bytes) of cleaned UTF-8 text, stopping just below the limit
+to keep whole documents. This is additional to Wikipedia. Compressed download
+sizes, Hub caches and filesystem overhead are not counted. Exact duplicates are
+removed across both sources; prose/code filtering is heuristic, as above.
+
+The launcher uses width **512**, **8 layers**, **8 heads**, context **512** and an
+8,192-token vocabulary: about **29.7M parameters**. Defaults are batch size 4,
+learning rate 0.0003, 3 epochs and 5% validation. Override, for example, with
+`bash wikipedia-fineweb-data/train.sh --batch-size 2 --epochs 1`.
+It creates fresh model/tokenizer artifacts; existing Wikipedia training artifacts
+are not reused. Model training still holds token IDs and shuffle indices in RAM.
+
+Source URLs, hashes, revisions and actual byte counts are recorded under
+`metadata/`. Existing nonempty output folders are protected. Interrupted mixed
+builds can be verified and continued with:
+
+```bash
+python other/prepare_wikipedia_fineweb_dataset.py --resume
+```
+
+Resume replays cached shards and skips documents already in the manifest. For a
+nearly complete build, finalize the collected text without further network access:
+
+```bash
+python other/prepare_wikipedia_fineweb_dataset.py --finalize-existing
+```
+
+Both recovery modes verify hashes and report progress every 5,000 documents.
+Partial manifest tails and unlisted files from an interrupted write are preserved
+under `metadata/`. Finalization records the actual size, which may be below 1 GiB.
+New builds record their source revision before collection. For an older interrupted
+build, `--fineweb-revision COMMIT` supplies its known revision; otherwise it is
+marked unknown. Completed datasets cannot be overwritten using recovery options.
 
 ## Books and source-code dataset (previous example)
 

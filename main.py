@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import argparse
+import csv
 import os
 import sys
 from itertools import islice
@@ -114,6 +115,51 @@ def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+PROGRESS_COLUMNS = ["epoch", "step", "loss", "mean_loss", "validation_loss"]
+
+
+def prepare_progress_log(path):
+    """Add the validation column to legacy logs, leaving old values unknown."""
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        with path.open("w", newline="") as output:
+            csv.writer(output).writerow(PROGRESS_COLUMNS)
+        return
+    with path.open(newline="") as source:
+        reader = csv.reader(source)
+        header = next(reader)
+        if header == PROGRESS_COLUMNS:
+            return
+        if header != PROGRESS_COLUMNS[:-1]:
+            raise ValueError(f"Unexpected progress CSV columns in {path}: {header}")
+        descriptor, temporary = tempfile.mkstemp(prefix="progress-", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w", newline="") as output:
+                writer = csv.writer(output)
+                writer.writerow(PROGRESS_COLUMNS)
+                for row in reader:
+                    if len(row) != len(header):
+                        raise ValueError(f"Malformed progress CSV row in {path}: {row}")
+                    writer.writerow([*row, ""])
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def write_progress_row(path, row, position=None):
+    """Append a batch, or refresh its final validation value after epoch end."""
+    with open(path, "r+", newline="") as output:
+        if position is None:
+            output.seek(0, os.SEEK_END)
+        else:
+            output.seek(position)
+        position = output.tell()
+        csv.writer(output).writerow(row)
+        output.truncate()
+    return position
 
 
 def getData(verbose=True, lower_case=True, rawdata_folder="rawdata", oneliners=[], corpus_config=None):
@@ -283,8 +329,10 @@ def stream_batches(datareader, bpe, context_length, batch_size):
 
 
 @torch.no_grad()
-def generate(model, bpe, prompt, max_new_tokens=50, device="cpu"):
+def generate(model, bpe, prompt, max_new_tokens=50, device="cpu", temperature=1.0, top_k=0):
     """Generate text autoregressively from a prompt."""
+    if not math.isfinite(temperature) or temperature < 0 or top_k < 0:
+        raise ValueError("Temperature must be finite and nonnegative; top_k must be nonnegative")
     model.eval()
 
     # Encode prompt → token IDs
@@ -296,8 +344,15 @@ def generate(model, bpe, prompt, max_new_tokens=50, device="cpu"):
         x = ids[:, -model.context_length :]
         logits = model(x)  # (1, C, d_model)
         next_token_logits = logits[:, -1, :]  # last position
-        probs = torch.softmax(next_token_logits, dim=-1)
-        next_id = torch.multinomial(probs, num_samples=1)
+        if temperature == 0:
+            next_id = next_token_logits.argmax(dim=-1, keepdim=True)
+        else:
+            next_token_logits = next_token_logits / temperature
+            if top_k:
+                cutoff = torch.topk(next_token_logits, min(top_k, next_token_logits.size(-1))).values[:, -1:]
+                next_token_logits = next_token_logits.masked_fill(next_token_logits < cutoff, float("-inf"))
+            probs = torch.softmax(next_token_logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
         ids = torch.cat([ids, next_id], dim=1)
 
     # Decode all tokens back to text
@@ -436,7 +491,17 @@ def parse_args(argv=None):
                         help="Maximum batches per evaluation, using the same sampled windows (default: 100).")
     parser.add_argument("--validation-seed", type=int, default=42,
                         help="Seed for the file split and validation window sample (default: 42).")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Sampling temperature; lower is less random, 0 is greedy (default: 1).")
+    parser.add_argument("--top-k", type=int, default=0,
+                        help="Sample from the top K tokens; 0 uses the full vocabulary (default: 0).")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for repeatable inference.")
     args = parser.parse_args(argv)
+    if not math.isfinite(args.temperature) or args.temperature < 0 or args.top_k < 0:
+        parser.error("--temperature must be finite and nonnegative; --top-k must be nonnegative")
+    if args.max_new_tokens < 0:
+        parser.error("--max-new-tokens must be nonnegative")
     if args.save_every_steps < 0:
         parser.error("--save-every-steps must be nonnegative")
     if not 0 <= args.validation_fraction < 1:
@@ -513,8 +578,11 @@ def main(argv=None):
                 # Allow plain state_dict as well
                 model.load_state_dict(checkpoint)
 
-        prompt = args.prompt.lower() if args.lower_case else args.prompt
-        result = generate(model, bpe, prompt, args.context_length - 1, args.device)
+        prompt = args.prompt.lower() if bpe.lower_case else args.prompt
+        if args.seed is not None:
+            torch.manual_seed(args.seed)
+        result = generate(model, bpe, prompt, args.max_new_tokens, args.device,
+                          temperature=args.temperature, top_k=args.top_k)
         print("\n--- Generated Text ---")
         if not bpe.preserve_whitespace:
             result = result.replace(bpe.get_end_of_word_mark(), " ")
@@ -722,15 +790,17 @@ def main(argv=None):
     model.train()
 
     last_validation_step = None
+    latest_validation_loss = None
+    if args.log_progress:
+        prepare_progress_log(args.log_progress)
 
     def report_validation(epoch):
-        nonlocal last_validation_step
+        nonlocal last_validation_step, latest_validation_loss
         val_loss, perplexity, tokens = evaluate(
             model, validation_reader, args.batch_size, args.validation_batches,
             args.device, args.validation_seed)
         print(f"Validation | Step {global_step:,} | Loss: {val_loss:.4f} | Perplexity: {perplexity:.2f} | Tokens: {tokens:,}", flush=True)
         if args.log_progress:
-            import csv
             path = args.log_progress + ".validation.csv"
             exists = os.path.exists(path) and os.path.getsize(path) > 0
             with open(path, "a", newline="") as output:
@@ -739,6 +809,7 @@ def main(argv=None):
                     writer.writerow(["epoch", "global_step", "validation_loss", "perplexity", "tokens"])
                 writer.writerow([epoch, global_step, val_loss, perplexity, tokens])
         last_validation_step = global_step
+        latest_validation_loss = val_loss
 
     if validation_reader is not None:
         report_validation(start_epoch)
@@ -750,6 +821,8 @@ def main(argv=None):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         total_loss, step = 0.0, 0
         mean_loss = 0.0
+        last_progress_row = None
+        last_progress_position = None
 
         for x, y in stream_batches(
             datareader, bpe, args.context_length, args.batch_size
@@ -790,13 +863,8 @@ def main(argv=None):
 
             # Log progress to CSV if requested
             if args.log_progress:
-                import csv
-                file_exists = os.path.exists(args.log_progress)
-                with open(args.log_progress, "a", newline="") as f:
-                    writer = csv.writer(f)
-                    if not file_exists:
-                        writer.writerow(["epoch", "step", "loss", "mean_loss"])
-                    writer.writerow([epoch + 1, step, loss.item(), avg_loss])
+                last_progress_row = [epoch + 1, step, loss.item(), avg_loss, latest_validation_loss]
+                last_progress_position = write_progress_row(args.log_progress, last_progress_row)
 
             if args.verbose and step % 10 == 0:
                 print(
@@ -807,6 +875,9 @@ def main(argv=None):
         print(f"Epoch {epoch+1} complete | Mean loss: {mean_loss:.4f}")
         if validation_reader is not None and last_validation_step != global_step:
             report_validation(epoch + 1)
+            if last_progress_row is not None:
+                last_progress_row[-1] = latest_validation_loss
+                write_progress_row(args.log_progress, last_progress_row, last_progress_position)
 
         # --- Save model checkpoint ---
         save_checkpoint(args.model, model, optimizer, epoch + 1, mean_loss, global_step)

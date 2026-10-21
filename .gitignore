@@ -11,3 +11,4 @@ raw-data
 models
 *.csv
 *.diff
+/wikipedia-fineweb-data/

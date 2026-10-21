@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import io
 from pathlib import Path
 import tempfile
@@ -37,7 +38,8 @@ class CheckpointTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "model.pt"
-            args = ["--device", "cpu", "--model", str(path), "--d-model", "12", "--n-heads", "3", "--num-layers", "1", "--context-length", "4", "--save-every-steps", "2", "--verbose", "false"]
+            log = Path(directory) / "progress.csv"
+            args = ["--device", "cpu", "--model", str(path), "--log-progress", str(log), "--d-model", "12", "--n-heads", "3", "--num-layers", "1", "--context-length", "4", "--save-every-steps", "2", "--verbose", "false"]
             with patch.object(training, "getData", return_value=[]), patch.object(training, "getBPE", return_value=SimpleNamespace(vocab_size=20)), patch.object(training, "TokenizedDataReader", return_value=[]), patch.object(training, "stream_batches", side_effect=lambda *args: iter([(x, y)] * 3)), patch.object(training, "save_checkpoint", side_effect=capture), contextlib.redirect_stdout(io.StringIO()):
                 training.main(args + ["--epochs", "1"])
                 self.assertEqual([(s["epoch"], s["step"], s["global_step"]) for s in snapshots], [(0, 2, 2), (1, 0, 3)])
@@ -49,6 +51,10 @@ class CheckpointTests(unittest.TestCase):
                 self.assertEqual([(s["epoch"], s["step"], s["global_step"]) for s in snapshots], [(0, 2, 4), (1, 0, 5)])
                 for name, tensor in periodic["model_state_dict"].items():
                     self.assertTrue(torch.isfinite(snapshots[-1]["model_state_dict"][name]).all())
+                with log.open() as source:
+                    rows = list(csv.DictReader(source))
+                self.assertEqual(len(rows), 6)
+                self.assertTrue(all(row['validation_loss'] == '' for row in rows))
 
     def test_negative_interval_is_rejected(self):
         with contextlib.redirect_stderr(io.StringIO()):

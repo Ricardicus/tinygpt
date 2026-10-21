@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate text from a saved TinyGPT checkpoint and its matching tokenizer."""
 import argparse
+import math
 from pathlib import Path
 import sys
 
@@ -22,7 +23,13 @@ def main(argv=None):
                         help="Number of tokens to generate (default: 100).")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, help="Random seed for repeatable sampling.")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Sampling temperature; 0 is greedy (default: 1).")
+    parser.add_argument("--top-k", type=int, default=0,
+                        help="Sample from the top K tokens; 0 uses all tokens (default: 0).")
     args = parser.parse_args(argv)
+    if not math.isfinite(args.temperature) or args.temperature < 0 or args.top_k < 0:
+        parser.error("--temperature must be finite and nonnegative; --top-k must be nonnegative")
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
     model_path = args.model.expanduser()
@@ -59,7 +66,8 @@ def main(argv=None):
     model.load_state_dict(checkpoint["model_state_dict"])
     if args.seed is not None:
         torch.manual_seed(args.seed)
-    result = generate(model, tokenizer, prompt, args.max_new_tokens, args.device)
+    result = generate(model, tokenizer, prompt, args.max_new_tokens, args.device,
+                      temperature=args.temperature, top_k=args.top_k)
     if not tokenizer.preserve_whitespace:
         result = result.replace(tokenizer.get_end_of_word_mark(), " ")
     print(result)

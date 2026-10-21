@@ -1,3 +1,10 @@
 torch
 numpy
+datasets
+huggingface-hub
+pyarrow
+requests
+beautifulsoup4
+pandas
+matplotlib
 black
