@@ -3,13 +3,17 @@
 
 Run without arguments for a checkbox TUI, or use --plain for a line-based wizard.
 GB limits count saved UTF-8 text (1 GB = 1,000,000,000 bytes), not RAM or traffic.
+Gutenberg uses a soft limit: finish the whole book that reaches the target.
 """
 import argparse
 from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+import csv
+from functools import lru_cache
+import gzip
+import io
 import hashlib
-from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
@@ -37,8 +41,8 @@ SOURCES = {
     "fineweb-edu": {"label": "FineWeb-Edu (complete collection)", "default": "1.0",
                     "dataset": "HuggingFaceFW/fineweb-edu", "config": "default",
                     "url": "https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu"},
-    "gutenberg": {"label": "Gutenberg top 100 books (last 7 days)", "default": "full",
-                  "url": "https://www.gutenberg.org/browse/scores/top"},
+    "gutenberg": {"label": "Gutenberg books (full catalog)", "default": "0.25",
+                  "url": "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"},
 }
 
 
@@ -58,9 +62,11 @@ def parse_limit(value):
         raise ValueError("Enter a positive GB amount (e.g. 0.5) or full") from None
 
 
-def default_folder(selected):
+def default_folder(selected, languages=("en",)):
     parts = [f"{name}-{('full' if cap is None else format(Decimal(cap) / 1_000_000_000, 'f') + 'gb')}"
              for name, cap in selected.items()]
+    if "gutenberg" in selected:
+        parts.append("-".join(languages))
     return "datasets/" + "_".join(parts)
 
 
@@ -87,7 +93,9 @@ def plain_plan():
         except ValueError:
             print("Enter numbers from 1 to 4 separated by commas, or all.")
     print("Limits are saved text in decimal GB, not RAM, network traffic or caches.")
-    print("Full FineWeb-Edu is a very large collection. Gutenberg full = all top 100.")
+    print("Gutenberg's GB target is soft: the final book is saved in full, even above the target.")
+    print("Full FineWeb-Edu is a very large collection. Gutenberg full = all selected-language books.")
+    languages = plain_languages() if "gutenberg" in selected_names else ("en",)
     selected = {}
     for name in selected_names:
         while True:
@@ -99,12 +107,12 @@ def plain_plan():
                 print(error)
     while True:
         try:
-            root = validate_output(input(f"Output folder [{default_folder(selected)}]: ").strip() or default_folder(selected))
+            root = validate_output(input(f"Output folder [{default_folder(selected, languages)}]: ").strip() or default_folder(selected, languages))
             break
         except ValueError as error:
             print(error)
-    print_plan(selected, root)
-    return (selected, root) if input("Start download? [y/N]: ").strip().lower() in ("y", "yes") else None
+    print_plan(selected, root, languages)
+    return (selected, root, languages) if input("Start download? [y/N]: ").strip().lower() in ("y", "yes") else None
 
 
 def tui_plan():
@@ -123,6 +131,7 @@ def tui_plan():
         folder = ""
         message = ""
         reviewing = False
+        languages = ("en",)
 
         def put(row, value, attr=0):
             height, width = stdscr.getmaxyx()
@@ -158,13 +167,14 @@ def tui_plan():
             selected = {name: parse_limit(limits[name]) for name in names if name in checked}
             put(0, "TinyGPT | Dataset downloader", curses.A_BOLD)
             put(2, "Up/Down: move   Space: select   A: all/none   E: edit GB   F: full")
-            put(3, "O: output folder   Enter: review/start   Q/Esc: cancel")
+            put(3, "L: Gutenberg languages   O: output folder   Enter: review/start   Q: cancel")
             for index, name in enumerate(names):
                 attr = curses.A_REVERSE if cursor == index else 0
                 put(5 + index, f" [{'x' if name in checked else ' '}] {SOURCES[name]['label']:<45} {limits[name]}" + (" GB" if limits[name] != "full" else ""), attr)
             put(10, "GB = saved UTF-8 text; RAM, network traffic and caches are extra.")
-            put(11, "Full FineWeb-Edu = entire collection; full Gutenberg = the top 100.")
-            put(13, "Folder: " + (folder or (default_folder(selected) if selected else "(select a source)")))
+            put(11, "Gutenberg languages: " + ", ".join(languages) + " (L to change; default English)")
+            put(12, "Gutenberg GB is a soft target: finish the final book, then stop.")
+            put(13, "Folder: " + (folder or (default_folder(selected, languages) if selected else "(select a source)")))
             put(15, "REVIEW: Enter starts downloading; B returns to editing." if reviewing else message,
                 curses.A_BOLD)
             stdscr.refresh()
@@ -176,7 +186,7 @@ def tui_plan():
                     reviewing = False
                 elif key in ("\n", "\r", curses.KEY_ENTER):
                     try:
-                        return selected, validate_output(folder or default_folder(selected))
+                        return selected, validate_output(folder or default_folder(selected, languages)), languages
                     except ValueError as error:
                         reviewing, message = False, str(error)
                 continue
@@ -200,6 +210,15 @@ def tui_plan():
                     message = ""
                 except ValueError as error:
                     message = str(error)
+            elif key in ("l", "L"):
+                put(15, "Loading Gutenberg catalog to find its top 10 languages...", curses.A_BOLD)
+                stdscr.refresh()
+                try:
+                    choices = gutenberg_languages()
+                    languages = language_screen(stdscr, choices, languages)
+                    message = ""
+                except (OSError, ValueError) as error:
+                    message = f"Catalog unavailable: {error}"
             elif key in ("o", "O"):
                 folder = edit("Folder (blank = automatic, Ctrl-U clears): ", folder).strip()
             elif key in ("\n", "\r", curses.KEY_ENTER):
@@ -207,7 +226,7 @@ def tui_plan():
                     message = "Select at least one dataset with Space."
                 else:
                     try:
-                        validate_output(folder or default_folder(selected))
+                        validate_output(folder or default_folder(selected, languages))
                         reviewing = True
                     except ValueError as error:
                         message = str(error)
@@ -215,83 +234,146 @@ def tui_plan():
     return curses.wrapper(screen)
 
 
-def print_plan(selected, root):
+def print_plan(selected, root, languages=("en",)):
     print(f"\nOutput: {root}")
     for name, limit in selected.items():
         print(f"  {SOURCES[name]['label']}: {'full' if limit is None else f'{limit / 1e9:g} GB'}")
 
-
-class GutenbergChart(HTMLParser):
-    """Read only the seven-day book list, preserving ranking and title text."""
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.found = False
-        self.in_list = False
-        self.finished = False
-        self.current = None
-        self.links = []
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        if attrs.get("id") == "books-last7":
-            self.found = True
-        if self.found and not self.finished and tag == "ol":
-            self.in_list = True
-        if self.in_list and tag == "a" and attrs.get("href", "").startswith("/ebooks/"):
-            self.current = [attrs["href"], ""]
-
-    def handle_data(self, data):
-        if self.current is not None:
-            self.current[1] += data
-
-    def handle_endtag(self, tag):
-        if tag == "a" and self.current is not None:
-            self.links.append(tuple(self.current))
-            self.current = None
-        if tag == "ol" and self.in_list:
-            self.in_list = False
-            self.finished = True
+    if "gutenberg" in selected:
+        print("  Gutenberg languages: " + ", ".join(languages))
+        print("  Gutenberg uses a soft GB target; the final book is always saved in full.")
 
 
-def gutenberg_records():
-    """Fetch the live seven-day chart and preserve a snapshot for provenance."""
-    from urllib.parse import urljoin
+LANGUAGE_NAMES = {
+    "en": "English", "fr": "French", "fi": "Finnish", "de": "German",
+    "nl": "Dutch", "it": "Italian", "es": "Spanish", "pt": "Portuguese",
+    "hu": "Hungarian", "zh": "Chinese", "sv": "Swedish", "el": "Greek",
+    "eo": "Esperanto", "la": "Latin", "ca": "Catalan", "da": "Danish",
+}
 
-    def get(url):
-        for attempt in range(3):
-            try:
-                request = Request(url, headers={"User-Agent": "TinyGPT-DatasetDownloader/1.0"})
-                with urlopen(request, timeout=90) as response:
-                    return response.read().decode("utf-8-sig"), response.url
-            except (URLError, TimeoutError) as error:
-                if isinstance(error, HTTPError) and error.code < 500 and error.code != 429:
-                    raise
-                if attempt == 2:
-                    raise
-                time.sleep(2 * (attempt + 1))
 
-    page = GutenbergChart()
-    page.feed(get(SOURCES["gutenberg"]["url"])[0])
-    if len(page.links) != 100:
-        raise ValueError("Gutenberg seven-day chart did not contain 100 books")
-    for rank, (href, title) in enumerate(page.links, 1):
-        url = urljoin("https://www.gutenberg.org", href)
-        book_id = href.rstrip("/").split("/")[-1]
+def fetch_gutenberg(url):
+    for attempt in range(3):
+        try:
+            request = Request(url, headers={"User-Agent": "TinyGPT-DatasetDownloader/1.0"})
+            with urlopen(request, timeout=90) as response:
+                return response.read(), response.url
+        except (URLError, TimeoutError) as error:
+            if isinstance(error, HTTPError) and error.code < 500 and error.code != 429:
+                raise
+            if attempt == 2:
+                raise
+            time.sleep(2 * (attempt + 1))
+
+
+@lru_cache(maxsize=1)
+def gutenberg_catalog():
+    """Load the machine-readable catalog once per run, including for the UI."""
+    data, url = fetch_gutenberg(SOURCES["gutenberg"]["url"])
+    with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
+        with io.TextIOWrapper(compressed, encoding="utf-8-sig", newline="") as text:
+            reader = csv.DictReader(text)
+            if not {"Text#", "Type", "Title", "Language", "Authors"}.issubset(reader.fieldnames or []):
+                raise ValueError("Unrecognized Gutenberg CSV catalog columns")
+            books = []
+            for row in reader:
+                if row["Type"] == "Text" and row["Text#"].isdigit():
+                    books.append({"id": row["Text#"], "title": row["Title"],
+                                  "authors": row["Authors"],
+                                  "languages": [part.strip() for part in row["Language"].split(";") if part.strip()]})
+    if not books:
+        raise ValueError("Gutenberg catalog contains no text books")
+    metadata = {"catalog_url": url, "catalog_sha256": hashlib.sha256(data).hexdigest(),
+                "catalog_retrieved_utc": datetime.now(timezone.utc).isoformat()}
+    return books, metadata
+
+
+def gutenberg_languages():
+    books, _ = gutenberg_catalog()
+    counts = Counter(lang for book in books for lang in set(book["languages"]))
+    return sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:10]
+
+
+def language_screen(stdscr, choices, selected):
+    import curses
+    checked = set(selected)
+    cursor = 0
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        lines = ["Gutenberg | Top 10 languages by catalog book count",
+                 "Up/Down: move   Space: toggle   Enter: apply   Esc: back", ""]
+        for code, count in choices:
+            lines.append(f" [{'x' if code in checked else ' '}] {LANGUAGE_NAMES.get(code, code):<15} {count:,} books")
+        lines.extend(["", "Select at least one language. The GB limit covers all selected languages together."])
+        for row, line in enumerate(lines):
+            if row < height - 1:
+                stdscr.addnstr(row, 0, line, width - 1, curses.A_REVERSE if row == cursor + 3 else 0)
+        stdscr.refresh()
+        key = stdscr.get_wch()
+        if key in ("\x1b", "q", "Q"):
+            return selected
+        if key in (curses.KEY_DOWN, "j"):
+            cursor = (cursor + 1) % len(choices)
+        elif key in (curses.KEY_UP, "k"):
+            cursor = (cursor - 1) % len(choices)
+        elif key == " ":
+            checked.symmetric_difference_update({choices[cursor][0]})
+        elif key in ("\n", "\r", curses.KEY_ENTER) and checked:
+            return tuple(code for code, _ in choices if code in checked)
+
+
+def plain_languages():
+    print("Loading Gutenberg catalog for the top 10 languages...")
+    choices = gutenberg_languages()
+    for index, (code, count) in enumerate(choices, 1):
+        print(f"  {index}. {LANGUAGE_NAMES.get(code, code)} ({count:,} books)")
+    english = next(i for i, (code, _) in enumerate(choices, 1) if code == "en")
+    while True:
+        value = input(f"Gutenberg languages (comma-separated numbers) [{english}: English]: ").strip() or str(english)
+        try:
+            numbers = {int(part.strip()) for part in value.split(",")}
+            if not numbers or any(i < 1 or i > len(choices) for i in numbers):
+                raise ValueError
+            return tuple(code for i, (code, _) in enumerate(choices, 1) if i in numbers)
+        except ValueError:
+            print("Select one or more of the listed language numbers.")
+
+
+def gutenberg_records(languages=("en",), provenance=None):
+    """Iterate the full catalog in book-ID order, without a book-count cap."""
+    books, metadata = gutenberg_catalog()
+    matching = [book for book in books if set(book["languages"]) & set(languages)]
+    if provenance is not None:
+        provenance.update(metadata, languages=list(languages), matching_books=len(matching),
+                          order="ascending book ID", skipped_unavailable=0)
+    if not matching:
+        raise ValueError("No Gutenberg books match the selected languages")
+    print(f"Gutenberg: {len(matching):,} catalog books match {', '.join(languages)}", flush=True)
+    for book in sorted(matching, key=lambda book: int(book["id"])):
+        book_id = book["id"]
         time.sleep(1)
         download_url = f"https://www.gutenberg.org/ebooks/{book_id}.txt.utf-8"
-        text, actual_url = get(download_url)
-        if "*** START OF" not in text.upper():
-            raise ValueError(f"Missing Gutenberg text marker in {download_url}")
-        yield {"id": book_id, "rank": rank, "title": title.strip(),
-               "url": url, "download_url": actual_url, "text": text}
+        try:
+            data, actual_url = fetch_gutenberg(download_url)
+            text = data.decode("utf-8-sig")
+            if "*** START OF" not in text.upper():
+                raise UnicodeError("Missing Gutenberg text marker")
+        except (HTTPError, UnicodeError) as error:
+            if isinstance(error, HTTPError) and error.code not in (404, 410):
+                raise
+            if provenance is not None:
+                provenance["skipped_unavailable"] += 1
+            print(f"Gutenberg: skipping {book_id}, no usable UTF-8 text edition", flush=True)
+            continue
+        yield {**book, "url": f"https://www.gutenberg.org/ebooks/{book_id}",
+               "download_url": actual_url, "text": text}
 
 
-def source_records(name, provenance):
+def source_records(name, provenance, languages=("en",)):
     if name == "gutenberg":
-        provenance["chart_retrieved_utc"] = datetime.now(timezone.utc).isoformat()
-        provenance["chart"] = "Top 100 EBooks last 7 days"
-        return gutenberg_records()
+        provenance["languages"] = list(languages)
+        return gutenberg_records(languages, provenance)
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     from datasets import load_dataset
     from huggingface_hub import HfApi
@@ -320,12 +402,14 @@ def record_text(name, record):
     return wikipedia.clean_text(text)
 
 
-def prepare(selected, root):
+def prepare(selected, root, languages=("en",)):
     root = validate_output(root)
     (root / "metadata").mkdir(parents=True)
     (root / "corpus").mkdir()
     summary = {"created_utc": datetime.now(timezone.utc).isoformat(), "status": "downloading",
-               "limits_bytes": selected, "sources": {}, "counts": {}}
+               "limits_bytes": selected, "sources": {}, "counts": {},
+               "limit_modes": {name: "soft_whole_book" if name == "gutenberg" else "hard_whole_document"
+                               for name in selected}}
     summary_path = root / "metadata/summary.json"
     # Disk-backed hashes keep full-dataset deduplication from growing a RAM set.
     with sqlite3.connect(root / "metadata/dedup.sqlite3") as hashes, \
@@ -339,7 +423,8 @@ def prepare(selected, root):
                 summary["sources"][name] = provenance
                 wikipedia.write_json(summary_path, summary)
                 print(f"\n{SOURCES[name]['label']}: connecting...", flush=True)
-                records = source_records(name, provenance)
+                records = (source_records(name, provenance, languages) if name == "gutenberg"
+                           else source_records(name, provenance))
                 wikipedia.write_json(summary_path, summary)
                 last_report = 0
                 try:
@@ -357,7 +442,7 @@ def prepare(selected, root):
                         if hashes.execute("SELECT 1 FROM hashes WHERE digest = ?", (digest,)).fetchone():
                             counts["duplicates"] += 1
                             continue
-                        if limit is not None and counts["bytes"] + len(data) > limit:
+                        if name != "gutenberg" and limit is not None and counts["bytes"] + len(data) > limit:
                             counts["stopped_at_byte_limit"] = 1
                             break
                         index = counts["files"]
@@ -365,7 +450,7 @@ def prepare(selected, root):
                         (root / rel).parent.mkdir(parents=True, exist_ok=True)
                         (root / rel).write_bytes(data)
                         meta = {key: record[key] for key in
-                                ("id", "url", "title", "rank", "download_url", "category") if key in record}
+                                ("id", "url", "title", "authors", "languages", "download_url", "category") if key in record}
                         manifest.write(json.dumps({**meta, "kind": name, "path": rel.as_posix(),
                                                    "bytes": len(data), "sha256": digest}, ensure_ascii=False) + "\n")
                         manifest.flush()
@@ -378,7 +463,7 @@ def prepare(selected, root):
                             last_report = time.monotonic()
                             hashes.commit()
                             wikipedia.write_json(summary_path, summary)
-                        if limit is not None and counts["bytes"] == limit:
+                        if limit is not None and counts["bytes"] >= limit:
                             counts["stopped_at_byte_limit"] = 1
                             break
                     else:
@@ -399,7 +484,9 @@ def prepare(selected, root):
                 "This launcher requires the original TinyGPT checkout and its dependencies.\n\n"
                 "Each corpus file is a whole document. GB caps count saved UTF-8 text only;\n"
                 "network traffic, caches, filesystem overhead and training RAM are extra.\n"
-                "Full means all available records at the recorded source revision/chart,\n"
+                "Gutenberg uses a soft GB target: the last book is saved in full even if\n"
+                "it crosses the target; other sources keep hard whole-document caps.\n"
+                "Full means all available records at the recorded source revision/catalog,\n"
                 "after prose filtering and exact deduplication. Gutenberg keeps book notices.\n"
                 "Dolly retains instruction/context/response sections, including short answers.\n"
                 "Training uses ordinary next-token prediction over the mixed corpus.\n\n"

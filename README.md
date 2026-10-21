@@ -125,23 +125,39 @@ python other/download_datasets.py
 ```
 
 Available sources are English Wikipedia, Dolly 15k, FineWeb-Edu and Project
-Gutenberg's top 100 books over the last seven days. Use **Up/Down** to move,
+Gutenberg's full book catalog. Use **Up/Down** to move,
 **Space** to toggle a source, **A** to select/deselect all, **E** to edit its
-limit, **F** for `full`, and **O** to edit the output folder. **Ctrl-U** clears
+limit, **F** for `full`, **L** for Gutenberg languages, and **O** to edit the output folder. **Ctrl-U** clears
 an edit field. Press **Enter** to review the selection, then **Enter** again to
 download; **B** returns to editing and **Q** cancels. The suggested folder includes
 the source names and limits, for example
-`datasets/wikipedia-0.25gb_dolly-full_fineweb-edu-1gb_gutenberg-full`.
+`datasets/wikipedia-0.25gb_dolly-full_fineweb-edu-1gb_gutenberg-0.25gb_en`.
 It updates with your selection unless you enter a custom path.
 
 Each selected source accepts a positive decimal GB amount such as `0.25` or
 `1.5`, or `full`. Limits count saved UTF-8 training text, with **1 GB =
-1,000,000,000 bytes**, preserving whole documents; the result can be slightly
-below the cap or smaller if the source ends first. Network traffic, streaming
+1,000,000,000 bytes**, preserving whole documents. Wikipedia, Dolly and FineWeb-Edu
+stop below their caps when the next document would exceed them. Gutenberg uses
+a **soft GB target**: it saves the entire book that reaches or crosses the target,
+then stops. The result may exceed the target by part of one book; a single book
+larger than the target is still saved in full. Results may be smaller if the
+source ends first. Network traffic, streaming
 buffers, caches, filesystem overhead and training RAM are additional.
 `full` processes the entire pinned source after filtering and deduplication.
 For FineWeb-Edu this means the complete collection, which is very large;
-for Gutenberg it means all 100 books in the retrieved chart.
+for Gutenberg it means all available text books matching the selected languages.
+
+Gutenberg has no book-count cap. Press **L** to load its compressed CSV catalog
+and choose multiple languages from the ten with the most text titles. Only
+English is selected by default. The language screen uses **Space** to toggle
+and **Enter** to apply; at least one language is required. The line-based wizard
+offers the same choices. The GB cap covers all selected languages together,
+not a separate quota per language. Gutenberg defaults to a soft `0.25` GB target.
+Books are considered in ascending Gutenberg ID order; multilingual books
+matching any selected language are included once. Missing or unusable UTF-8 text
+editions are skipped. The catalog hash, retrieval time, selected languages and
+skip count are recorded in the summary, with authors and language codes in each
+book's manifest record. The downloaded catalog is reused throughout the run.
 
 The downloader streams Hugging Face sources and stores document hashes in SQLite
 to avoid keeping a full-dataset hash set in RAM. It filters Wikipedia/FineWeb
