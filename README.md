@@ -62,6 +62,36 @@ loading/saving. Slow scans report progress about every two seconds. Initial read
 setup discovers files without reading the entire corpus just to print a count;
 a new tokenizer counts input chunks separately when needed.
 
+Large English corpora can contain thousands of distinct Unicode characters.
+New tokenizers default to `--bpe-alphabet-policy limit`: if the base alphabet
+cannot fit `--vocab_size`, keep the most frequent characters within roughly half
+the vocabulary, reserving the rest for BPE merges. Ordinary printable ASCII and
+basic whitespace are retained when the cap permits. Excluded characters map to
+`<unk>` during both training and encoding; their original spelling is lost.
+Character frequencies include all scanned training and validation text, while
+word-pair frequencies for merges use only the training sample.
+
+Use `--bpe-max-chars 1024` to set an explicit base alphabet token cap (including
+reserved symbols and `<unk>`), even when the full alphabet would fit. The default
+`0` chooses a cap automatically only when the alphabet overflows. Use
+`--bpe-alphabet-policy expand` to preserve all observed characters by growing the
+target to a power of two, or `--bpe-alphabet-policy error` to stop on overflow.
+These options apply only to a new tokenizer. Existing tokenizers retain their
+saved size and fallback policy. To switch from an existing 32,768-token tokenizer
+to 8,192 tokens, select fresh `--tokenizer` and `--model` paths and restart model
+training; lowering the CLI value does not change a loaded tokenizer/checkpoint.
+
+Training uses PyTorch's optimized causal attention and layer normalization while
+keeping checkpoint parameter names and shapes compatible. `--precision auto`
+(the default) uses BF16 autocast on CUDA GPUs with native support, and FP32
+otherwise; use `--precision float32` to keep full precision or
+`--precision bfloat16` to require native CUDA BF16. Model weights and optimizer
+state remain FP32. Validation uses the same precision as training. The console
+reports average full training-step time and tokens per second over each ten-step
+reporting interval, including backward/optimizer work and transfers but excluding
+batch preparation, validation and checkpoint writing. These replace the old
+forward-only `Inference` timer. Actual speed depends on the GPU and workload.
+
 Once the tokenizer is trained, it will try to train the model on your data.
 
 If you provide the program with --model it will read its hyperparameters from that

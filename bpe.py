@@ -23,6 +23,8 @@ class BPE:
         self.max_word_chars = max_word_chars
         self.preserve_whitespace = True
         self.alphabet = set(" \t\r\n")
+        self.character_freq = Counter()
+        self.unknown_token = None
         self.skipped_words = 0
         self.vocab_size = vocab_size
         self._encoding_state = None
@@ -41,7 +43,7 @@ class BPE:
         """Add raw text data to the training corpus (frequency-counted)."""
         if self.lower_case:
             text = text.lower()
-        self.alphabet.update(text)
+        self.observe_characters(text)
         for match in re.finditer(r"\S+", text):
             word = match.group()
             self.alphabet.update(word)
@@ -55,6 +57,33 @@ class BPE:
                 self.skipped_words += 1
                 continue
             self.word_freq[key] = self.word_freq.get(key, 0) + 1
+
+    def observe_characters(self, text):
+        """Count characters across all scanned text, beyond the word sample."""
+        if self.lower_case:
+            text = text.lower()
+        self.character_freq.update(text)
+        self.alphabet.update(text)
+
+    def restrict_alphabet(self, max_symbols):
+        """Keep frequent characters and map excluded characters to one token."""
+        required = set(" \t\r\n'\"<->?!:")
+        if max_symbols < len(required) + 1:
+            raise ValueError(f"Alphabet cap must allow at least {len(required) + 1} base tokens")
+        # Preserve ordinary printable ASCII when the cap has enough room.
+        ascii_chars = {chr(code) for code in range(32, 127)} | set("\t\r\n")
+        if max_symbols >= len(ascii_chars) + 1:
+            required = ascii_chars
+        candidates = sorted(self.base_alphabet() - required,
+                            key=lambda char: (-self.character_freq[char], char))
+        allowed = required | set(candidates[:max_symbols - len(required) - 1])
+        self.unknown_token = "<unk>"
+        self.alphabet = allowed | {self.unknown_token}
+        remapped = {}
+        for word, frequency in self.word_freq.items():
+            symbols = tuple(char if char in allowed else self.unknown_token for char in word)
+            remapped[symbols] = remapped.get(symbols, 0) + frequency
+        self.word_freq = remapped
 
     def get_end_of_word_mark(self):
         return self.end_of_word_mark
@@ -86,6 +115,10 @@ class BPE:
         self.word_freq = new_word_freq
         return new_symbol
 
+    def base_alphabet(self):
+        """Characters/symbols required before learning any merges."""
+        return self.alphabet | {ch for word in self.word_freq for ch in word} | set("'\"<->?!:")
+
     def train(self, batch_merges: int = 4):
         """
         Learn BPE merges until vocab size is reached or no more merges.
@@ -97,10 +130,7 @@ class BPE:
         self._encoding_state = None
         if batch_merges < 1:
             raise ValueError("batch_merges must be positive")
-        vocab = self.alphabet | set(ch for word in self.word_freq for ch in word)
-        other_chars = ["'", '"', "<", "-", ">", "?", "!", ":"]
-        for ch in other_chars:
-            vocab.add(ch)
+        vocab = self.base_alphabet()
         if len(vocab) >= self.vocab_size:
             raise ValueError(
                 f"BPE base alphabet requires {len(vocab):,} tokens, but vocab_size "
@@ -164,7 +194,7 @@ class BPE:
         if self.lower_case:
             word = word.lower()
         state = (id(self.merges), id(self.vocab), self.preserve_whitespace,
-                 self.lower_case, self.end_of_word_mark)
+                 self.lower_case, self.end_of_word_mark, self.unknown_token)
         if state != self._encoding_state:
             self._merge_ranks = {pair: rank for rank, pair in enumerate(self.merges)}
             self._word_cache.clear()
@@ -174,7 +204,8 @@ class BPE:
             self._word_cache.move_to_end(word)
             return list(cached)
 
-        symbols = list(word)
+        symbols = [char if char in self.vocab or self.unknown_token is None else self.unknown_token
+                   for char in word]
         if not self.preserve_whitespace:
             symbols.append(self.end_of_word_mark)
 
@@ -230,8 +261,11 @@ class BPE:
             if piece.isspace():
                 for char in piece:
                     if char not in self.vocab:
-                        raise ValueError(f"Unknown whitespace during encoding: {char!r}")
-                    ids.append(self.vocab[char])
+                        if self.unknown_token is None:
+                            raise ValueError(f"Unknown whitespace during encoding: {char!r}")
+                        ids.append(self.vocab[self.unknown_token])
+                    else:
+                        ids.append(self.vocab[char])
             else:
                 ids.extend(self.encode_word(piece))
         return ids
@@ -263,6 +297,7 @@ class BPE:
             "vocab_size": self.vocab_size,
             "lower_case": self.lower_case,
             "preserve_whitespace": self.preserve_whitespace,
+            "unknown_token": self.unknown_token,
             "vocab": self.vocab,
             "end-of-word-mark": self.end_of_word_mark,
             # save merges as list of [a, b, freq] for portability
@@ -285,6 +320,7 @@ class BPE:
         # Missing flag denotes a legacy tokenizer; keep its token IDs/behavior.
         self._encoding_state = None
         self.preserve_whitespace = payload.get("preserve_whitespace", False)
+        self.unknown_token = payload.get("unknown_token")
         self.lower_case = payload.get("lower_case", self.lower_case)
         self.vocab_size = int(payload.get("vocab_size", self.vocab_size))
         self.end_of_word_mark = payload.get("end-of-word-mark", "</w>")
@@ -296,6 +332,8 @@ class BPE:
         # vocab: token -> id
         self.vocab = {str(k): int(v) for k, v in payload.get("vocab", {}).items()}
         self.rev_vocab = {v: k for k, v in self.vocab.items()}
+        if self.unknown_token is not None and self.unknown_token not in self.vocab:
+            raise ValueError("Tokenizer fallback token is missing from its vocabulary")
 
         # training data intentionally left empty
         self.word_freq = {}

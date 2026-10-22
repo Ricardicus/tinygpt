@@ -18,16 +18,7 @@ class LayerNorm(nn.Module):
         """
         x: (batch_size, context_length, d_model)
         """
-        # Compute mean and variance along the last dimension (features)
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, keepdim=True, unbiased=False)
-
-        # Normalize
-        x_hat = (x - mean) / torch.sqrt(var + self.eps)
-
-        # Scale and shift
-        out = self.gamma * x_hat + self.beta
-        return out
+        return F.layer_norm(x, (self.d_model,), self.gamma, self.beta, self.eps)
 
 
 class SelfAttention(nn.Module):
@@ -91,18 +82,8 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = qkv.reshape(B, C, 3, self.num_heads, self.d_head).permute(2, 0, 3, 1, 4)
         Q, K, V = qkv[0], qkv[1], qkv[2]  # each (B, num_heads, C, d_head)
 
-        # Compute attention scores
-        attn_scores = (Q @ K.transpose(-2, -1)) / math.sqrt(
-            self.d_head
-        )  # (B, num_heads, C, C)
-
-        # Apply causal mask (prevent attending to future tokens)
-        mask = torch.tril(torch.ones(C, C, device=x.device))
-        attn_scores = attn_scores.masked_fill(mask == 0, float("-inf"))
-
-        # Softmax and attention output
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_out = attn_weights @ V  # (B, num_heads, C, d_head)
+        # PyTorch selects an optimized causal attention kernel for this device/dtype.
+        attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
 
         # Recombine heads
         attn_out = attn_out.transpose(1, 2).contiguous().reshape(B, C, D)

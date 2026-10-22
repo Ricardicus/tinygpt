@@ -140,6 +140,8 @@ class TokenizedDataReader:
             "preserve_whitespace": bpe.preserve_whitespace,
             "end_of_word": bpe.end_of_word_mark,
         }
+        if bpe.unknown_token is not None:
+            manifest["unknown_token"] = bpe.unknown_token
         self._fingerprint = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
         self._meta_path = Path(str(self._cache_path) + ".json")
         self._tokens = array("I")

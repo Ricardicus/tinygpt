@@ -11,6 +11,7 @@ import tempfile
 import hashlib
 import math
 import random
+from contextlib import nullcontext
 from pathlib import Path
 
 from datareader import PagedDataReader, TextCorpusReader, TokenizedDataReader
@@ -58,8 +59,26 @@ def split_validation_files(files, folder, fraction, seed):
             [p for p in files if p in held_out])
 
 
+def training_dtype(device, precision):
+    """Keep checkpoint weights FP32; use BF16 operations on capable CUDA GPUs."""
+    if precision == "float32":
+        return None
+    cuda_device = torch.device(device)
+    supported = False
+    if cuda_device.type == "cuda" and torch.cuda.is_available():
+        with torch.cuda.device(cuda_device):
+            supported = torch.cuda.is_bf16_supported(including_emulation=False)
+    if precision == "bfloat16" and not supported:
+        raise ValueError("--precision bfloat16 requires a CUDA GPU with native BF16 support; use auto or float32")
+    return torch.bfloat16 if supported else None
+
+
+def precision_context(device, dtype):
+    return torch.autocast(device_type=torch.device(device).type, dtype=dtype) if dtype is not None else nullcontext()
+
+
 @torch.inference_mode()
-def evaluate(model, datareader, batch_size, max_batches, device, seed=42):
+def evaluate(model, datareader, batch_size, max_batches, device, seed=42, dtype=None):
     """Token-weighted loss over a fixed sample of held-out windows."""
     count = min(len(datareader), batch_size * max_batches)
     if not count:
@@ -72,11 +91,13 @@ def evaluate(model, datareader, batch_size, max_batches, device, seed=42):
         for start in range(0, count, batch_size):
             windows = torch.tensor([datareader[i] for i in indices[start:start + batch_size]],
                                    dtype=torch.long, device=device)
-            logits = model(windows[:, :-1])
-            targets = windows[:, 1:]
-            total_loss += nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), targets.reshape(-1), reduction="sum"
-            ).item()
+            with precision_context(device, dtype):
+                logits = model(windows[:, :-1])
+                targets = windows[:, 1:]
+                loss = nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)), targets.reshape(-1), reduction="sum"
+                )
+            total_loss += loss.item()
             total_tokens += targets.numel()
     finally:
         model.train(was_training)
@@ -183,6 +204,8 @@ def getBPE(
     lower_case=True,
     bpe_max_words=100_000,
     character_sources=(),
+    bpe_alphabet_policy="limit",
+    bpe_max_chars=0,
 ):
     """Load existing tokenizer or train a new one."""
     if tokenizer_path and os.path.exists(tokenizer_path):
@@ -197,6 +220,14 @@ def getBPE(
             print(f"Using existing tokenizer from '{tokenizer_path}'")
         return bpe
 
+    if bpe_alphabet_policy not in ("limit", "expand", "error"):
+        raise ValueError("BPE alphabet policy must be limit, expand or error")
+    if bpe_max_chars < 0 or (bpe_max_chars and bpe_alphabet_policy != "limit"):
+        raise ValueError("--bpe-max-chars must be nonnegative and requires alphabet policy limit")
+    if bpe_max_chars >= vocab_size:
+        raise ValueError("--bpe-max-chars must be smaller than --vocab_size to leave room for merges")
+    if bpe_max_chars and bpe_max_chars < len(set(" \t\r\n'\"<->?!:")) + 1:
+        raise ValueError("--bpe-max-chars must be at least 13 for reserved symbols and <unk>")
     bpe = BPE(
         vocab_size=vocab_size,
         verbose=verbose,
@@ -224,27 +255,44 @@ def getBPE(
     last_report = time.monotonic()
     import math
     sample_count = max(1, math.ceil(total * bpe_part))
-    # Learn merges from the sample, but include characters from every file so
-    # later pretraining files cannot fail merely because the sample missed them.
+    # Learn merges from the word sample; rank characters using the full corpus.
     for i, row in enumerate(data):
         if i < sample_count:
             bpe.add_corpus(row)
         else:
-            bpe.alphabet.update(row.lower() if lower_case else row)
+            bpe.observe_characters(row)
         if verbose and time.monotonic() - last_report >= 2:
             print(f"BPE input: {i + 1:,} / {total:,} chunks processed", flush=True)
             last_report = time.monotonic()
-    # Include held-out characters for lossless encoding, without learning their merges.
+    # Include held-out character counts without learning word merges from them.
     if verbose and character_sources:
         print("Scanning validation character coverage...", flush=True)
     for path in character_sources:
         for row in text_chunks(path):
-            bpe.alphabet.update(row.lower() if lower_case else row)
+            bpe.observe_characters(row)
             if verbose and time.monotonic() - last_report >= 2:
                 print(f"Validation character coverage: {path}", flush=True)
                 last_report = time.monotonic()
+    base_size = len(bpe.base_alphabet())
+    if bpe_alphabet_policy == "limit" and (base_size >= bpe.vocab_size or
+                                          (bpe_max_chars and base_size > bpe_max_chars)):
+        cap = bpe_max_chars or max(len(set(" \t\r\n'\"<->?!:")) + 1, bpe.vocab_size // 2)
+        if cap >= bpe.vocab_size:
+            raise ValueError("Vocabulary is too small to hold reserved symbols plus merges")
+        bpe.restrict_alphabet(cap)
+        print(f"Limiting BPE base alphabet from {base_size:,} to {len(bpe.base_alphabet()):,} tokens. "
+              f"Less frequent characters map to <unk>; vocabulary stays at {bpe.vocab_size:,}.", flush=True)
+    elif bpe_alphabet_policy == "expand" and base_size >= bpe.vocab_size:
+        requested = bpe.vocab_size
+        # Retain all observed Unicode characters and leave room for useful merges.
+        required = base_size + max(2048, requested // 2)
+        bpe.vocab_size = 1 << (required - 1).bit_length()
+        print(f"BPE base alphabet needs {base_size:,} tokens. Expanding vocabulary "
+              f"from {requested:,} to {bpe.vocab_size:,} to leave room for merges. "
+              "The model will use the expanded vocabulary.", flush=True)
     if verbose:
-        print(f"Training BPE merges on {sample_count}/{total} chunks.")
+        print(f"Training BPE merges on {sample_count}/{total} chunks "
+              f"(base alphabet: {len(bpe.base_alphabet()):,}, vocabulary target: {bpe.vocab_size:,}).", flush=True)
     bpe.train()
 
     if tokenizer_path:
@@ -372,6 +420,12 @@ def generate(model, bpe, prompt, max_new_tokens=50, device="cpu", temperature=1.
 # ---------------------------------------------------------
 # Argument parsing
 # ------------------------------------self.chunked_file_readers.append(ChunkedFile(file, self.buffer_size))---------------------
+def default_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    return "mps" if torch.backends.mps.is_available() else "cpu"
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Train TinyGPT using a BPE tokenizer with streaming data."
@@ -386,7 +440,7 @@ def parse_args(argv=None):
         "--vocab_size",
         type=int,
         default=1920,
-        help="Vocabulary size for BPE training (default: 1920).",
+        help="Requested BPE vocabulary size (default: 1920); oversized alphabets are limited by default.",
     )
     parser.add_argument(
         "--verbose",
@@ -467,9 +521,15 @@ def parse_args(argv=None):
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
+        default=default_device(),
         help="Compute device.",
     )
+    parser.add_argument("--precision", choices=("auto", "float32", "bfloat16"), default="auto",
+                        help="Training precision: auto uses native CUDA BF16 when supported, otherwise FP32. Checkpoint weights stay FP32.")
+    parser.add_argument("--bpe-alphabet-policy", choices=("limit", "expand", "error"), default="limit",
+                        help="New tokenizer behavior when characters exceed vocabulary capacity: limit rare characters to <unk> (default), expand vocabulary, or error.")
+    parser.add_argument("--bpe-max-chars", type=int, default=0,
+                        help="Optional base alphabet token cap, including reserved symbols and <unk>, for policy limit; 0 caps to half the vocabulary only when it overflows.")
     parser.add_argument(
         "--prompt",
         type=str,
@@ -507,6 +567,12 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for repeatable inference.")
     args = parser.parse_args(argv)
+    if args.bpe_max_chars < 0 or (args.bpe_max_chars and args.bpe_alphabet_policy != "limit"):
+        parser.error("--bpe-max-chars must be nonnegative and requires --bpe-alphabet-policy limit")
+    if args.bpe_max_chars >= args.vocab_size:
+        parser.error("--bpe-max-chars must be smaller than --vocab_size")
+    if args.bpe_max_chars and args.bpe_max_chars < 13:
+        parser.error("--bpe-max-chars must be at least 13 for reserved symbols and <unk>")
     if not math.isfinite(args.temperature) or args.temperature < 0 or args.top_k < 0:
         parser.error("--temperature must be finite and nonnegative; --top-k must be nonnegative")
     if args.max_new_tokens < 0:
@@ -601,6 +667,8 @@ def main(argv=None):
     # ---------------------------------------------------------
     # --- Training setup ---
     # ---------------------------------------------------------
+    dtype = training_dtype(args.device, args.precision)
+    print(f"Training precision: {'BF16 mixed precision' if dtype is not None else 'FP32'}", flush=True)
     # --- Data & tokenizer ---
     # ---------------------------------------------------------
     oneliners = []
@@ -734,6 +802,8 @@ def main(argv=None):
         lower_case=args.lower_case,
         bpe_max_words=args.bpe_max_words,
         character_sources=validation_files or (),
+        bpe_alphabet_policy=args.bpe_alphabet_policy,
+        bpe_max_chars=args.bpe_max_chars,
     )
     args.vocab_size = bpe.vocab_size
 
@@ -807,7 +877,7 @@ def main(argv=None):
         nonlocal last_validation_step, latest_validation_loss
         val_loss, perplexity, tokens = evaluate(
             model, validation_reader, args.batch_size, args.validation_batches,
-            args.device, args.validation_seed)
+            args.device, args.validation_seed, dtype=dtype)
         print(f"Validation | Step {global_step:,} | Loss: {val_loss:.4f} | Perplexity: {perplexity:.2f} | Tokens: {tokens:,}", flush=True)
         if args.log_progress:
             path = args.log_progress + ".validation.csv"
@@ -832,33 +902,29 @@ def main(argv=None):
         mean_loss = 0.0
         last_progress_row = None
         last_progress_position = None
+        timing_steps = timing_tokens = 0
+        timing_seconds = 0.0
 
         for x, y in stream_batches(
             datareader, bpe, args.context_length, args.batch_size
         ):
+            start_time = time.perf_counter()
             x, y = x.to(args.device), y.to(args.device)
-
-            # --- Measure inference (forward) time ---
-            if args.device.startswith("cuda"):
-                torch.cuda.synchronize()
-            start_time = time.time()
-
-            logits = model(x)  # forward pass
-
-            if args.device.startswith("cuda"):
-                torch.cuda.synchronize()
-            end_time = time.time()
-            inference_time = end_time - start_time
-
-            # --- Compute loss and backprop ---
-            loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
-
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
+            with precision_context(args.device, dtype):
+                logits = model(x)
+                loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
             loss.backward()
             optimizer.step()
             global_step += 1
 
-            total_loss += loss.item()
+            # Reading loss waits for GPU completion, so this includes forward,
+            # backward and optimizer work without extra per-forward synchronizations.
+            loss_value = loss.item()
+            timing_seconds += time.perf_counter() - start_time
+            timing_tokens += y.numel()
+            timing_steps += 1
+            total_loss += loss_value
             step += 1
             avg_loss = total_loss / step
 
@@ -872,13 +938,18 @@ def main(argv=None):
 
             # Log progress to CSV if requested
             if args.log_progress:
-                last_progress_row = [epoch + 1, step, loss.item(), avg_loss, latest_validation_loss]
+                last_progress_row = [epoch + 1, step, loss_value, avg_loss, latest_validation_loss]
                 last_progress_position = write_progress_row(args.log_progress, last_progress_row)
 
             if args.verbose and step % 10 == 0:
                 print(
-                    f"Epoch {epoch + 1}/{args.epochs} | Step {step:6d} | Avg Loss: {avg_loss:.4f} | Inference: {inference_time:.4f}s"
+                    f"Epoch {epoch + 1}/{args.epochs} | Step {step:6d} | Avg Loss: {avg_loss:.4f} | "
+                    f"Train step: {timing_seconds / timing_steps:.4f}s | "
+                    f"{timing_tokens / max(timing_seconds, 1e-9):,.0f} tokens/s",
+                    flush=True,
                 )
+                timing_steps = timing_tokens = 0
+                timing_seconds = 0.0
 
         mean_loss = total_loss / max(1, step)
         print(f"Epoch {epoch+1} complete | Mean loss: {mean_loss:.4f}")

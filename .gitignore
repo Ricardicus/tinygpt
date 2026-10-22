@@ -12,3 +12,5 @@ models
 *.csv
 *.diff
 /wikipedia-fineweb-data/
+*.patch
+*-data

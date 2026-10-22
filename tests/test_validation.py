@@ -6,6 +6,7 @@ from pathlib import Path
 import random
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -16,6 +17,48 @@ from tinygpt import TinyGPT
 
 
 class ValidationTests(unittest.TestCase):
+    def test_alphabet_policy_cli_defaults_and_validation(self):
+        args = training.parse_args([])
+        self.assertEqual(args.bpe_alphabet_policy, "limit")
+        self.assertEqual(args.bpe_max_chars, 0)
+        self.assertEqual(training.parse_args(["--bpe-alphabet-policy", "expand"]).bpe_alphabet_policy, "expand")
+        for flags in (["--bpe-max-chars", "-1"], ["--bpe-max-chars", "1"],
+                      ["--bpe-max-chars", "1920"],
+                      ["--bpe-alphabet-policy", "expand", "--bpe-max-chars", "128"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                training.parse_args(flags)
+
+    def test_precision_selection_keeps_cpu_and_unsupported_gpus_in_fp32(self):
+        self.assertIsNone(training.training_dtype("cpu", "auto"))
+        self.assertIsNone(training.training_dtype("cuda", "float32"))
+        with self.assertRaisesRegex(ValueError, "native BF16"):
+            training.training_dtype("cpu", "bfloat16")
+        with patch.object(torch.cuda, "is_available", return_value=True), \
+                patch.object(torch.cuda, "device", return_value=contextlib.nullcontext()), \
+                patch.object(torch.cuda, "is_bf16_supported", return_value=False):
+            self.assertIsNone(training.training_dtype("cuda:0", "auto"))
+            with self.assertRaisesRegex(ValueError, "native BF16"):
+                training.training_dtype("cuda:0", "bfloat16")
+        with patch.object(torch.cuda, "is_available", return_value=True), \
+                patch.object(torch.cuda, "device", return_value=contextlib.nullcontext()), \
+                patch.object(torch.cuda, "is_bf16_supported", return_value=True):
+            self.assertEqual(training.training_dtype("cuda:0", "auto"), torch.bfloat16)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA GPU required")
+    def test_bf16_training_preserves_fp32_checkpoint_weights(self):
+        if training.training_dtype("cuda", "auto") is None:
+            self.skipTest("Native BF16 GPU required")
+        model = TinyGPT(32, 8, 64, 4, 1).cuda()
+        optimizer = torch.optim.AdamW(model.parameters())
+        tokens = torch.randint(0, 32, (2, 8), device="cuda")
+        with training.precision_context("cuda", torch.bfloat16):
+            logits = model(tokens)
+            loss = torch.nn.functional.cross_entropy(logits.reshape(-1, 32), tokens.reshape(-1))
+        loss.backward()
+        optimizer.step()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(all(p.dtype == torch.float32 and torch.isfinite(p).all() for p in model.parameters()))
+
     def test_file_split_is_repeatable_disjoint_and_does_not_change_rng(self):
         root = Path('/tmp/validation-corpus')
         files = [root / f'{i}.txt' for i in range(20)]

@@ -111,6 +111,68 @@ class CorpusTests(unittest.TestCase):
         self.assertTrue(bpe.word_freq)
         self.assertFalse(bpe.vocab)
 
+    def test_new_tokenizer_expands_for_unicode_training_and_validation(self):
+        from main import getBPE
+        text = "hello world " + "".join(chr(0x4e00 + index) for index in range(100))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            held_out = root / "validation.txt"
+            held_out.write_text("Held-out characters: café Ω", encoding="utf-8")
+            tokenizer = root / "tokenizer.json"
+            with redirect_stdout(io.StringIO()) as output:
+                bpe = getBPE([text], vocab_size=32, verbose=False,
+                             tokenizer_path=tokenizer, lower_case=False,
+                             bpe_part=1, character_sources=[held_out], bpe_alphabet_policy="expand")
+            self.assertIn("Expanding vocabulary", output.getvalue())
+            self.assertGreater(bpe.vocab_size, 32)
+            self.assertTrue(bpe.merges)
+            self.assertEqual(bpe.decode(bpe.encode(text)), text)
+            self.assertEqual(bpe.decode(bpe.encode("café Ω")), "café Ω")
+            self.assertLess(max(bpe.vocab.values()), bpe.vocab_size)
+            saved = json.loads(tokenizer.read_text())
+            self.assertEqual(saved["vocab_size"], bpe.vocab_size)
+            with patch.object(BPE, "train", side_effect=AssertionError("Existing tokenizer must be reused")):
+                restored = getBPE([], vocab_size=32, verbose=False, tokenizer_path=tokenizer)
+            self.assertEqual(restored.vocab_size, bpe.vocab_size)
+            self.assertEqual(restored.encode(text), bpe.encode(text))
+
+    def test_default_policy_caps_unicode_alphabet_and_persists_unknown_fallback(self):
+        from main import getBPE
+        rare = "".join(chr(0x4e00 + index) for index in range(1000))
+        sample = "hello world " + rare
+        with tempfile.TemporaryDirectory() as directory:
+            tokenizer = Path(directory) / "tokenizer.json"
+            with redirect_stdout(io.StringIO()) as output:
+                bpe = getBPE([sample, "Ω " * 1000], vocab_size=256, bpe_part=0.5,
+                             tokenizer_path=tokenizer, lower_case=False, verbose=False)
+            self.assertEqual(bpe.vocab_size, 256)
+            self.assertLessEqual(len(bpe.vocab), 256)
+            self.assertIn("Limiting BPE base alphabet", output.getvalue())
+            self.assertIn("Ω", bpe.vocab)  # Counts include text outside the word sample.
+            self.assertEqual(bpe.decode(bpe.encode("hello Ω")), "hello Ω")
+            self.assertEqual(bpe.decode(bpe.encode("\U0001f984")), "<unk>")
+            self.assertIn("<unk>", bpe.decode(bpe.encode(sample)))
+            restored = BPE(model_file=tokenizer)
+            restored.load()
+            self.assertEqual(restored.unknown_token, "<unk>")
+            self.assertEqual(restored.encode(sample), bpe.encode(sample))
+            self.assertEqual(restored.decode(restored.encode("hello\u2003world")), "hello<unk>world")
+
+    def test_explicit_alphabet_cap_and_error_policy(self):
+        from main import getBPE
+        text = "hello world " + "".join(chr(0x4e00 + index) for index in range(1000))
+        with redirect_stdout(io.StringIO()):
+            limited = getBPE([text], vocab_size=2048, bpe_part=1,
+                             bpe_max_chars=128, verbose=False)
+        # The full alphabet would fit 2048, but an explicit cap still applies.
+        self.assertEqual(limited.vocab_size, 2048)
+        self.assertEqual(limited.unknown_token, "<unk>")
+        with self.assertRaisesRegex(ValueError, "increase vocab_size"):
+            getBPE([text], vocab_size=256, bpe_alphabet_policy="error", verbose=False)
+        for cap in (1, 256):
+            with self.assertRaises(ValueError):
+                getBPE([], vocab_size=256, bpe_max_chars=cap, verbose=False)
+
     def test_cache_invalidates_for_corpus_and_tokenizer(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'data'
