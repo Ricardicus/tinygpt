@@ -164,13 +164,13 @@ def write_progress_row(path, row, position=None):
 
 def getData(verbose=True, lower_case=True, rawdata_folder="rawdata", oneliners=[], corpus_config=None):
     if verbose:
-        print("Initializing data reader...")
+        print("Initializing data reader...", flush=True)
     datareader = TextCorpusReader(
         rawdata_folder, lower_case=lower_case, to_new_lines=oneliners,
-        corpus_config=corpus_config
+        corpus_config=corpus_config, verbose=verbose
     )
     if verbose:
-        print(f"DataReader ready: {len(datareader)} entries")
+        print(f"DataReader ready: {len(datareader.files):,} corpus files", flush=True)
     return datareader
 
 
@@ -220,7 +220,8 @@ def getBPE(
         raise ValueError("--bpe-max-words must be positive")
     total = len(data)
     if verbose:
-        print("Feeding data to BPE...")
+        print("Feeding data to BPE...", flush=True)
+    last_report = time.monotonic()
     import math
     sample_count = max(1, math.ceil(total * bpe_part))
     # Learn merges from the sample, but include characters from every file so
@@ -230,10 +231,18 @@ def getBPE(
             bpe.add_corpus(row)
         else:
             bpe.alphabet.update(row.lower() if lower_case else row)
+        if verbose and time.monotonic() - last_report >= 2:
+            print(f"BPE input: {i + 1:,} / {total:,} chunks processed", flush=True)
+            last_report = time.monotonic()
     # Include held-out characters for lossless encoding, without learning their merges.
+    if verbose and character_sources:
+        print("Scanning validation character coverage...", flush=True)
     for path in character_sources:
         for row in text_chunks(path):
             bpe.alphabet.update(row.lower() if lower_case else row)
+            if verbose and time.monotonic() - last_report >= 2:
+                print(f"Validation character coverage: {path}", flush=True)
+                last_report = time.monotonic()
     if verbose:
         print(f"Training BPE merges on {sample_count}/{total} chunks.")
     bpe.train()

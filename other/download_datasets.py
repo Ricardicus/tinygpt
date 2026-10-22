@@ -340,45 +340,56 @@ def plain_languages():
             print("Select one or more of the listed language numbers.")
 
 
-def gutenberg_records(languages=("en",), provenance=None):
+def gutenberg_records(languages=("en",), provenance=None, completed_ids=()):
     """Iterate the full catalog in book-ID order, without a book-count cap."""
     books, metadata = gutenberg_catalog()
     matching = [book for book in books if set(book["languages"]) & set(languages)]
     if provenance is not None:
         provenance.update(metadata, languages=list(languages), matching_books=len(matching),
-                          order="ascending book ID", skipped_unavailable=0)
+                          order="ascending book ID",
+                          skipped_unavailable=provenance.get("skipped_unavailable", 0))
     if not matching:
         raise ValueError("No Gutenberg books match the selected languages")
     print(f"Gutenberg: {len(matching):,} catalog books match {', '.join(languages)}", flush=True)
     for book in sorted(matching, key=lambda book: int(book["id"])):
         book_id = book["id"]
+        if book_id in completed_ids:
+            continue
         time.sleep(1)
         download_url = f"https://www.gutenberg.org/ebooks/{book_id}.txt.utf-8"
         try:
-            data, actual_url = fetch_gutenberg(download_url)
+            try:
+                data, actual_url = fetch_gutenberg(download_url)
+            except HTTPError as error:
+                if error.code not in (404, 406, 410):
+                    raise
+                # Format negotiation can fail even when the generated text exists.
+                fallback = f"https://www.gutenberg.org/cache/epub/{book_id}/pg{book_id}.txt"
+                time.sleep(1)
+                data, actual_url = fetch_gutenberg(fallback)
             text = data.decode("utf-8-sig")
             if "*** START OF" not in text.upper():
                 raise UnicodeError("Missing Gutenberg text marker")
         except (HTTPError, UnicodeError) as error:
-            if isinstance(error, HTTPError) and error.code not in (404, 410):
+            if isinstance(error, HTTPError) and error.code not in (404, 406, 410):
                 raise
             if provenance is not None:
                 provenance["skipped_unavailable"] += 1
-            print(f"Gutenberg: skipping {book_id}, no usable UTF-8 text edition", flush=True)
+            print(f"Gutenberg: skipping {book_id} ({book['title']}), no usable UTF-8 text edition", flush=True)
             continue
         yield {**book, "url": f"https://www.gutenberg.org/ebooks/{book_id}",
                "download_url": actual_url, "text": text}
 
 
-def source_records(name, provenance, languages=("en",)):
+def source_records(name, provenance, languages=("en",), completed_ids=()):
     if name == "gutenberg":
         provenance["languages"] = list(languages)
-        return gutenberg_records(languages, provenance)
+        return gutenberg_records(languages, provenance, completed_ids)
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     from datasets import load_dataset
     from huggingface_hub import HfApi
     source = SOURCES[name]
-    revision = source.get("revision") or HfApi().dataset_info(source["dataset"]).sha
+    revision = provenance.get("revision") or source.get("revision") or HfApi().dataset_info(source["dataset"]).sha
     provenance.update(dataset=source["dataset"], config=source["config"], revision=revision)
     return iter(load_dataset(source["dataset"], name=source["config"], split="train",
                              revision=revision, streaming=True))
@@ -402,28 +413,120 @@ def record_text(name, record):
     return wikipedia.clean_text(text)
 
 
-def prepare(selected, root, languages=("en",)):
-    root = validate_output(root)
-    (root / "metadata").mkdir(parents=True)
-    (root / "corpus").mkdir()
+def restore_download(root, summary, hashes):
+    """Verify manifest documents before appending; rebuild dedup from actual files."""
+    print("Verifying saved documents and rebuilding deduplication metadata...", flush=True)
+    print("This reads the existing corpus from disk; downloads resume after verification.", flush=True)
+    last_report = time.monotonic()
+    verified_files = verified_bytes = 0
+    selected = summary["limits_bytes"]
+    if not selected or any(name not in SOURCES for name in selected):
+        raise ValueError("Unrecognized dataset sources in the saved summary")
+    counts = {name: Counter(summary.get("counts", {}).get(name, {})) for name in selected}
+    for count in counts.values():
+        count.update(files=-count["files"], bytes=-count["bytes"])
+    completed_books = set()
+    hashes.execute("DELETE FROM hashes")
+    hashes.execute("CREATE TEMP TABLE restored_paths (path TEXT PRIMARY KEY)")
+    manifest_path = root / "metadata/files.jsonl"
+    with manifest_path.open(encoding="utf-8") as manifest:
+        for line in manifest:
+            record = json.loads(line)
+            rel = Path(record["path"])
+            name = record["kind"]
+            path = root / rel
+            if (name not in selected or rel.is_absolute() or ".." in rel.parts
+                    or rel.parts[:2] != ("corpus", name) or rel.suffix != ".txt"
+                    or path.is_symlink() or not path.resolve().is_relative_to((root / "corpus").resolve())):
+                raise ValueError(f"Invalid saved corpus path: {rel}")
+            index = counts[name]["files"]
+            expected = Path("corpus") / name / f"{index // 1000:05d}" / f"{index:08d}.txt"
+            if rel != expected:
+                raise ValueError(f"Unexpected saved document sequence: {rel}")
+            data = path.read_bytes()
+            if len(data) != record["bytes"] or hashlib.sha256(data).hexdigest() != record["sha256"]:
+                raise ValueError(f"Saved document hash/size mismatch: {rel}")
+            if not data.endswith(b"\n\n") or "\x00" in data.decode("utf-8"):
+                raise ValueError(f"Invalid saved document text: {rel}")
+            try:
+                hashes.execute("INSERT INTO restored_paths VALUES (?)", (rel.as_posix(),))
+                hashes.execute("INSERT INTO hashes VALUES (?)", (record["sha256"],))
+            except sqlite3.IntegrityError as error:
+                raise ValueError(f"Repeated saved path or document: {rel}") from error
+            counts[name]["files"] += 1
+            counts[name]["bytes"] += len(data)
+            verified_files += 1
+            verified_bytes += len(data)
+            if time.monotonic() - last_report >= 2:
+                print(f"Verification: {verified_files:,} documents | {verified_bytes / 1e9:.4f} GB checked | {name}", flush=True)
+                last_report = time.monotonic()
+            if name == "gutenberg" and "id" in record:
+                completed_books.add(str(record["id"]))
+    if manifest_path.stat().st_size:
+        with manifest_path.open("rb") as manifest:
+            manifest.seek(-1, 2)
+            if manifest.read(1) != b"\n":
+                raise ValueError("Saved manifest is missing its final newline; preserve and repair it before resuming")
+    print(f"Verified document contents: {verified_files:,} documents, {verified_bytes / 1e9:.4f} GB. "
+          "Checking for unlisted corpus files...", flush=True)
+    last_report = time.monotonic()
+    scanned = 0
+    for path in (root / "corpus").rglob("*.txt"):
+        rel = path.relative_to(root).as_posix()
+        if not hashes.execute("SELECT 1 FROM restored_paths WHERE path = ?", (rel,)).fetchone():
+            raise ValueError(f"Unlisted corpus file: {rel}; preserve it outside corpus before resuming")
+        scanned += 1
+        if time.monotonic() - last_report >= 2:
+            print(f"Corpus scan: {scanned:,} / {verified_files:,} files checked", flush=True)
+            last_report = time.monotonic()
+    hashes.execute("DROP TABLE restored_paths")
+    summary["counts"] = counts
+    print(f"Verified {sum(c['files'] for c in counts.values()):,} saved documents; continuing download.", flush=True)
+    return completed_books
+
+
+def prepare(selected, root, languages=("en",), resume=False):
+    root = Path(root).expanduser().resolve() if resume else validate_output(root)
+    if not resume:
+        (root / "metadata").mkdir(parents=True)
+        (root / "corpus").mkdir()
     summary = {"created_utc": datetime.now(timezone.utc).isoformat(), "status": "downloading",
                "limits_bytes": selected, "sources": {}, "counts": {},
+               "gutenberg_languages": list(languages),
                "limit_modes": {name: "soft_whole_book" if name == "gutenberg" else "hard_whole_document"
                                for name in selected}}
     summary_path = root / "metadata/summary.json"
+    if resume:
+        print(f"Resuming dataset: {root}", flush=True)
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if summary.get("status") == "complete":
+            raise ValueError("Dataset is already complete")
+        selected = summary["limits_bytes"]
+        languages = tuple(summary.get("gutenberg_languages") or
+                          summary.get("sources", {}).get("gutenberg", {}).get("languages", ["en"]))
     # Disk-backed hashes keep full-dataset deduplication from growing a RAM set.
     with sqlite3.connect(root / "metadata/dedup.sqlite3") as hashes, \
-            (root / "metadata/files.jsonl").open("w", encoding="utf-8") as manifest:
-        hashes.execute("CREATE TABLE hashes (digest TEXT PRIMARY KEY)")
+            (root / "metadata/files.jsonl").open("a" if resume else "w", encoding="utf-8") as manifest:
+        hashes.execute("CREATE TABLE IF NOT EXISTS hashes (digest TEXT PRIMARY KEY)")
+        completed_books = restore_download(root, summary, hashes) if resume else set()
+        hashes.commit()
+        summary["status"] = "downloading"
+        summary.pop("error", None)
         try:
             for name, limit in selected.items():
-                counts = Counter(files=0, bytes=0, examined=0)
+                counts = Counter(summary["counts"].get(name, {}))
+                counts.update(files=0, bytes=0, examined=0)
+                if counts["files"] and (counts["stopped_at_byte_limit"] or counts["source_exhausted"]
+                                        or (limit is not None and counts["bytes"] >= limit)):
+                    print(f"{name}: already finished; reusing {counts['files']:,} verified documents.", flush=True)
+                    continue
                 summary["counts"][name] = counts
-                provenance = {"url": SOURCES[name]["url"]}
+                provenance = summary["sources"].get(name, {"url": SOURCES[name]["url"]})
                 summary["sources"][name] = provenance
                 wikipedia.write_json(summary_path, summary)
                 print(f"\n{SOURCES[name]['label']}: connecting...", flush=True)
-                records = (source_records(name, provenance, languages) if name == "gutenberg"
+                records = (source_records(name, provenance, languages, completed_books) if name == "gutenberg" and resume
+                           else source_records(name, provenance, languages) if name == "gutenberg"
                            else source_records(name, provenance))
                 wikipedia.write_json(summary_path, summary)
                 last_report = 0
@@ -511,10 +614,14 @@ def prepare(selected, root, languages=("en",)):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plain", action="store_true", help="Use line-based prompts instead of the checkbox TUI")
+    parser.add_argument("--resume", type=Path, metavar="FOLDER", help="Verify and continue a failed/interrupted download using its saved selections")
     args = parser.parse_args(argv)
-    if not sys.stdin.isatty():
+    if not args.resume and not sys.stdin.isatty():
         parser.error("Interactive terminal required. Run this command directly in your terminal.")
     try:
+        if args.resume:
+            prepare({}, args.resume, resume=True)
+            return
         if args.plain:
             plan = plain_plan()
         else:

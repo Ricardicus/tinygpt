@@ -1,10 +1,13 @@
 import json
 import io
+import itertools
+from array import array
 from contextlib import redirect_stdout
 import random
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from bpe import BPE
 from corpus import discover_files, load_config, text_chunks
@@ -12,6 +15,51 @@ from datareader import TextCorpusReader, TokenizedDataReader
 
 
 class CorpusTests(unittest.TestCase):
+    def test_large_cache_roundtrip_reports_read_and_write_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reader = TokenizedDataReader.__new__(TokenizedDataReader)
+            reader.verbose = True
+            reader._cache_path = Path(directory) / "tokens.bin"
+            reader._meta_path = Path(directory) / "tokens.bin.json"
+            reader._fingerprint = "test-fingerprint"
+            expected = array("I", [1, 256, 65536]) * (1_400_000)
+            reader._tokens = expected
+            with patch("datareader.time.monotonic", side_effect=itertools.count(step=3).__next__), \
+                    redirect_stdout(io.StringIO()) as output:
+                reader._save_cache()
+                reader._tokens = array("I")
+                reader._load_cache()
+            self.assertEqual(reader._tokens, expected)
+            self.assertEqual(reader._cache_path.stat().st_size, len(expected) * 4)
+            self.assertIn("Cache saving:", output.getvalue())
+            self.assertIn("Cache loading:", output.getvalue())
+
+    def test_initialization_discovers_files_without_reading_corpus_contents(self):
+        from main import getData
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "book.txt").write_text("whole book\n" * 100)
+            with patch("datareader.text_chunks", side_effect=AssertionError("Unnecessary corpus read")), \
+                    redirect_stdout(io.StringIO()) as output:
+                reader = getData(rawdata_folder=root)
+            self.assertEqual(len(reader.files), 1)
+            self.assertIsNone(reader._length)
+            self.assertIn("DataReader ready: 1 corpus files", output.getvalue())
+
+    def test_chunk_count_reports_progress_and_caches_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "book.txt").write_text("whole book\n" * 1000)
+            reader = TextCorpusReader(root, shuffle=False, verbose=True)
+            expected = sum(1 for _ in reader)
+            with patch("datareader.time.monotonic", side_effect=itertools.count(step=3).__next__), \
+                    redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(len(reader), expected)
+            self.assertIn("Counting input: file 1 / 1", output.getvalue())
+            self.assertIn("Input count complete:", output.getvalue())
+            with patch("datareader.text_chunks", side_effect=AssertionError("Repeated count")):
+                self.assertEqual(len(reader), expected)
+
     def test_recursive_selection_and_streaming(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

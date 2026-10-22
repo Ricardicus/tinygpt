@@ -56,6 +56,12 @@ Place your raw data files under the folder "rawdata" and the program will by def
 train a BPE tokenizer on the data. With --bpe-part you can set a percentage of all
 the data included in the tokenization effort. It typically takes a while.
 
+With verbose output enabled (the default), startup reports file discovery,
+tokenizer input counting and processing, cache identity checks, and token cache
+loading/saving. Slow scans report progress about every two seconds. Initial reader
+setup discovers files without reading the entire corpus just to print a count;
+a new tokenizer counts input chunks separately when needed.
+
 Once the tokenizer is trained, it will try to train the model on your data.
 
 If you provide the program with --model it will read its hyperparameters from that
@@ -155,7 +161,10 @@ offers the same choices. The GB cap covers all selected languages together,
 not a separate quota per language. Gutenberg defaults to a soft `0.25` GB target.
 Books are considered in ascending Gutenberg ID order; multilingual books
 matching any selected language are included once. Missing or unusable UTF-8 text
-editions are skipped. The catalog hash, retrieval time, selected languages and
+editions are skipped. If the text endpoint returns HTTP 404, 406 or 410, the
+downloader tries Gutenberg's generated text URL before skipping that title.
+Rate-limit, permission and server errors still stop the run rather than silently
+skipping books. The catalog hash, retrieval time, selected languages and
 skip count are recorded in the summary, with authors and language codes in each
 book's manifest record. The downloaded catalog is reused throughout the run.
 
@@ -169,8 +178,20 @@ and actual sizes are recorded under `metadata/`.
 
 Downloads show progress in the terminal. Existing nonempty folders are refused.
 Interrupted downloads retain their text and metadata, with a partial status in
-`metadata/summary.json`; this downloader currently requires a fresh folder to
-retry. Completion creates `training_data.json` and `train.sh`. Start training
+`metadata/summary.json`. Continue an existing failed or interrupted download with:
+
+```bash
+python other/download_datasets.py --resume <chosen-folder>
+```
+
+Resume verifies the manifest, file sizes and hashes, rebuilds deduplication
+metadata, and restores the saved limits and languages. Finished sources are
+reused; already-saved Gutenberg book IDs are skipped before downloading. Partial
+Hugging Face sources replay their recorded revision and skip known documents.
+Invalid manifests or modified/unlisted corpus files stop verification before
+any downloads. Resume also works for folders produced before this flag existed.
+
+Completion creates `training_data.json` and `train.sh`. Start training
 separately with `bash <chosen-folder>/train.sh`.
 
 For terminals without curses, use the line-based multi-selection wizard:

@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 DEFAULT_CONFIG = Path(__file__).with_name("training_data.json")
@@ -22,7 +23,7 @@ def load_config(path=None):
     return {"suffixes": [s.lower() for s in suffixes], "exclude_dirs": excluded}
 
 
-def discover_files(folder, config=None):
+def discover_files(folder, config=None, verbose=False):
     folder = Path(folder)
     if not folder.is_dir():
         raise FileNotFoundError(f"Not a corpus directory: {folder}")
@@ -30,6 +31,9 @@ def discover_files(folder, config=None):
     suffixes = tuple(config["suffixes"])
     excluded = set(config["exclude_dirs"])
     files = []
+    last_report = time.monotonic()
+    if verbose:
+        print(f"Discovering corpus files in {folder}...", flush=True)
     def onerror(error):
         raise error
     for root, dirs, names in os.walk(folder, followlinks=False, onerror=onerror):
@@ -38,8 +42,13 @@ def discover_files(folder, config=None):
             path = Path(root) / name
             if name.lower().endswith(suffixes) and not path.is_symlink() and path.is_file():
                 files.append(path)
+            if verbose and time.monotonic() - last_report >= 2:
+                print(f"Corpus discovery: {len(files):,} accepted files found...", flush=True)
+                last_report = time.monotonic()
     if not files:
         raise FileNotFoundError(f"No accepted corpus files in {folder}")
+    if verbose:
+        print(f"Corpus discovery complete: {len(files):,} files.", flush=True)
     return files
 
 

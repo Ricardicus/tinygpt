@@ -3,6 +3,7 @@ import csv
 import gzip
 import io
 import hashlib
+import itertools
 import json
 from pathlib import Path
 import tempfile
@@ -65,18 +66,92 @@ class DownloadDatasetsTests(unittest.TestCase):
         books = [{"id": str(i), "languages": ["en"], "title": f"Book {i}"} for i in range(1, 104)]
         books += [{"id": "104", "languages": ["fr"], "title": "French"}]
         data = b"\xef\xbb\xbf*** START OF THE PROJECT GUTENBERG EBOOK ***\nBook\nLicense"
-        replies = [HTTPError("url", 404, "No text", None, None)] + [(data, "text-url")] * 102
+        replies = [HTTPError("url", code, "No text", None, None) for code in (404, 406)] + [(data, "text-url")] * 102
         provenance = {}
         with patch.object(builder, "gutenberg_catalog", return_value=(books, {"catalog_sha256": "hash"})), \
                 patch.object(builder, "fetch_gutenberg", side_effect=replies) as fetch, \
                 patch.object(builder.time, "sleep"):
             records = list(builder.gutenberg_records(("en",), provenance))
         self.assertEqual(len(records), 102)
-        self.assertEqual(fetch.call_count, 103)
+        self.assertEqual(fetch.call_count, 104)
         self.assertEqual(records[-1]["id"], "103")
         self.assertEqual(provenance["skipped_unavailable"], 1)
         self.assertEqual(provenance["languages"], ["en"])
         self.assertFalse(records[0]["text"].startswith("\ufeff"))
+
+    def test_406_uses_generated_text_fallback(self):
+        book = {"id": "41", "languages": ["en"], "title": "A book"}
+        data = b"*** START OF THE PROJECT GUTENBERG EBOOK ***\nComplete book"
+        with patch.object(builder, "gutenberg_catalog", return_value=([book], {})), \
+                patch.object(builder, "fetch_gutenberg", side_effect=[HTTPError("url", 406, "Unavailable", None, None), (data, "fallback-url")]) as fetch, \
+                patch.object(builder.time, "sleep"):
+            rows = list(builder.gutenberg_records())
+        self.assertEqual(rows[0]["download_url"], "fallback-url")
+        self.assertEqual(fetch.call_args_list[1].args[0], "https://www.gutenberg.org/cache/epub/41/pg41.txt")
+
+    def test_server_and_permission_errors_are_not_silently_skipped(self):
+        book = {"id": "1", "languages": ["en"], "title": "A book"}
+        for code in (403, 429, 500):
+            with self.subTest(code=code), \
+                    patch.object(builder, "gutenberg_catalog", return_value=([book], {})), \
+                    patch.object(builder, "fetch_gutenberg", side_effect=HTTPError("url", code, "Error", None, None)), \
+                    patch.object(builder.time, "sleep"), self.assertRaises(HTTPError):
+                list(builder.gutenberg_records())
+
+    def test_resume_reuses_finished_sources_and_skips_saved_book_downloads(self):
+        books = [{"id": str(i), "languages": ["en"], "title": f"Book {i}"} for i in (1, 2)]
+        data = b"*** START OF THE PROJECT GUTENBERG EBOOK ***\nFirst complete book"
+        second = data.replace(b"First", b"Second")
+        limit = len(builder.record_text("gutenberg", {"text": data.decode()}).encode()) + 1
+        original_source = builder.source_records
+        def source(name, meta, *args):
+            return iter([{"text": PROSE}]) if name == "wikipedia" else original_source(name, meta, *args)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "resume"
+            with patch.object(builder, "gutenberg_catalog", return_value=(books, {})), \
+                    patch.object(builder, "source_records", side_effect=source), \
+                    patch.object(builder, "fetch_gutenberg", side_effect=[(data, "url1"), OSError("network down")]), \
+                    patch.object(builder.time, "sleep"), self.assertRaises(OSError):
+                builder.prepare({"wikipedia": None, "gutenberg": limit}, root)
+            before = (root / "metadata/files.jsonl").read_bytes()
+            output = io.StringIO()
+            def fetch_remaining(url):
+                # Verification must be visible before any network request resumes.
+                self.assertIn("Resuming dataset:", output.getvalue())
+                self.assertIn("Verification:", output.getvalue())
+                self.assertIn("Corpus scan:", output.getvalue())
+                return second, "url2"
+            with patch.object(builder, "gutenberg_catalog", return_value=(books, {})), \
+                    patch.object(builder, "source_records", wraps=original_source) as sources, \
+                    patch("sys.stdout", output), \
+                    patch.object(builder.time, "monotonic", side_effect=itertools.count(step=3).__next__), \
+                    patch.object(builder, "fetch_gutenberg", side_effect=fetch_remaining) as fetch, \
+                    patch.object(builder.time, "sleep"):
+                result = builder.prepare({}, root, resume=True)
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(result["files"], 3)
+            self.assertEqual(result["counts"]["gutenberg"]["files"], 2)
+            self.assertGreaterEqual(result["counts"]["gutenberg"]["bytes"], limit)
+            self.assertTrue((root / "metadata/files.jsonl").read_bytes().startswith(before))
+            self.assertEqual(sources.call_count, 1)
+            fetch.assert_called_once_with("https://www.gutenberg.org/ebooks/2.txt.utf-8")
+            self.assertTrue((root / "train.sh").exists())
+
+    def test_resume_refuses_modified_documents_before_network_or_summary_changes(self):
+        def records():
+            yield {"id": "1", "text": "Original complete book"}
+            raise OSError("interrupted")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tampered"
+            with patch.object(builder, "source_records", return_value=records()), self.assertRaises(OSError):
+                builder.prepare({"gutenberg": None}, root)
+            row = json.loads((root / "metadata/files.jsonl").read_text())
+            (root / row["path"]).write_text("Modified book")
+            before = (root / "metadata/summary.json").read_bytes()
+            with patch.object(builder, "source_records") as source, self.assertRaisesRegex(ValueError, "mismatch"):
+                builder.prepare({}, root, resume=True)
+            source.assert_not_called()
+            self.assertEqual((root / "metadata/summary.json").read_bytes(), before)
 
     def test_language_union_includes_bilingual_books_once(self):
         books = [{"id": "1", "languages": ["en", "fr"], "title": "Bilingual"},

@@ -99,7 +99,7 @@ class TokenizedDataReader:
                 f"Folder {self.folder} does not exist or is not a directory."
             )
 
-        self.files = [Path(p) for p in files] if files is not None else discover_files(self.folder, corpus_config)
+        self.files = [Path(p) for p in files] if files is not None else discover_files(self.folder, corpus_config, verbose=verbose)
         if glob_pattern:
             self.files = [p for p in self.files if fnmatch.fnmatch(p.name, glob_pattern)]
         if not self.files:
@@ -120,9 +120,19 @@ class TokenizedDataReader:
         else:
             self._cache_path = self.folder.parent / f"{self.folder.name}_tokens.bin"
 
+        if verbose:
+            print(f"Checking token cache identity for {len(self.files):,} files...", flush=True)
+        file_metadata = []
+        last_report = time.monotonic()
+        for index, path in enumerate(self.files, 1):
+            stat = path.stat()
+            file_metadata.append((str(path.resolve()), stat.st_size, stat.st_mtime_ns))
+            if verbose and time.monotonic() - last_report >= 2:
+                print(f"Cache identity: {index:,} / {len(self.files):,} files checked", flush=True)
+                last_report = time.monotonic()
         manifest = {
             "version": 3,
-            "files": [(str(p.resolve()), p.stat().st_size, p.stat().st_mtime_ns) for p in self.files],
+            "files": file_metadata,
             "vocab": bpe.vocab,
             "merges": list(bpe.merges.items()),
             "lower_case": lower_case,
@@ -159,11 +169,21 @@ class TokenizedDataReader:
     # ---- cache I/O ------------------------------------------------
     def _save_cache(self):
         """Write token IDs to a compact binary file (4 bytes per token)."""
+        if self.verbose:
+            print(f"Saving token cache: {self._cache_path}...", flush=True)
         with open(self._cache_path, "wb") as f:
             if sys.byteorder != "little":
                 self._tokens.byteswap()
             try:
-                self._tokens.tofile(f)
+                last_report = time.monotonic()
+                with memoryview(self._tokens).cast("B") as data:
+                    block_size = 16 * 1024 * 1024
+                    for start in range(0, len(data), block_size):
+                        end = min(start + block_size, len(data))
+                        f.write(data[start:end])
+                        if self.verbose and time.monotonic() - last_report >= 2:
+                            print(f"Cache saving: {end / 1e9:.3f} / {len(data) / 1e9:.3f} GB", flush=True)
+                            last_report = time.monotonic()
             finally:
                 if sys.byteorder != "little":
                     self._tokens.byteswap()
@@ -179,8 +199,15 @@ class TokenizedDataReader:
     def _load_cache(self):
         """Read token IDs from a previously saved binary cache."""
         n_tokens = self._cache_path.stat().st_size // 4
+        if self.verbose:
+            print(f"Loading token cache: {self._cache_path} ({n_tokens * 4 / 1e9:.3f} GB)...", flush=True)
+        last_report = time.monotonic()
         with open(self._cache_path, "rb") as f:
-            self._tokens.fromfile(f, n_tokens)
+            while len(self._tokens) < n_tokens:
+                self._tokens.fromfile(f, min(4 * 1024 * 1024, n_tokens - len(self._tokens)))
+                if self.verbose and time.monotonic() - last_report >= 2:
+                    print(f"Cache loading: {len(self._tokens) * 4 / 1e9:.3f} / {n_tokens * 4 / 1e9:.3f} GB", flush=True)
+                    last_report = time.monotonic()
         if sys.byteorder != "little":
             self._tokens.byteswap()
         if self.verbose:
@@ -577,8 +604,10 @@ class TextCorpusReader:
         to_new_lines=[],
         round_off_at_whitespace=True,
         corpus_config=None,
+        verbose=False,
     ):
         self.lower_case = lower_case
+        self.verbose = verbose
         self.delimiter = delimiter
         self.encoding = encoding
         self.buffer_size = buffer_size
@@ -590,7 +619,7 @@ class TextCorpusReader:
                 raise FileNotFoundError(
                     f"Folder {folder} does not exist or is not a directory."
                 )
-            self.files = [str(p) for p in discover_files(folder, corpus_config)]
+            self.files = [str(p) for p in discover_files(folder, corpus_config, verbose=verbose)]
         elif isinstance(sources, (list, tuple)):
             self.files = [str(Path(p)) for p in sources]
         else:
@@ -614,7 +643,19 @@ class TextCorpusReader:
 
     def __len__(self):
         if self._length is None:
-            self._length = sum(1 for _ in self)
+            if self.verbose:
+                print(f"Counting tokenizer input chunks across {len(self.files):,} files...", flush=True)
+            total = 0
+            last_report = time.monotonic()
+            for index, path in enumerate(self.files, 1):
+                for _ in text_chunks(path, chunk_size=max(1024, self.buffer_size)):
+                    total += 1
+                    if self.verbose and time.monotonic() - last_report >= 2:
+                        print(f"Counting input: file {index:,} / {len(self.files):,} | {total:,} chunks", flush=True)
+                        last_report = time.monotonic()
+            self._length = total
+            if self.verbose:
+                print(f"Input count complete: {total:,} chunks.", flush=True)
         return self._length
 
     def __getitem__(self, index):
