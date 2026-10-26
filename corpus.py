@@ -8,8 +8,19 @@ from pathlib import Path
 DEFAULT_CONFIG = Path(__file__).with_name("training_data.json")
 
 
+def relative_corpus_path(value):
+    """Normalize a portable file path relative to the corpus root."""
+    if not isinstance(value, str) or not value or "\\" in value or "\n" in value or "\r" in value:
+        raise ValueError("Excluded files must be nonempty corpus-relative paths using '/' separators")
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts or path.as_posix() == ".":
+        raise ValueError(f"Excluded file must stay relative to the corpus root: {value}")
+    return path.as_posix()
+
+
 def load_config(path=None):
-    with open(path or DEFAULT_CONFIG, encoding="utf-8") as source:
+    config_path = Path(path or DEFAULT_CONFIG)
+    with open(config_path, encoding="utf-8") as source:
         config = json.load(source)
     suffixes = config.get("suffixes")
     if not isinstance(suffixes, list) or not suffixes or any(
@@ -20,7 +31,34 @@ def load_config(path=None):
     excluded = config.get("exclude_dirs", [])
     if not isinstance(excluded, list) or any(not isinstance(s, str) for s in excluded):
         raise ValueError("'exclude_dirs' must be a list of directory names.")
-    return {"suffixes": [s.lower() for s in suffixes], "exclude_dirs": excluded}
+    exclude_files = config.get("exclude_files", [])
+    manifests = config.get("exclude_files_from", [])
+    if not isinstance(exclude_files, list) or not isinstance(manifests, list) or any(not isinstance(p, str) for p in manifests):
+        raise ValueError("'exclude_files' and 'exclude_files_from' must be lists of paths")
+    paths = {relative_corpus_path(value) for value in exclude_files}
+    for manifest in manifests:
+        manifest_path = Path(manifest).expanduser()
+        if not manifest_path.is_absolute():
+            manifest_path = config_path.parent / manifest_path
+        with manifest_path.open(encoding="utf-8") as source:
+            for line in source:
+                entry = line.strip()
+                if entry and not entry.startswith("#"):
+                    paths.add(relative_corpus_path(entry))
+    result = {"suffixes": [s.lower() for s in suffixes], "exclude_dirs": excluded}
+    if paths:
+        result["exclude_files"] = sorted(paths)
+    return result
+
+
+def filter_excluded_files(folder, files, config=None):
+    """Apply explicit exclusions to preselected train/validation file lists too."""
+    config = config or {}
+    excluded = {relative_corpus_path(value) for value in config.get("exclude_files", [])}
+    if not excluded:
+        return list(files)
+    root = Path(folder).resolve()
+    return [path for path in files if Path(path).resolve().relative_to(root).as_posix() not in excluded]
 
 
 def discover_files(folder, config=None, verbose=False):
@@ -30,7 +68,9 @@ def discover_files(folder, config=None, verbose=False):
     config = config or load_config()
     suffixes = tuple(config["suffixes"])
     excluded = set(config["exclude_dirs"])
+    excluded_files = {relative_corpus_path(value) for value in config.get("exclude_files", [])}
     files = []
+    skipped_files = 0
     last_report = time.monotonic()
     if verbose:
         print(f"Discovering corpus files in {folder}...", flush=True)
@@ -41,14 +81,17 @@ def discover_files(folder, config=None, verbose=False):
         for name in sorted(names):
             path = Path(root) / name
             if name.lower().endswith(suffixes) and not path.is_symlink() and path.is_file():
-                files.append(path)
+                if path.relative_to(folder).as_posix() not in excluded_files:
+                    files.append(path)
+                else:
+                    skipped_files += 1
             if verbose and time.monotonic() - last_report >= 2:
                 print(f"Corpus discovery: {len(files):,} accepted files found...", flush=True)
                 last_report = time.monotonic()
     if not files:
         raise FileNotFoundError(f"No accepted corpus files in {folder}")
     if verbose:
-        print(f"Corpus discovery complete: {len(files):,} files.", flush=True)
+        print(f"Corpus discovery complete: {len(files):,} files; {skipped_files:,} explicitly excluded.", flush=True)
     return files
 
 

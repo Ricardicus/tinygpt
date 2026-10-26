@@ -152,6 +152,100 @@ trained with `--lower-case false`.
 
 ## Interactive dataset downloader
 
+### Audit a corpus before excluding foreign scripts or symbols
+
+The read-only character audit accepts a prepared dataset folder or its `corpus/`
+folder and produces per-file measurements, context examples and removal estimates:
+
+```bash
+python other/audit_corpus.py datasets/wikipedia-0.25gb_fineweb-edu-20gb_gutenberg-1gb_en
+```
+
+The default `--policy english` accepts printable ASCII, tab/CR/LF, Latin letters
+(including accents), combining marks and common English typography. To measure
+everything that an ASCII-only tokenizer would replace, add `--policy ascii`.
+Hebrew, CJK and other non-Latin letters are flagged under either policy.
+These are character suitability checks, not language identification or proof of
+data poisoning: legitimate English text can quote foreign names or mathematical
+symbols, while non-English Latin-script text and malicious English text can pass.
+
+Reports default to a new timestamped folder under `<dataset>/audits/`:
+
+- `files.csv`: every file's path, source, MB/GB, percentage of characters outside
+  policy, affected byte percentage, and percentage of letters from non-Latin scripts.
+- `flagged-files.jsonl`: flagged files with reasons, Unicode names/code points,
+  line numbers, character offsets and nearby text (`--examples 3` per file by default).
+- `characters.csv`: character frequencies, Unicode names, file counts and whether
+  the policy accepts each character. Includes accepted non-ASCII characters too.
+- `summary.json`: totals by source and whole-file removal estimates for thresholds
+  of 0%, 0.1%, 1%, 5% and 10%. Each scenario includes MB/GB removed, percentage of
+  the corpus lost, source breakdowns, and the cost of dropping entire affected
+  sources instead of just their files.
+
+A removal threshold applies to the percentage of decoded characters, including
+whitespace, and flags files **strictly above** the threshold. For example,
+`--thresholds 0,1,5,20` compares removing any affected file with removing only files
+above 1%, 5% or 20%. Removal estimates count each whole file's original bytes,
+not just the unsupported characters. Nothing is deleted, filtered or replaced.
+Invalid UTF-8 bytes and control characters are reported too. The audit streams
+file contents and prints progress during discovery and scanning. Use
+`--output PATH` to choose a new report directory outside the corpus.
+
+### Apply reviewed audit exclusions to training
+
+Choose a threshold after reviewing the report. Generate an editable exclusion
+list and config from an existing audit without rescanning any corpus text:
+
+```bash
+python other/audit_corpus.py --from-report /path/to/audit-report --exclude-above 1
+```
+
+This selects files with **more than 1%** outside-policy characters; 1% is an
+example decision threshold, not an automatic conclusion about poisoning.
+It creates `exclusions-gt-1/` inside the report, containing:
+
+- `excluded-files.txt`: one exact corpus-relative path per line; review/edit it.
+- `training_data.json`: references that list and preserves the audited suffixes,
+  directory exclusions and any prior file exclusions.
+- `selection.json`: threshold, policy, selected file count and MB/GB impact.
+
+The command prints the new config path. Add it to your training launch command:
+
+```bash
+bash "$dataset_dir/train.sh" --data-config /path/to/audit-report/exclusions-gt-1/training_data.json
+```
+
+Keep your other model/training arguments when adding this option. You can also
+generate the candidate alongside a new audit with
+`python other/audit_corpus.py "$dataset_dir" --exclude-above 1`. Different
+thresholds produce separate review folders; existing configs/reports are never
+overwritten. Generating a list does not activate it or delete any corpus files.
+
+The shared corpus config also supports manual exclusions:
+
+```json
+{
+  "suffixes": [".txt"],
+  "exclude_dirs": [],
+  "exclude_files": ["gutenberg/00001/00001612.txt"],
+  "exclude_files_from": ["excluded-files.txt"]
+}
+```
+
+Exclusion paths identify files relative to the `--rawdata` corpus root; do not
+prefix them with `corpus/`. They are exact paths, not filename/glob matches.
+Referenced list filenames resolve relative to the config file, so the config and
+list can move together between machines. Blank lines and `#` comments in lists
+are ignored. Missing lists and invalid/escaping paths produce errors.
+
+Exclusions apply before tokenizer preparation and the train/validation split,
+and tokenized readers honor them with explicit file lists as well. Token caches
+automatically invalidate when the effective file selection changes. Existing
+tokenizers and model checkpoints retain what they already learned; use fresh
+tokenizer/model paths to train solely on the filtered corpus.
+
+### Download datasets interactively
+
 Choose several sources, limits and a destination in a checkbox terminal UI:
 
 ```bash

@@ -15,6 +15,55 @@ from datareader import TextCorpusReader, TokenizedDataReader
 
 
 class CorpusTests(unittest.TestCase):
+    def test_external_exclusions_are_config_relative_and_exact_corpus_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus"
+            for group in ("books", "wiki"):
+                (corpus / group).mkdir(parents=True)
+                (corpus / group / "same.txt").write_text("hello world " * 10)
+            rules = root / "reports/rules"
+            rules.mkdir(parents=True)
+            (rules / "excluded.txt").write_text("# Reviewed exclusions\nbooks/same.txt\n")
+            config_path = rules / "training_data.json"
+            config_path.write_text(json.dumps({"suffixes": [".txt"], "exclude_dirs": [],
+                                                "exclude_files_from": ["excluded.txt"]}))
+            config = load_config(config_path)
+            files = discover_files(corpus, config)
+            self.assertEqual([p.relative_to(corpus).as_posix() for p in files], ["wiki/same.txt"])
+            bpe = BPE(vocab_size=32)
+            bpe.add_corpus("hello world")
+            bpe.train()
+            # Preselected validation/training lists cannot bypass file exclusions.
+            reader = TokenizedDataReader(corpus, bpe, 2, files=sorted(corpus.rglob("*.txt")), corpus_config=config)
+            self.assertEqual(reader.files, files)
+
+    def test_invalid_exclusion_config_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            for exclusions in (["../outside.txt"], ["/absolute.txt"], ["books\\bad.txt"], [None], "not a list"):
+                path.write_text(json.dumps({"suffixes": [".txt"], "exclude_files": exclusions}))
+                with self.subTest(exclusions=exclusions), self.assertRaises(ValueError):
+                    load_config(path)
+            path.write_text(json.dumps({"suffixes": [".txt"], "exclude_files_from": ["missing.txt"]}))
+            with self.assertRaises(FileNotFoundError):
+                load_config(path)
+
+    def test_changed_exclusions_invalidate_token_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "corpus"
+            root.mkdir()
+            (root / "a.txt").write_text("hello world " * 10)
+            (root / "b.txt").write_text("hello world " * 10)
+            bpe = BPE(vocab_size=32)
+            bpe.add_corpus("hello world")
+            bpe.train()
+            first = TokenizedDataReader(root, bpe, 2, cache=True)
+            config = {"suffixes": [".txt"], "exclude_dirs": [], "exclude_files": ["b.txt"]}
+            second = TokenizedDataReader(root, bpe, 2, cache=True, corpus_config=config)
+            self.assertNotEqual(first._fingerprint, second._fingerprint)
+            self.assertLess(len(second._tokens), len(first._tokens))
+
     def test_large_cache_roundtrip_reports_read_and_write_progress(self):
         with tempfile.TemporaryDirectory() as directory:
             reader = TokenizedDataReader.__new__(TokenizedDataReader)

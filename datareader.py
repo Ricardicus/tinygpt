@@ -3,7 +3,7 @@ import time
 import hashlib
 import fnmatch
 from array import array
-from corpus import discover_files, text_chunks
+from corpus import discover_files, text_chunks, filter_excluded_files
 import sys
 import json
 import random
@@ -99,7 +99,8 @@ class TokenizedDataReader:
                 f"Folder {self.folder} does not exist or is not a directory."
             )
 
-        self.files = [Path(p) for p in files] if files is not None else discover_files(self.folder, corpus_config, verbose=verbose)
+        self.files = (filter_excluded_files(self.folder, [Path(p) for p in files], corpus_config)
+                      if files is not None else discover_files(self.folder, corpus_config, verbose=verbose))
         if glob_pattern:
             self.files = [p for p in self.files if fnmatch.fnmatch(p.name, glob_pattern)]
         if not self.files:
