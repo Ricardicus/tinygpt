@@ -14,6 +14,48 @@ from tinygpt import TinyGPT
 
 
 class CheckpointTests(unittest.TestCase):
+    def test_lr_default_and_explicit_argument_tracking(self):
+        args = training.parse_args([])
+        self.assertEqual(args.lr, 0.0003)
+        self.assertFalse(args.lr_explicit)
+        for flags in (["--lr", "0.00003"], ["--lr=0.00003"], ["--lr", "0.0003"]):
+            self.assertTrue(training.parse_args(flags).lr_explicit)
+        for value in ("-1", "nan", "inf"):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                training.parse_args(["--lr", value])
+
+    def test_resume_lr_override_preserves_optimizer_moments_and_other_settings(self):
+        model = TinyGPT(20, 4, 12, 3, 1)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.005, betas=(0.8, 0.95), weight_decay=0.2)
+        model(torch.tensor([[1, 2, 3, 4]])).square().mean().backward()
+        optimizer.step()
+        saved_optimizer = optimizer.state_dict()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.pt"
+            for flags, expected_lr in (([], 0.005), (["--lr", "0.00003"], 0.00003),
+                                       (["--lr=0.00003"], 0.00003), (["--lr", "0.0003"], 0.0003)):
+                with self.subTest(flags=flags):
+                    training.save_checkpoint(path, model, optimizer, 0, 1.5, 5)
+                    # Zero batches isolate restoration from subsequent optimizer updates.
+                    with patch.object(training, "getData", return_value=[]), \
+                            patch.object(training, "getBPE", return_value=SimpleNamespace(vocab_size=20)), \
+                            patch.object(training, "TokenizedDataReader", return_value=[]), \
+                            patch.object(training, "stream_batches", return_value=iter([])), \
+                            contextlib.redirect_stdout(io.StringIO()) as output:
+                        training.main(["--device", "cpu", "--model", str(path), "--epochs", "1", "--verbose", "false"] + flags)
+                    result = torch.load(path, map_location="cpu")
+                    restored = result["optimizer_state_dict"]
+                    self.assertEqual(restored["param_groups"][0]["lr"], expected_lr)
+                    self.assertEqual(restored["param_groups"][0]["betas"], (0.8, 0.95))
+                    self.assertEqual(restored["param_groups"][0]["weight_decay"], 0.2)
+                    self.assertEqual(result["global_step"], 5)
+                    for key, state in saved_optimizer["state"].items():
+                        for name, tensor in state.items():
+                            torch.testing.assert_close(restored["state"][key][name], tensor, rtol=0, atol=0)
+                    for name, tensor in model.state_dict().items():
+                        torch.testing.assert_close(result["model_state_dict"][name], tensor, rtol=0, atol=0)
+                    self.assertIn("--lr overrides checkpoint" if flags else "Learning rate (checkpoint)", output.getvalue())
+
     def test_failed_save_preserves_previous_checkpoint(self):
         model = TinyGPT(20, 4, 12, 3, 1)
         optimizer = torch.optim.AdamW(model.parameters())
@@ -32,8 +74,8 @@ class CheckpointTests(unittest.TestCase):
         snapshots = []
         real_save = training.save_checkpoint
 
-        def capture(*args):
-            real_save(*args)
+        def capture(*args, **kwargs):
+            real_save(*args, **kwargs)
             snapshots.append(torch.load(args[0], map_location="cpu"))
 
         with tempfile.TemporaryDirectory() as directory:

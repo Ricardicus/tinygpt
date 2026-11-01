@@ -13,6 +13,7 @@ import torch
 from bpe import BPE
 from datareader import TokenizedDataReader
 import main as training
+from lr_schedule import WarmupCosine
 from tinygpt import TinyGPT
 
 
@@ -118,7 +119,8 @@ class ValidationTests(unittest.TestCase):
                     '--device', 'cpu', '--d-model', '12', '--n-heads', '3',
                     '--num-layers', '1', '--context-length', '4', '--batch-size', '2',
                     '--validation-fraction', '.25', '--validation-every-steps', '2',
-                    '--validation-batches', '2', '--verbose', 'false']
+                    '--validation-batches', '2', '--verbose', 'false',
+                    '--lr-schedule', 'cosine', '--warmup-steps', '2', '--lr-decay-steps', '1000']
             with contextlib.redirect_stdout(io.StringIO()):
                 training.main(args + ['--epochs', '1'])
             checkpoint = torch.load(model, map_location='cpu')
@@ -136,6 +138,7 @@ class ValidationTests(unittest.TestCase):
             for step, row in enumerate(progress, 1):
                 latest = [r for r in rows if int(r['global_step']) <= step][-1]
                 self.assertEqual(float(row['validation_loss']), float(latest['validation_loss']))
+                self.assertEqual(float(row['lr']), WarmupCosine(**checkpoint['lr_schedule']).rate(step - 1))
             self.assertTrue((root / 'corpus_train_tokens.bin').exists())
             self.assertTrue((root / 'corpus_validation_tokens.bin').exists())
             train_files, valid_files = training.split_validation_files(sorted(corpus.glob('*.txt')), corpus, .25, 42)
@@ -160,7 +163,7 @@ class ValidationTests(unittest.TestCase):
                 reader = csv.DictReader(source)
                 self.assertEqual(reader.fieldnames, training.PROGRESS_COLUMNS)
                 self.assertEqual(list(reader), [dict(epoch='3', step='14575', loss='2.049',
-                                                    mean_loss='2.176', validation_loss='')])
+                                                    mean_loss='2.176', validation_loss='', lr='')])
             before = path.read_bytes()
             training.prepare_progress_log(path)
             self.assertEqual(path.read_bytes(), before)

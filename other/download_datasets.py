@@ -31,7 +31,7 @@ else:
 
 # A small registry keeps adding sources independent of the selection UI.
 SOURCES = {
-    "wikipedia": {"label": "Wikipedia (English)", "default": "0.25",
+    "wikipedia": {"label": "Wikipedia (English, complete 2023-11-01 snapshot)", "default": "0.25",
                   "dataset": wikipedia.DATASET, "config": wikipedia.CONFIG,
                   "revision": wikipedia.REVISION,
                   "url": "https://huggingface.co/datasets/wikimedia/wikipedia"},
@@ -93,6 +93,7 @@ def plain_plan():
         except ValueError:
             print("Enter numbers from 1 to 4 separated by commas, or all.")
     print("Limits are saved text in decimal GB, not RAM, network traffic or caches.")
+    print("Wikipedia full = all English articles in the 2023-11-01 text snapshot.")
     print("Gutenberg's GB target is soft: the final book is saved in full, even above the target.")
     print("Full FineWeb-Edu is a very large collection. Gutenberg full = all selected-language books.")
     languages = plain_languages() if "gutenberg" in selected_names else ("en",)
@@ -238,6 +239,9 @@ def print_plan(selected, root, languages=("en",)):
     print(f"\nOutput: {root}")
     for name, limit in selected.items():
         print(f"  {SOURCES[name]['label']}: {'full' if limit is None else f'{limit / 1e9:g} GB'}")
+    if "wikipedia" in selected:
+        print("  Wikipedia: all extracted English article text; 6,407,814 source articles.")
+        print("  Snapshot metadata: about 11.63 GB compressed / 20.20 GB dataset size.")
 
     if "gutenberg" in selected:
         print("  Gutenberg languages: " + ", ".join(languages))
@@ -406,9 +410,11 @@ def record_text(name, record):
         parts.append("### Response\n" + record["response"].strip())
         return "\n\n".join(parts) + "\n\n"
     text = record.get("text", "")
-    if name == "gutenberg":
+    if name in ("gutenberg", "wikipedia"):
         text = text.replace("\r\n", "\n").replace("\r", "\n")
-        # Keep the complete book, including its Gutenberg license/notice.
+        # Wikipedia is already extracted article text. Keep stubs, lists, tables
+        # and code too; the prose-only filter would silently shrink a full run.
+        # Gutenberg also keeps the complete book, including its license/notice.
         return text.strip() + "\n\n" if text.strip() else ""
     return wikipedia.clean_text(text)
 
@@ -590,7 +596,10 @@ def prepare(selected, root, languages=("en",), resume=False):
                 "Gutenberg uses a soft GB target: the last book is saved in full even if\n"
                 "it crosses the target; other sources keep hard whole-document caps.\n"
                 "Full means all available records at the recorded source revision/catalog,\n"
-                "after prose filtering and exact deduplication. Gutenberg keeps book notices.\n"
+                "after exact deduplication. FineWeb-Edu uses prose filtering.\n"
+                "Wikipedia preserves complete extracted article text, including stubs and lists,\n"
+                "from the English 2023-11-01 snapshot (not live Wikipedia or revision history).\n"
+                "Gutenberg keeps book notices.\n"
                 "Dolly retains instruction/context/response sections, including short answers.\n"
                 "Training uses ordinary next-token prediction over the mixed corpus.\n\n"
                 "See metadata/summary.json for source revisions, limits and actual totals,\n"
@@ -615,12 +624,26 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plain", action="store_true", help="Use line-based prompts instead of the checkbox TUI")
     parser.add_argument("--resume", type=Path, metavar="FOLDER", help="Verify and continue a failed/interrupted download using its saved selections")
+    parser.add_argument("--wikipedia", type=parse_limit, default=argparse.SUPPRESS, metavar="GB_OR_FULL",
+                        help="Download English Wikipedia without prompts: a positive decimal GB amount or full")
+    parser.add_argument("--output", type=Path, help="Output folder for --wikipedia (default: automatic)")
     args = parser.parse_args(argv)
-    if not args.resume and not sys.stdin.isatty():
+    direct_wikipedia = hasattr(args, "wikipedia")
+    if args.resume and (direct_wikipedia or args.output):
+        parser.error("--resume cannot be combined with --wikipedia or --output")
+    if args.output and not direct_wikipedia:
+        parser.error("--output requires --wikipedia")
+    if not args.resume and not direct_wikipedia and not sys.stdin.isatty():
         parser.error("Interactive terminal required. Run this command directly in your terminal.")
     try:
         if args.resume:
             prepare({}, args.resume, resume=True)
+            return
+        if direct_wikipedia:
+            selected = {"wikipedia": args.wikipedia}
+            root = args.output or Path(default_folder(selected))
+            print_plan(selected, root)
+            prepare(selected, root)
             return
         if args.plain:
             plan = plain_plan()

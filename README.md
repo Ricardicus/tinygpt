@@ -105,6 +105,47 @@ and optimizer state; a checkpoint saved during an epoch restarts that epoch with
 a new shuffle rather than restoring the exact data position. Changes to the
 save interval apply when launching a new training process.
 
+On resume, an explicitly supplied `--lr` overrides the saved optimizer learning
+rate while retaining its moments, step counters and other optimizer settings.
+For example, add `--lr 0.00003` to continue at a lower constant rate. Omitting
+`--lr` preserves the checkpoint's saved rate; a new run defaults to `0.0003`.
+Startup prints the effective rate and whether it came from the checkpoint or
+the command line. If a launcher supplies `--lr` already, that counts as explicit;
+append the desired `--lr` to its arguments to override the launcher's value.
+With a cosine schedule, `--lr` instead overrides its peak rate while retaining
+the saved schedule position.
+
+Enable linear warmup followed by cosine learning-rate decay for a new run by
+adding these flags to `main.py` or a prepared dataset's `train.sh`:
+
+```bash
+--lr 0.0003 --lr-schedule cosine --warmup-steps 2000 --min-lr-ratio 0.1
+```
+
+Here the first update uses `0.0003 / 2000`, update 2,000 reaches `0.0003`, and
+the final planned update reaches `0.00003`. The rate remains at that floor if
+training continues. Without an explicit `--warmup-steps`, warmup uses 10% of
+planned updates, capped at 1,000. Set it to `0` to start at the peak immediately.
+`--lr-decay-steps N` explicitly sets the total schedule length **including warmup**;
+otherwise it is computed from training windows, batch size, and requested epochs.
+Choose a total greater than the warmup count.
+
+Checkpoints save the peak, floor ratio, warmup count, total length, and starting
+global step. Resuming restores these settings without repeating warmup, even if
+the data traversal restarts an epoch. Changing `--epochs` or batch size does not
+automatically change an existing schedule's length. Explicit schedule flags
+override saved settings; `--lr-decay-steps` changes the total length from the
+original schedule start, not the number of additional updates. To enable cosine
+on an older constant-rate checkpoint, pass `--lr-schedule cosine`; its new schedule
+starts at the checkpoint's global step. Use `--warmup-steps 0` when continuing a
+model that is already warm. `--lr-schedule constant` disables a saved schedule
+and retains the optimizer's latest rate unless `--lr` overrides it.
+
+The default remains constant-rate training for new runs and old checkpoints.
+The console reports the active rate, and `progress.csv` includes an `lr` column
+containing the rate actually used for each optimizer update. Existing four- and
+five-column progress logs are upgraded, leaving historical rates blank.
+
 Enable validation with `--validation-fraction 0.05` (the prepared dataset's
 `train.sh` uses this by default after refreshing helpers). A deterministic split
 holds out 5% of whole files from model training. Validation reports token-weighted
@@ -273,7 +314,29 @@ then stops. The result may exceed the target by part of one book; a single book
 larger than the target is still saved in full. Results may be smaller if the
 source ends first. Network traffic, streaming
 buffers, caches, filesystem overhead and training RAM are additional.
-`full` processes the entire pinned source after filtering and deduplication.
+`full` processes the entire pinned source after source-specific filtering and deduplication.
+Wikipedia preserves complete extracted article text, including short stubs, lists,
+and code; it does not apply the prose filters used by the separate
+`prepare_wikipedia_dataset.py` script. It uses Wikimedia's complete English
+`20231101.en` snapshot (6,407,814 articles), pinned to revision
+`b04c8d1ceb2f5cd4588862100d08de323dccfbaa`. This is article text from November 2023,
+not live Wikipedia, images, or edit history. The source metadata lists about
+11.63 GB compressed and 20.20 GB of dataset data; saved text and filesystem space
+differ, so 27 GB is not a fixed download size.
+
+Download Wikipedia directly without the wizard:
+
+```bash
+python other/download_datasets.py --wikipedia full --output datasets/wikipedia-full
+python other/download_datasets.py --wikipedia 5 --output datasets/wikipedia-5gb
+```
+
+The same GB/full choices are available in the interactive UI. `full` has no byte
+or article-count cap and streams every English shard to exhaustion. Empty/invalid
+text and exact duplicate documents are omitted; article IDs, titles, and URLs are
+retained in the manifest. Use a fresh folder when switching from an older,
+prose-filtered Wikipedia download.
+
 For FineWeb-Edu this means the complete collection, which is very large;
 for Gutenberg it means all available text books matching the selected languages.
 
@@ -293,8 +356,8 @@ skip count are recorded in the summary, with authors and language codes in each
 book's manifest record. The downloaded catalog is reused throughout the run.
 
 The downloader streams Hugging Face sources and stores document hashes in SQLite
-to avoid keeping a full-dataset hash set in RAM. It filters Wikipedia/FineWeb
-prose, preserves Dolly instruction/context/response pairs (including short
+to avoid keeping a full-dataset hash set in RAM. It filters FineWeb
+prose, preserves Wikipedia article text and Dolly instruction/context/response pairs (including short
 answers), and keeps Gutenberg book notices. Exact duplicates across selected
 sources are omitted. Dolly is formatted as training text; the trainer still
 performs ordinary next-token prediction. Source revisions, document URLs, hashes

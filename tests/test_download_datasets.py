@@ -21,6 +21,41 @@ PROSE = (
 
 
 class DownloadDatasetsTests(unittest.TestCase):
+    def test_wikipedia_preserves_stubs_lists_and_code(self):
+        article = "A short stub.\r\n\r\n* Item one\r\n* Item two\r\n\r\ndef example():\r\n    return 1"
+        self.assertEqual(builder.record_text("wikipedia", {"text": article}),
+                         article.replace("\r\n", "\n") + "\n\n")
+
+    def test_wikipedia_stream_selects_all_english_shards_at_pinned_revision(self):
+        datasets = Mock()
+        datasets.load_dataset.return_value = [{"id": "1", "text": "Stub"}]
+        with patch.dict("sys.modules", {"datasets": datasets, "huggingface_hub": Mock()}):
+            provenance = {}
+            self.assertEqual(list(builder.source_records("wikipedia", provenance)),
+                             [{"id": "1", "text": "Stub"}])
+        datasets.load_dataset.assert_called_once_with(
+            "wikimedia/wikipedia", name="20231101.en", split="train",
+            revision=builder.wikipedia.REVISION, streaming=True)
+
+    def test_wikipedia_full_keeps_all_articles_and_budget_keeps_whole_articles(self):
+        articles = [{"id": str(i), "text": text} for i, text in enumerate(
+            ["Short stub.", "* List item", "def code():\n    pass"])]
+        for limit, expected_files in [(None, 3), (len("Short stub.\n\n".encode()), 1)]:
+            with self.subTest(limit=limit), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "wiki"
+                with patch.object(builder, "source_records", return_value=iter(articles)):
+                    summary = builder.prepare({"wikipedia": limit}, root)
+                self.assertEqual(summary["files"], expected_files)
+                self.assertEqual(summary["counts"]["wikipedia"].get("source_exhausted", 0),
+                                 int(limit is None))
+
+    def test_wikipedia_cli_accepts_gb_and_full_without_terminal(self):
+        for value, limit in [("full", None), ("2.5", 2_500_000_000)]:
+            with self.subTest(value=value), patch.object(builder, "prepare") as prepare, \
+                    patch.object(builder.sys.stdin, "isatty", return_value=False):
+                builder.main(["--wikipedia", value, "--output", "/tmp/wiki-cli"])
+                prepare.assert_called_once_with({"wikipedia": limit}, Path("/tmp/wiki-cli"))
+
     def test_limits_are_decimal_gb_or_full(self):
         self.assertEqual(builder.parse_limit("0.125"), 125_000_000)
         self.assertEqual(builder.parse_limit("0.000000001"), 1)

@@ -18,6 +18,7 @@ from datareader import PagedDataReader, TextCorpusReader, TokenizedDataReader
 from bpe import BPE
 from corpus import load_config, text_chunks
 from tinygpt import TinyGPT
+from lr_schedule import resolve_schedule
 
 
 # ---------------------------------------------------------
@@ -105,7 +106,7 @@ def evaluate(model, datareader, batch_size, max_batches, device, seed=42, dtype=
     return loss, math.exp(loss) if loss < 700 else float("inf"), total_tokens
 
 
-def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0):
+def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0, lr_schedule=None):
     """Atomically replace the latest checkpoint; epoch counts completed epochs.
 
     A mid-epoch checkpoint resumes weights/optimizer and restarts that epoch
@@ -120,6 +121,7 @@ def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0):
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "loss": loss,
+        "lr_schedule": lr_schedule.state_dict() if lr_schedule is not None else None,
         "config": {
             "vocab_size": model.vocab_size,
             "context_length": model.context_length,
@@ -138,11 +140,11 @@ def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0):
             os.unlink(temporary)
 
 
-PROGRESS_COLUMNS = ["epoch", "step", "loss", "mean_loss", "validation_loss"]
+PROGRESS_COLUMNS = ["epoch", "step", "loss", "mean_loss", "validation_loss", "lr"]
 
 
 def prepare_progress_log(path):
-    """Add the validation column to legacy logs, leaving old values unknown."""
+    """Add validation/rate columns to legacy logs, leaving old values unknown."""
     path = Path(path)
     if not path.exists() or path.stat().st_size == 0:
         with path.open("w", newline="") as output:
@@ -153,7 +155,7 @@ def prepare_progress_log(path):
         header = next(reader)
         if header == PROGRESS_COLUMNS:
             return
-        if header != PROGRESS_COLUMNS[:-1]:
+        if header not in (PROGRESS_COLUMNS[:4], PROGRESS_COLUMNS[:5]):
             raise ValueError(f"Unexpected progress CSV columns in {path}: {header}")
         descriptor, temporary = tempfile.mkstemp(prefix="progress-", suffix=".tmp", dir=path.parent)
         try:
@@ -163,7 +165,7 @@ def prepare_progress_log(path):
                 for row in reader:
                     if len(row) != len(header):
                         raise ValueError(f"Malformed progress CSV row in {path}: {row}")
-                    writer.writerow([*row, ""])
+                    writer.writerow([*row, *([""] * (len(PROGRESS_COLUMNS) - len(header)))])
             os.replace(temporary, path)
         finally:
             if os.path.exists(temporary):
@@ -488,8 +490,17 @@ def parse_args(argv=None):
         help="Number of transformer layers. Default 6.",
     )
     parser.add_argument(
-        "--lr", type=float, default=3e-4, help="Learning rate. Default 0.0003."
+        "--lr", type=float, default=argparse.SUPPRESS,
+        help="Learning rate (cosine peak): 0.0003 for new runs; omitted on resume preserves the saved rate/schedule, explicitly supplied overrides it."
     )
+    parser.add_argument("--lr-schedule", choices=("constant", "cosine"), default=None,
+                        help="Default: constant for new runs, saved schedule on resume. Cosine enables linear warmup then cosine decay.")
+    parser.add_argument("--warmup-steps", type=int, default=None,
+                        help="Cosine warmup updates; 0 disables warmup. Default: min(1000, total schedule updates // 10).")
+    parser.add_argument("--lr-decay-steps", type=int, default=None,
+                        help="Total schedule updates INCLUDING warmup; default: planned remaining training updates. Saved on resume.")
+    parser.add_argument("--min-lr-ratio", type=float, default=None,
+                        help="Cosine floor as a fraction of peak --lr (default: 0.1).")
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -567,6 +578,24 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for repeatable inference.")
     args = parser.parse_args(argv)
+    args.lr_explicit = hasattr(args, "lr")
+    if not args.lr_explicit:
+        args.lr = 3e-4
+    if not math.isfinite(args.lr) or args.lr < 0:
+        parser.error("--lr must be finite and nonnegative")
+    if args.warmup_steps is not None and args.warmup_steps < 0:
+        parser.error("--warmup-steps must be nonnegative")
+    if args.lr_decay_steps is not None and args.lr_decay_steps < 1:
+        parser.error("--lr-decay-steps must be positive")
+    if args.min_lr_ratio is not None and (not math.isfinite(args.min_lr_ratio) or not 0 <= args.min_lr_ratio <= 1):
+        parser.error("--min-lr-ratio must be between 0 and 1")
+    if args.warmup_steps is not None and args.lr_decay_steps is not None and args.warmup_steps >= args.lr_decay_steps:
+        parser.error("--warmup-steps must be smaller than --lr-decay-steps")
+    if args.lr_schedule == "constant" and any(value is not None for value in
+                                              (args.warmup_steps, args.lr_decay_steps, args.min_lr_ratio)):
+        parser.error("Schedule options require --lr-schedule cosine")
+    if args.batch_size < 1 or args.epochs < 1:
+        parser.error("--batch-size and --epochs must be positive")
     if args.bpe_max_chars < 0 or (args.bpe_max_chars and args.bpe_alphabet_policy != "limit"):
         parser.error("--bpe-max-chars must be nonnegative and requires --bpe-alphabet-policy limit")
     if args.bpe_max_chars >= args.vocab_size:
@@ -839,7 +868,6 @@ def main(argv=None):
         print(f"Context length (CLI): {args.context_length}")
         print(f"Num layers (CLI): {args.num_layers}")
         print(f"Embedding dimension (CLI): {args.d_model}")
-        print(f"Learning rate: {args.lr}")
         print(f"Heads (CLI): {args.n_heads}")
         print(f"Device: {args.device}")
 
@@ -852,15 +880,34 @@ def main(argv=None):
         num_layers=args.num_layers,
     ).to(args.device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    lr_source = "--lr" if args.lr_explicit else "default"
     global_step = 0
     if ckpt_state is not None:
         model.load_state_dict(ckpt_state)
         if ckpt_optim is not None:
             optimizer.load_state_dict(ckpt_optim)
+            lr_source = "checkpoint"
+            if args.lr_explicit:
+                for group in optimizer.param_groups:
+                    group["lr"] = args.lr
+                lr_source = "--lr overrides checkpoint"
         print("✅ Loaded model and optimizer state from checkpoint.")
         global_step = checkpoint.get("global_step", 0)
         if checkpoint.get("step", 0):
             print("Resuming a mid-epoch checkpoint: restarting the saved epoch with a new data shuffle.")
+
+    saved_schedule = checkpoint.get("lr_schedule") if ckpt_state is not None else None
+    steps_per_epoch = (len(datareader) + args.batch_size - 1) // args.batch_size
+    lr_schedule = resolve_schedule(args, saved_schedule, optimizer.param_groups[0]["lr"],
+                                   global_step, steps_per_epoch * max(0, args.epochs - start_epoch))
+    if lr_schedule is not None:
+        print(f"Learning rate schedule: linear warmup {lr_schedule.warmup_steps:,} updates, "
+              f"cosine to update {lr_schedule.decay_steps:,}, peak {lr_schedule.peak_lr:g}, "
+              f"floor {lr_schedule.peak_lr * lr_schedule.min_lr_ratio:g}, "
+              f"start at global step {lr_schedule.start_step:,}; "
+              f"next LR {lr_schedule.rate(global_step):g}", flush=True)
+    else:
+        print(f"Learning rate ({lr_source}): " + ", ".join(f"{group['lr']:g}" for group in optimizer.param_groups), flush=True)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total trainable parameters: {num_params:,}")
@@ -908,6 +955,10 @@ def main(argv=None):
         for x, y in stream_batches(
             datareader, bpe, args.context_length, args.batch_size
         ):
+            if lr_schedule is not None:
+                for group in optimizer.param_groups:
+                    group["lr"] = lr_schedule.rate(global_step)
+            current_lr = optimizer.param_groups[0]["lr"]
             start_time = time.perf_counter()
             x, y = x.to(args.device), y.to(args.device)
             optimizer.zero_grad(set_to_none=True)
@@ -933,17 +984,18 @@ def main(argv=None):
                 report_validation(epoch + 1)
 
             if args.save_every_steps and global_step % args.save_every_steps == 0:
-                save_checkpoint(args.model, model, optimizer, epoch, avg_loss, global_step, step)
+                save_checkpoint(args.model, model, optimizer, epoch, avg_loss, global_step, step, lr_schedule)
                 print(f"Checkpoint saved at optimizer step {global_step:,}: {args.model}", flush=True)
 
             # Log progress to CSV if requested
             if args.log_progress:
-                last_progress_row = [epoch + 1, step, loss_value, avg_loss, latest_validation_loss]
+                last_progress_row = [epoch + 1, step, loss_value, avg_loss, latest_validation_loss, current_lr]
                 last_progress_position = write_progress_row(args.log_progress, last_progress_row)
 
             if args.verbose and step % 10 == 0:
                 print(
                     f"Epoch {epoch + 1}/{args.epochs} | Step {step:6d} | Avg Loss: {avg_loss:.4f} | "
+                    f"LR: {current_lr:.3g} | "
                     f"Train step: {timing_seconds / timing_steps:.4f}s | "
                     f"{timing_tokens / max(timing_seconds, 1e-9):,.0f} tokens/s",
                     flush=True,
@@ -956,11 +1008,11 @@ def main(argv=None):
         if validation_reader is not None and last_validation_step != global_step:
             report_validation(epoch + 1)
             if last_progress_row is not None:
-                last_progress_row[-1] = latest_validation_loss
+                last_progress_row[4] = latest_validation_loss
                 write_progress_row(args.log_progress, last_progress_row, last_progress_position)
 
         # --- Save model checkpoint ---
-        save_checkpoint(args.model, model, optimizer, epoch + 1, mean_loss, global_step)
+        save_checkpoint(args.model, model, optimizer, epoch + 1, mean_loss, global_step, lr_schedule=lr_schedule)
 
         print(f"💾 Checkpoint saved to {args.model}")
 
