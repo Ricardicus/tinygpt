@@ -15,7 +15,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from datareader import PagedDataReader, TextCorpusReader, TokenizedDataReader
-from bpe import BPE
+from bpe import BPE, getBPE
 from corpus import load_config, text_chunks
 from tinygpt import TinyGPT
 from lr_schedule import resolve_schedule
@@ -196,115 +196,6 @@ def getData(verbose=True, lower_case=True, rawdata_folder="rawdata", oneliners=[
         print(f"DataReader ready: {len(datareader.files):,} corpus files", flush=True)
     return datareader
 
-
-def getBPE(
-    data,
-    vocab_size=1920,
-    verbose=True,
-    tokenizer_path=None,
-    bpe_part=0.01,
-    lower_case=True,
-    bpe_max_words=100_000,
-    character_sources=(),
-    bpe_alphabet_policy="limit",
-    bpe_max_chars=0,
-):
-    """Load existing tokenizer or train a new one."""
-    if tokenizer_path and os.path.exists(tokenizer_path):
-        bpe = BPE(
-            vocab_size=vocab_size,
-            verbose=verbose,
-            model_file=tokenizer_path,
-            lower_case=lower_case,
-        )
-        bpe.load()
-        if verbose:
-            print(f"Using existing tokenizer from '{tokenizer_path}'")
-        return bpe
-
-    if bpe_alphabet_policy not in ("limit", "expand", "error"):
-        raise ValueError("BPE alphabet policy must be limit, expand or error")
-    if bpe_max_chars < 0 or (bpe_max_chars and bpe_alphabet_policy != "limit"):
-        raise ValueError("--bpe-max-chars must be nonnegative and requires alphabet policy limit")
-    if bpe_max_chars >= vocab_size:
-        raise ValueError("--bpe-max-chars must be smaller than --vocab_size to leave room for merges")
-    if bpe_max_chars and bpe_max_chars < len(set(" \t\r\n'\"<->?!:")) + 1:
-        raise ValueError("--bpe-max-chars must be at least 13 for reserved symbols and <unk>")
-    bpe = BPE(
-        vocab_size=vocab_size,
-        verbose=verbose,
-        model_file=(tokenizer_path or default_tokenizer),
-        lower_case=lower_case,
-    )
-    if verbose:
-        if tokenizer_path:
-            print(
-                f"Creating new tokenizer; will save to '{tokenizer_path}' after training"
-            )
-        else:
-            print(
-                "Creating new tokenizer (no model path specified; using default inside BPE)"
-            )
-
-    if not 0 < bpe_part <= 1:
-        raise ValueError("--bpe-part must be greater than 0 and at most 1")
-    bpe.max_unique_words = bpe_max_words
-    if bpe_max_words < 1:
-        raise ValueError("--bpe-max-words must be positive")
-    total = len(data)
-    if verbose:
-        print("Feeding data to BPE...", flush=True)
-    last_report = time.monotonic()
-    import math
-    sample_count = max(1, math.ceil(total * bpe_part))
-    # Learn merges from the word sample; rank characters using the full corpus.
-    for i, row in enumerate(data):
-        if i < sample_count:
-            bpe.add_corpus(row)
-        else:
-            bpe.observe_characters(row)
-        if verbose and time.monotonic() - last_report >= 2:
-            print(f"BPE input: {i + 1:,} / {total:,} chunks processed", flush=True)
-            last_report = time.monotonic()
-    # Include held-out character counts without learning word merges from them.
-    if verbose and character_sources:
-        print("Scanning validation character coverage...", flush=True)
-    for path in character_sources:
-        for row in text_chunks(path):
-            bpe.observe_characters(row)
-            if verbose and time.monotonic() - last_report >= 2:
-                print(f"Validation character coverage: {path}", flush=True)
-                last_report = time.monotonic()
-    base_size = len(bpe.base_alphabet())
-    if bpe_alphabet_policy == "limit" and (base_size >= bpe.vocab_size or
-                                          (bpe_max_chars and base_size > bpe_max_chars)):
-        cap = bpe_max_chars or max(len(set(" \t\r\n'\"<->?!:")) + 1, bpe.vocab_size // 2)
-        if cap >= bpe.vocab_size:
-            raise ValueError("Vocabulary is too small to hold reserved symbols plus merges")
-        bpe.restrict_alphabet(cap)
-        print(f"Limiting BPE base alphabet from {base_size:,} to {len(bpe.base_alphabet()):,} tokens. "
-              f"Less frequent characters map to <unk>; vocabulary stays at {bpe.vocab_size:,}.", flush=True)
-    elif bpe_alphabet_policy == "expand" and base_size >= bpe.vocab_size:
-        requested = bpe.vocab_size
-        # Retain all observed Unicode characters and leave room for useful merges.
-        required = base_size + max(2048, requested // 2)
-        bpe.vocab_size = 1 << (required - 1).bit_length()
-        print(f"BPE base alphabet needs {base_size:,} tokens. Expanding vocabulary "
-              f"from {requested:,} to {bpe.vocab_size:,} to leave room for merges. "
-              "The model will use the expanded vocabulary.", flush=True)
-    if verbose:
-        print(f"Training BPE merges on {sample_count}/{total} chunks "
-              f"(base alphabet: {len(bpe.base_alphabet()):,}, vocabulary target: {bpe.vocab_size:,}).", flush=True)
-    bpe.train()
-
-    if tokenizer_path:
-        bpe.save(tokenizer_path)
-        if verbose:
-            print(f"Saved new tokenizer to '{tokenizer_path}'")
-
-    if verbose:
-        print("BPE ready.")
-    return bpe
 
 
 # ---------------------------------------------------------
