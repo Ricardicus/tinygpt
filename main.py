@@ -140,11 +140,11 @@ def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0, lr
             os.unlink(temporary)
 
 
-PROGRESS_COLUMNS = ["epoch", "step", "loss", "mean_loss", "validation_loss", "lr"]
+PROGRESS_COLUMNS = ["epoch", "step", "loss", "mean_loss", "validation_loss", "lr", "grad_norm"]
 
 
 def prepare_progress_log(path):
-    """Add validation/rate columns to legacy logs, leaving old values unknown."""
+    """Add missing metric columns to legacy logs, leaving old values unknown."""
     path = Path(path)
     if not path.exists() or path.stat().st_size == 0:
         with path.open("w", newline="") as output:
@@ -155,7 +155,7 @@ def prepare_progress_log(path):
         header = next(reader)
         if header == PROGRESS_COLUMNS:
             return
-        if header not in (PROGRESS_COLUMNS[:4], PROGRESS_COLUMNS[:5]):
+        if header not in (PROGRESS_COLUMNS[:4], PROGRESS_COLUMNS[:5], PROGRESS_COLUMNS[:6]):
             raise ValueError(f"Unexpected progress CSV columns in {path}: {header}")
         descriptor, temporary = tempfile.mkstemp(prefix="progress-", suffix=".tmp", dir=path.parent)
         try:
@@ -857,6 +857,9 @@ def main(argv=None):
                 logits = model(x)
                 loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
             loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=1.0, error_if_nonfinite=True
+            )
             optimizer.step()
             global_step += 1
 
@@ -880,7 +883,7 @@ def main(argv=None):
 
             # Log progress to CSV if requested
             if args.log_progress:
-                last_progress_row = [epoch + 1, step, loss_value, avg_loss, latest_validation_loss, current_lr]
+                last_progress_row = [epoch + 1, step, loss_value, avg_loss, latest_validation_loss, current_lr, grad_norm.item()]
                 last_progress_position = write_progress_row(args.log_progress, last_progress_row)
 
             if args.verbose and step % 10 == 0:

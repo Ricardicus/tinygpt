@@ -136,6 +136,8 @@ class ValidationTests(unittest.TestCase):
                 progress = list(csv.DictReader(source))
             self.assertEqual(len(progress), checkpoint['global_step'])
             for step, row in enumerate(progress, 1):
+                self.assertTrue(math.isfinite(float(row['grad_norm'])))
+                self.assertGreaterEqual(float(row['grad_norm']), 0)
                 latest = [r for r in rows if int(r['global_step']) <= step][-1]
                 self.assertEqual(float(row['validation_loss']), float(latest['validation_loss']))
                 self.assertEqual(float(row['lr']), WarmupCosine(**checkpoint['lr_schedule']).rate(step - 1))
@@ -163,10 +165,16 @@ class ValidationTests(unittest.TestCase):
                 reader = csv.DictReader(source)
                 self.assertEqual(reader.fieldnames, training.PROGRESS_COLUMNS)
                 self.assertEqual(list(reader), [dict(epoch='3', step='14575', loss='2.049',
-                                                    mean_loss='2.176', validation_loss='', lr='')])
+                                                    mean_loss='2.176', validation_loss='', lr='', grad_norm='')])
             before = path.read_bytes()
             training.prepare_progress_log(path)
             self.assertEqual(path.read_bytes(), before)
+            path.write_text('epoch,step,loss,mean_loss,validation_loss,lr\n1,1,2,2,2.1,0.0002\n')
+            training.prepare_progress_log(path)
+            with path.open() as source:
+                row = next(csv.DictReader(source))
+            self.assertEqual(row['lr'], '0.0002')
+            self.assertEqual(row['grad_norm'], '')
             # A malformed old log is not replaced with a partially upgraded one.
             path.write_text('epoch,step,loss,mean_loss\n1,1,2\n')
             before = path.read_bytes()
