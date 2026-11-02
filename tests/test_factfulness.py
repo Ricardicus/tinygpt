@@ -115,7 +115,7 @@ default_model_context_length = 64
 # Country - Capital
 tests = [
     {
-        "name": "Country Capitals",
+        "name": "Country -> Capitals",
         "basePrompt": "The capital of ",
         "variations": [
             "Norway",
@@ -162,6 +162,34 @@ tests = [
             "Ottawa",
             "Tokyo",
             "Canberra"
+        ]
+    },
+    {
+        "name": "Capital -> Countries",
+        "basePrompt": "",
+        "variations": [
+            "Oslo is the capital of the country ",
+            "Stockholm is the capital of the country ",
+            "Copenhagen is the capital of the country ",
+            "Helsinki is the capital of the country",
+            "Berlin is the capital of the country",
+            "Paris is the capital of the country",
+            "Madrid is the capital of the country",
+            "Rome is the capital of the country",
+            "Lisbon is the capital of the country",
+            "Amsterdam is the capital of the country"
+        ],
+        "responses": [
+            "Norway",
+            "Sweden",
+            "Denmark",
+            "Finland",
+            "Germany",
+            "France",
+            "Spain",
+            "Italy",
+            "Portugal",
+            "Netherlands"
         ]
     },
     {
