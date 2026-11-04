@@ -137,6 +137,17 @@ class TinyGPT(nn.Module):
             [TransformerBlock(d_model, n_heads) for _ in range(num_layers)]
         )
 
+        # Each block contributes two residual branches. Scale their output
+        # projections at initialization to limit growth across deep stacks.
+        if num_layers:
+            residual_scale = 1 / math.sqrt(2 * num_layers)
+            with torch.no_grad():
+                for layer in self.layers:
+                    for projection in (layer.attn.W_o, layer.mlp.fc2):
+                        projection.weight.mul_(residual_scale)
+                        if projection.bias is not None:
+                            projection.bias.zero_()
+
         # Final normalization
         self.final_ln = LayerNorm(d_model)
 

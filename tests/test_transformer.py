@@ -7,6 +7,22 @@ from tinygpt import LayerNorm, MultiHeadSelfAttention, TinyGPT
 
 
 class TransformerMathTests(unittest.TestCase):
+    def test_residual_initialization_scales_with_depth(self):
+        torch.manual_seed(42)
+        shallow = TinyGPT(20, 8, 12, 3, 1)
+        torch.manual_seed(42)
+        deep = TinyGPT(20, 8, 12, 3, 4)
+        for name in ("attn.W_o", "mlp.fc2"):
+            a = shallow.layers[0].get_submodule(name)
+            b = deep.layers[0].get_submodule(name)
+            torch.testing.assert_close(b.weight, a.weight / 2)
+            self.assertEqual(torch.count_nonzero(b.bias).item(), 0)
+        torch.testing.assert_close(shallow.layers[0].attn.W_qkv.weight,
+                                   deep.layers[0].attn.W_qkv.weight)
+        deep.load_state_dict(shallow.state_dict(), strict=False)
+        torch.testing.assert_close(deep.layers[0].attn.W_o.weight,
+                                   shallow.layers[0].attn.W_o.weight)
+
     def test_layer_norm_matches_pytorch(self):
         norm = LayerNorm(12).double()
         x = torch.randn(2, 5, 12, dtype=torch.double)

@@ -451,6 +451,14 @@ def parse_args(argv=None):
         help="Path to CSV file to append training progress (iteration, loss, mean_loss).",
     )
     parser.add_argument(
+        "--monitor-layer-norms", metavar="CSV", default=None,
+        help="Append per-layer parameter and pre-clipping gradient L2 norms to CSV each training step.",
+    )
+    parser.add_argument(
+        "--monitor-layer-norms-every", type=int, default=1, metavar="N",
+        help="Record layer norms every N optimizer steps (default: 1).",
+    )
+    parser.add_argument(
         "--save-every-steps", type=int, default=1000,
         help="Save the latest model every N optimizer steps (default: 1000; 0 disables interval saves). Epoch-end saves always run.",
     )
@@ -469,6 +477,8 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for repeatable inference.")
     args = parser.parse_args(argv)
+    if args.monitor_layer_norms_every < 1:
+        parser.error("--monitor-layer-norms-every must be positive")
     args.lr_explicit = hasattr(args, "lr")
     if not args.lr_explicit:
         args.lr = 3e-4
@@ -857,6 +867,21 @@ def main(argv=None):
                 logits = model(x)
                 loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
             loss.backward()
+            if args.monitor_layer_norms and (global_step + 1) % args.monitor_layer_norms_every == 0:
+                # Measure gradients before clipping, and parameters before the update.
+                path = args.monitor_layer_norms
+                exists = os.path.exists(path) and os.path.getsize(path) > 0
+                with open(path, "a", newline="") as output:
+                    writer = csv.writer(output)
+                    if not exists:
+                        writer.writerow(["epoch", "global_step", "layer", "parameter_norm", "gradient_norm"])
+                    for index, layer in enumerate(model.layers):
+                        parameters = list(layer.parameters())
+                        def norm(tensors):
+                            return torch.stack([t.detach().float().norm() for t in tensors]).norm().item()
+                        gradients = [p.grad for p in parameters if p.grad is not None]
+                        writer.writerow([epoch + 1, global_step + 1, index,
+                                         norm(parameters), norm(gradients) if gradients else ""])
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_norm=1.0, error_if_nonfinite=True
             )
