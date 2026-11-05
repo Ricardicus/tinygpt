@@ -413,6 +413,10 @@ def parse_args(argv=None):
         "--lr", type=float, default=argparse.SUPPRESS,
         help="Learning rate (cosine peak): 0.0003 for new runs; omitted on resume preserves the saved rate/schedule, explicitly supplied overrides it."
     )
+    parser.add_argument("--beta1", type=float, default=None,
+                        help="AdamW beta1: default 0.9 for new runs; omitted on resume preserves the saved value.")
+    parser.add_argument("--beta2", type=float, default=None,
+                        help="AdamW beta2: default 0.999 for new runs; omitted on resume preserves the saved value.")
     parser.add_argument("--lr-schedule", choices=("constant", "cosine"), default=None,
                         help="Default: constant for new runs, saved schedule on resume. Cosine enables linear warmup then cosine decay.")
     parser.add_argument("--warmup-steps", type=int, default=None,
@@ -506,6 +510,10 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for repeatable inference.")
     args = parser.parse_args(argv)
+    for name in ("beta1", "beta2"):
+        value = getattr(args, name)
+        if value is not None and (not math.isfinite(value) or not 0 <= value < 1):
+            parser.error(f"--{name} must be finite and in [0, 1)")
     if args.monitor_layer_norms_every < 1:
         parser.error("--monitor-layer-norms-every must be positive")
     args.lr_explicit = hasattr(args, "lr")
@@ -825,6 +833,13 @@ def main(argv=None):
         global_step = checkpoint.get("global_step", 0)
         if checkpoint.get("step", 0):
             print("Resuming a mid-epoch checkpoint: restarting the saved epoch with a new data shuffle.")
+
+    # Apply explicit overrides after restoration, preserving omitted betas and moments.
+    for group in optimizer.param_groups:
+        beta1, beta2 = group["betas"]
+        group["betas"] = (args.beta1 if args.beta1 is not None else beta1,
+                          args.beta2 if args.beta2 is not None else beta2)
+    print("AdamW betas: " + ", ".join(str(group["betas"]) for group in optimizer.param_groups), flush=True)
 
     saved_schedule = checkpoint.get("lr_schedule") if ckpt_state is not None else None
     steps_per_epoch = (len(datareader) + args.batch_size - 1) // args.batch_size
