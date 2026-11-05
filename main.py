@@ -78,6 +78,35 @@ def precision_context(device, dtype):
     return torch.autocast(device_type=torch.device(device).type, dtype=dtype) if dtype is not None else nullcontext()
 
 
+def write_layer_norms(path, model, epoch, global_step):
+    """Record block norms and selected individual tensors before clipping/update."""
+    def norm(tensors):
+        return torch.stack([t.detach().float().norm() for t in tensors]).norm().item()
+
+    exists = os.path.exists(path) and os.path.getsize(path) > 0
+    with open(path, "a", newline="") as output:
+        writer = csv.writer(output)
+        if not exists:
+            writer.writerow(["epoch", "global_step", "layer", "parameter_norm", "gradient_norm"])
+        for index, layer in enumerate(model.layers):
+            parameters = list(layer.parameters())
+            gradients = [p.grad for p in parameters if p.grad is not None]
+            writer.writerow([epoch, global_step, index, norm(parameters),
+                             norm(gradients) if gradients else ""])
+
+    detail_path = path + ".parameters.csv"
+    exists = os.path.exists(detail_path) and os.path.getsize(detail_path) > 0
+    with open(detail_path, "a", newline="") as output:
+        writer = csv.writer(output)
+        if not exists:
+            writer.writerow(["epoch", "global_step", "parameter", "parameter_norm", "gradient_norm"])
+        for name, parameter in model.named_parameters():
+            if (name in ("E", "pos_E") or name.startswith("final_ln.")
+                    or name.startswith(("layers.0.", "layers.1.", "layers.2."))):
+                writer.writerow([epoch, global_step, name, norm([parameter]),
+                                 norm([parameter.grad]) if parameter.grad is not None else ""])
+
+
 @torch.inference_mode()
 def evaluate(model, datareader, batch_size, max_batches, device, seed=42, dtype=None):
     """Token-weighted loss over a fixed sample of held-out windows."""
@@ -452,7 +481,7 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--monitor-layer-norms", metavar="CSV", default=None,
-        help="Append per-layer parameter and pre-clipping gradient L2 norms to CSV each training step.",
+        help="Append block norms and selected per-parameter norms to CSV files during training.",
     )
     parser.add_argument(
         "--monitor-layer-norms-every", type=int, default=1, metavar="N",
@@ -869,19 +898,7 @@ def main(argv=None):
             loss.backward()
             if args.monitor_layer_norms and (global_step + 1) % args.monitor_layer_norms_every == 0:
                 # Measure gradients before clipping, and parameters before the update.
-                path = args.monitor_layer_norms
-                exists = os.path.exists(path) and os.path.getsize(path) > 0
-                with open(path, "a", newline="") as output:
-                    writer = csv.writer(output)
-                    if not exists:
-                        writer.writerow(["epoch", "global_step", "layer", "parameter_norm", "gradient_norm"])
-                    for index, layer in enumerate(model.layers):
-                        parameters = list(layer.parameters())
-                        def norm(tensors):
-                            return torch.stack([t.detach().float().norm() for t in tensors]).norm().item()
-                        gradients = [p.grad for p in parameters if p.grad is not None]
-                        writer.writerow([epoch + 1, global_step + 1, index,
-                                         norm(parameters), norm(gradients) if gradients else ""])
+                write_layer_norms(args.monitor_layer_norms, model, epoch + 1, global_step + 1)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_norm=1.0, error_if_nonfinite=True
             )
