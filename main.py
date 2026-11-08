@@ -157,6 +157,7 @@ def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0, lr
             "d_model": model.d_model,
             "n_heads": model.n_heads,
             "num_layers": model.num_layers,
+            "qk_norm": model.qk_norm,
         },
     }
     descriptor, temporary = tempfile.mkstemp(prefix="checkpoint-", suffix=".tmp", dir=directory)
@@ -413,6 +414,8 @@ def parse_args(argv=None):
         "--lr", type=float, default=argparse.SUPPRESS,
         help="Learning rate (cosine peak): 0.0003 for new runs; omitted on resume preserves the saved rate/schedule, explicitly supplied overrides it."
     )
+    parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable per-head Q/K RMSNorm for fresh models. On resume/inference, the saved architecture takes precedence; old checkpoints disable it.")
     parser.add_argument("--beta1", type=float, default=None,
                         help="AdamW beta1: default 0.9 for new runs; omitted on resume preserves the saved value.")
     parser.add_argument("--beta2", type=float, default=None,
@@ -587,6 +590,7 @@ def main(argv=None):
                 d_model=cfg["d_model"],
                 n_heads=cfg["n_heads"],
                 num_layers=cfg["num_layers"],
+                qk_norm=cfg.get("qk_norm", False),
             ).to(args.device)
 
             model.load_state_dict(checkpoint["model_state_dict"])
@@ -738,6 +742,12 @@ def main(argv=None):
     else:
         print("No existing checkpoint found. Training from scratch.\n")
 
+    if ckpt_state is not None:
+        saved_qk_norm = (ckpt_cfg or {}).get("qk_norm", False)
+        if args.qk_norm != saved_qk_norm:
+            print(f"Using checkpoint QK normalization setting: {saved_qk_norm} (overrides CLI).")
+        args.qk_norm = saved_qk_norm
+
     # For BPE training we still need raw text if no tokenizer exists yet
     corpus_config = load_config(args.data_config)
     raw_datareader = getData(
@@ -816,7 +826,9 @@ def main(argv=None):
         d_model=args.d_model,
         n_heads=args.n_heads,
         num_layers=args.num_layers,
+        qk_norm=args.qk_norm,
     ).to(args.device)
+    print(f"QK normalization: {model.qk_norm}", flush=True)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     lr_source = "--lr" if args.lr_explicit else "default"
     global_step = 0

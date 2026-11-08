@@ -61,7 +61,7 @@ def main(argv=None):
             parser.error("Prompt contains no encodable tokens")
     except ValueError as error:
         parser.error(str(error))
-    model = TinyGPT(**{name: config[name] for name in
+    model = TinyGPT(qk_norm=config.get("qk_norm", False), **{name: config[name] for name in
                        ("vocab_size", "context_length", "d_model", "n_heads", "num_layers")}).to(args.device)
     model.load_state_dict(checkpoint["model_state_dict"])
     if args.seed is not None:

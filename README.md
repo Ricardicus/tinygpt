@@ -159,6 +159,36 @@ The column is blank when validation is disabled. Existing four-column logs are
 upgraded automatically when training restarts; historical validation values stay
 blank. Detailed validation records also go into `<log path>.validation.csv`.
 
+Enable QK normalization for a fresh model with `--qk-norm`. This applies separate
+learned RMSNorm scales to Q and K over each head's feature dimension, sharing
+scales across heads. V and the usual attention scaling are unchanged. RMS
+statistics use FP32 with epsilon 1e-6; normalized Q/K return to the attention
+dtype, so BF16 mixed precision remains supported.
+
+QK normalization is disabled by default. Checkpoints save this architecture
+setting; resume and inference use the saved value, overriding the CLI setting.
+Older checkpoints without the setting use the original architecture. To enable
+QK normalization, choose a fresh model path; this flag does not convert existing
+models. Both `main.py --prompt` and `other/inference.py` support either format.
+
+Set AdamW's momentum coefficients with `--beta1 0.9 --beta2 0.95`.
+New runs default to beta1=0.9 and beta2=0.999. On resume, omitted values retain
+their checkpoint settings; explicitly supplied values override only that beta,
+preserving optimizer moments. Values must be finite and in `[0, 1)`.
+The effective betas are printed at startup and saved in checkpoints.
+
+Use `--monitor-layer-norms artifacts/layer-norms.csv --monitor-layer-norms-every 100`
+to record each transformer layer's combined parameter and gradient L2 norms every
+100 optimizer steps. Gradients are measured before clipping and parameters before
+the update. The interval uses the global step, including when resuming a checkpoint.
+The default interval is 1; less frequent measurements reduce monitoring overhead.
+The same flag also writes individual tensor norms to
+`artifacts/layer-norms.csv.parameters.csv`: token and positional embeddings,
+final LayerNorm, and all parameters in the first three transformer blocks (layers
+0–2). These measurements use the same steps and pre-clipping/pre-update timing.
+The tied token embedding/output matrix appears once as `E`. Both files append
+when resuming; use a new path to keep different runs or branches separate.
+
 The split is by file count rather than bytes and repeats with the same corpus
 and `--validation-seed` (default 42). Training and validation use separate token
 caches; enabling the split requires tokenization once. The tokenizer vocabulary

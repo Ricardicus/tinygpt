@@ -14,6 +14,17 @@ from tinygpt import TinyGPT
 
 
 class CheckpointTests(unittest.TestCase):
+    def test_beta_arguments(self):
+        args = training.parse_args([])
+        self.assertIsNone(args.beta1)
+        self.assertIsNone(args.beta2)
+        args = training.parse_args(["--beta1", "0", "--beta2", "0.95"])
+        self.assertEqual((args.beta1, args.beta2), (0, 0.95))
+        for flag in ("--beta1", "--beta2"):
+            for value in ("-0.1", "1", "nan", "inf"):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    training.parse_args([flag, value])
+
     def test_lr_default_and_explicit_argument_tracking(self):
         args = training.parse_args([])
         self.assertEqual(args.lr, 0.0003)
@@ -33,7 +44,10 @@ class CheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "model.pt"
             for flags, expected_lr in (([], 0.005), (["--lr", "0.00003"], 0.00003),
-                                       (["--lr=0.00003"], 0.00003), (["--lr", "0.0003"], 0.0003)):
+                                       (["--lr=0.00003"], 0.00003), (["--lr", "0.0003"], 0.0003),
+                                       (["--beta1", "0.85"], 0.005),
+                                       (["--beta2", "0.98"], 0.005),
+                                       (["--beta1", "0.85", "--beta2", "0.98"], 0.005)):
                 with self.subTest(flags=flags):
                     training.save_checkpoint(path, model, optimizer, 0, 1.5, 5)
                     # Zero batches isolate restoration from subsequent optimizer updates.
@@ -46,7 +60,9 @@ class CheckpointTests(unittest.TestCase):
                     result = torch.load(path, map_location="cpu")
                     restored = result["optimizer_state_dict"]
                     self.assertEqual(restored["param_groups"][0]["lr"], expected_lr)
-                    self.assertEqual(restored["param_groups"][0]["betas"], (0.8, 0.95))
+                    expected_betas = (0.85 if "--beta1" in flags else 0.8,
+                                      0.98 if "--beta2" in flags else 0.95)
+                    self.assertEqual(restored["param_groups"][0]["betas"], expected_betas)
                     self.assertEqual(restored["param_groups"][0]["weight_decay"], 0.2)
                     self.assertEqual(result["global_step"], 5)
                     for key, state in saved_optimizer["state"].items():
@@ -54,7 +70,7 @@ class CheckpointTests(unittest.TestCase):
                             torch.testing.assert_close(restored["state"][key][name], tensor, rtol=0, atol=0)
                     for name, tensor in model.state_dict().items():
                         torch.testing.assert_close(result["model_state_dict"][name], tensor, rtol=0, atol=0)
-                    self.assertIn("--lr overrides checkpoint" if flags else "Learning rate (checkpoint)", output.getvalue())
+                    self.assertIn("--lr overrides checkpoint" if any(f.startswith("--lr") for f in flags) else "Learning rate (checkpoint)", output.getvalue())
 
     def test_failed_save_preserves_previous_checkpoint(self):
         model = TinyGPT(20, 4, 12, 3, 1)

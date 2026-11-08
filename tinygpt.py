@@ -60,8 +60,22 @@ class SelfAttention(nn.Module):
         return attn_out
 
 
+class QKRMSNorm(nn.Module):
+    """Normalize each head over its features, sharing learned scales across heads."""
+    def __init__(self, d_head, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_head))
+        self.eps = eps
+
+    def forward(self, x):
+        # Accumulate statistics in FP32, then preserve the attention kernel dtype.
+        value = x.float()
+        value = value * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + self.eps)
+        return (value * self.weight.float()).to(x.dtype)
+
+
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, d_model, num_heads):
+    def __init__(self, d_model, num_heads, qk_norm=False):
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
 
@@ -73,6 +87,8 @@ class MultiHeadSelfAttention(nn.Module):
         self.W_qkv = nn.Linear(d_model, 3 * d_model)
         # Output projection after concatenating all heads
         self.W_o = nn.Linear(d_model, d_model)
+        self.q_norm = QKRMSNorm(self.d_head) if qk_norm else nn.Identity()
+        self.k_norm = QKRMSNorm(self.d_head) if qk_norm else nn.Identity()
 
     def forward(self, x):
         B, C, D = x.shape  # (batch, context_len, d_model)
@@ -81,6 +97,7 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = self.W_qkv(x)  # (B, C, 3*d_model)
         qkv = qkv.reshape(B, C, 3, self.num_heads, self.d_head).permute(2, 0, 3, 1, 4)
         Q, K, V = qkv[0], qkv[1], qkv[2]  # each (B, num_heads, C, d_head)
+        Q, K = self.q_norm(Q), self.k_norm(K)
 
         # PyTorch selects an optimized causal attention kernel for this device/dtype.
         attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
@@ -104,10 +121,10 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, d_heads):
+    def __init__(self, d_model, d_heads, qk_norm=False):
         super().__init__()
         self.ln1 = LayerNorm(d_model)
-        self.attn = MultiHeadSelfAttention(d_model, d_heads)
+        self.attn = MultiHeadSelfAttention(d_model, d_heads, qk_norm=qk_norm)
         self.ln2 = LayerNorm(d_model)
         self.mlp = FeedForward(d_model)
 
@@ -119,7 +136,8 @@ class TransformerBlock(nn.Module):
 
 class TinyGPT(nn.Module):
     def __init__(
-        self, vocab_size=1920, context_length=256, d_model=512, n_heads=8, num_layers=6
+        self, vocab_size=1920, context_length=256, d_model=512, n_heads=8, num_layers=6,
+        qk_norm=False
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -127,6 +145,7 @@ class TinyGPT(nn.Module):
         self.d_model = d_model
         self.num_layers = num_layers
         self.n_heads = n_heads
+        self.qk_norm = qk_norm
 
         # Embeddings
         self.E = nn.Parameter(torch.randn(vocab_size, d_model) * 0.02)
@@ -134,7 +153,7 @@ class TinyGPT(nn.Module):
 
         # Stack of transformer layers
         self.layers = nn.ModuleList(
-            [TransformerBlock(d_model, n_heads) for _ in range(num_layers)]
+            [TransformerBlock(d_model, n_heads, qk_norm=qk_norm) for _ in range(num_layers)]
         )
 
         # Each block contributes two residual branches. Scale their output
