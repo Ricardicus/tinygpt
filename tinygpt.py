@@ -170,6 +170,14 @@ class TinyGPT(nn.Module):
         # Final normalization
         self.final_ln = LayerNorm(d_model)
 
+    def compile_qk_norms(self):
+        """Compile normalization calls in place without changing state_dict keys."""
+        if not self.qk_norm:
+            raise ValueError("Compiled QK normalization requires a QK-normalized model")
+        for layer in self.layers:
+            layer.attn.q_norm.compile(fullgraph=True)
+            layer.attn.k_norm.compile(fullgraph=True)
+
     def forward(self, token_ids):
         B, C = token_ids.shape
 

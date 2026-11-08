@@ -171,6 +171,39 @@ Older checkpoints without the setting use the original architecture. To enable
 QK normalization, choose a fresh model path; this flag does not convert existing
 models. Both `main.py --prompt` and `other/inference.py` support either format.
 
+To reduce eager Q/K normalization overhead during training, add
+`--compile-qk-norm` alongside `--qk-norm` (or resume a QK-normalized checkpoint).
+This compiles only the normalization calls with TorchInductor, retaining FP32
+normalization arithmetic and the attention dtype. Initial steps include
+compilation overhead; measure throughput after warmup. This execution setting is
+not saved: specify it again on resume. Weights and optimizer checkpoint keys stay
+unchanged. Compilation requires a working PyTorch/Inductor toolchain; failures
+are reported rather than silently falling back to eager execution.
+
+On the training GPU, compare eager, compiled and native RMSNorm with:
+
+```bash
+python other/benchmark_qk_norm.py
+```
+
+Defaults match batch 16, context 1024, 18 heads of dimension 64 with BF16.
+The benchmark uses QKV-style strided inputs, checks output and gradient agreement,
+and measures warmed-up forward/backward time and additional peak allocated memory.
+The native variant explicitly keeps the same FP32 arithmetic and epsilon.
+This is a normalization microbenchmark; verify gains with full training throughput
+under the same monitoring settings before drawing conclusions about run time.
+
+Alternatively, use `--compile-model` to compile the entire model with Inductor.
+It takes precedence over `--compile-qk-norm`; do not enable both for extra speed.
+It works with or without QK normalization and keeps checkpoint keys unchanged
+using in-place `model.compile()`. The optimizer, CSV logging, and checkpoint
+writes remain outside compilation. Like QK-only compilation, specify this flag
+again on resume. Initial validation, the first training forward, and the first
+backward report start/finish times and an elapsed-time heartbeat every 15 seconds.
+These messages cover compilation plus execution, not compiler percentage progress.
+Different batch shapes or modes may cause later recompilation. Compare steady-state
+throughput after warmup; compilation can increase startup time and memory use.
+
 Set AdamW's momentum coefficients with `--beta1 0.9 --beta2 0.95`.
 New runs default to beta1=0.9 and beta2=0.999. On resume, omitted values retain
 their checkpoint settings; explicitly supplied values override only that beta,

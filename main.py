@@ -11,7 +11,8 @@ import tempfile
 import hashlib
 import math
 import random
-from contextlib import nullcontext
+import threading
+from contextlib import nullcontext, contextmanager
 from pathlib import Path
 
 from datareader import PagedDataReader, TextCorpusReader, TokenizedDataReader
@@ -76,6 +77,31 @@ def training_dtype(device, precision):
 
 def precision_context(device, dtype):
     return torch.autocast(device_type=torch.device(device).type, dtype=dtype) if dtype is not None else nullcontext()
+
+
+@contextmanager
+def compilation_progress(stage, interval=15):
+    """Report first-call work without inventing compiler completion percentages."""
+    started = time.perf_counter()
+    stopped = threading.Event()
+    print(f"Compile warmup: starting {stage}. This may take several minutes.", flush=True)
+
+    def heartbeat():
+        while not stopped.wait(interval):
+            print(f"Compile warmup: {stage} still running ({time.perf_counter() - started:.0f}s elapsed; compilation/execution).", flush=True)
+
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    try:
+        yield
+    except BaseException:
+        print(f"Compile warmup: {stage} failed or was interrupted.", flush=True)
+        raise
+    else:
+        print(f"Compile warmup: finished {stage} in {time.perf_counter() - started:.1f}s.", flush=True)
+    finally:
+        stopped.set()
+        thread.join()
 
 
 def write_layer_norms(path, model, epoch, global_step):
@@ -416,6 +442,10 @@ def parse_args(argv=None):
     )
     parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=False,
                         help="Enable per-head Q/K RMSNorm for fresh models. On resume/inference, the saved architecture takes precedence; old checkpoints disable it.")
+    parser.add_argument("--compile-qk-norm", action="store_true",
+                        help="Compile Q/K RMSNorm forward/backward with Inductor (training only; requires QK normalization). Execution option, not saved in checkpoints.")
+    parser.add_argument("--compile-model", action="store_true",
+                        help="Compile the whole model with Inductor during training; takes precedence over --compile-qk-norm. Not saved in checkpoints.")
     parser.add_argument("--beta1", type=float, default=None,
                         help="AdamW beta1: default 0.9 for new runs; omitted on resume preserves the saved value.")
     parser.add_argument("--beta2", type=float, default=None,
@@ -853,6 +883,16 @@ def main(argv=None):
                           args.beta2 if args.beta2 is not None else beta2)
     print("AdamW betas: " + ", ".join(str(group["betas"]) for group in optimizer.param_groups), flush=True)
 
+    compile_enabled = args.compile_model or args.compile_qk_norm
+    if args.compile_model:
+        print("Setting up whole-model compilation (includes QK normalization when enabled)...", flush=True)
+        model.compile()
+    elif args.compile_qk_norm:
+        print("Setting up QK normalization compilation...", flush=True)
+        model.compile_qk_norms()
+    if compile_enabled:
+        print("Compiler configured. Compilation is lazy: first validation, training forward and backward calls warm up separately. Further shapes may recompile.", flush=True)
+
     saved_schedule = checkpoint.get("lr_schedule") if ckpt_state is not None else None
     steps_per_epoch = (len(datareader) + args.batch_size - 1) // args.batch_size
     lr_schedule = resolve_schedule(args, saved_schedule, optimizer.param_groups[0]["lr"],
@@ -895,11 +935,13 @@ def main(argv=None):
         latest_validation_loss = val_loss
 
     if validation_reader is not None:
-        report_validation(start_epoch)
+        with compilation_progress("initial validation (includes all validation batches)") if compile_enabled else nullcontext():
+            report_validation(start_epoch)
 
     # ---------------------------------------------------------
     # --- Training loop ---
     # ---------------------------------------------------------
+    compile_training_pending = compile_enabled
     for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         total_loss, step = 0.0, 0
@@ -919,10 +961,15 @@ def main(argv=None):
             start_time = time.perf_counter()
             x, y = x.to(args.device), y.to(args.device)
             optimizer.zero_grad(set_to_none=True)
-            with precision_context(args.device, dtype):
-                logits = model(x)
-                loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
-            loss.backward()
+            with compilation_progress("first training forward") if compile_training_pending else nullcontext():
+                with precision_context(args.device, dtype):
+                    logits = model(x)
+                    loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
+            with compilation_progress("first training backward") if compile_training_pending else nullcontext():
+                loss.backward()
+            if compile_training_pending:
+                print("Initial training compile warmup finished; continuing training. New shapes or modes may trigger further compilation.", flush=True)
+                compile_training_pending = False
             if args.monitor_layer_norms and (global_step + 1) % args.monitor_layer_norms_every == 0:
                 # Measure gradients before clipping, and parameters before the update.
                 write_layer_norms(args.monitor_layer_norms, model, epoch + 1, global_step + 1)

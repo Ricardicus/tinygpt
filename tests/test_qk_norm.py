@@ -13,6 +13,34 @@ from tinygpt import TinyGPT, QKRMSNorm
 
 
 class QKNormTests(unittest.TestCase):
+    def test_compiled_norm_matches_forward_backward_and_state(self):
+        norm = QKRMSNorm(8)
+        x = torch.randn(2, 3, 8, requires_grad=True)
+        upstream = torch.randn_like(x)
+        reference = norm(x)
+        gradients = torch.autograd.grad(reference, (x, norm.weight), upstream)
+        state = {k: v.clone() for k, v in norm.state_dict().items()}
+        # Exercise compiled autograd without requiring a CUDA toolchain in tests.
+        norm.compile(backend='aot_eager', fullgraph=True)
+        actual = norm(x)
+        actual_gradients = torch.autograd.grad(actual, (x, norm.weight), upstream)
+        torch.testing.assert_close(actual, reference)
+        for a, b in zip(actual_gradients, gradients):
+            torch.testing.assert_close(a, b)
+        self.assertEqual(set(state), set(norm.state_dict()))
+        for key, value in state.items():
+            torch.testing.assert_close(norm.state_dict()[key], value)
+
+    def test_compile_requires_qk_and_visits_both_norms(self):
+        with self.assertRaises(ValueError):
+            TinyGPT(20, 4, 12, 3, 1).compile_qk_norms()
+        model = TinyGPT(20, 4, 12, 3, 2, qk_norm=True)
+        keys = set(model.state_dict())
+        with patch.object(QKRMSNorm, 'compile') as compile_norm:
+            model.compile_qk_norms()
+            self.assertEqual(compile_norm.call_count, 4)
+        self.assertEqual(set(model.state_dict()), keys)
+
     def test_normalizes_each_head_and_preserves_dtype(self):
         norm = QKRMSNorm(4)
         x = torch.randn(2, 3, 5, 4) * 100
