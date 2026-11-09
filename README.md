@@ -222,6 +222,13 @@ final LayerNorm, and all parameters in the first three transformer blocks (layer
 The tied token embedding/output matrix appears once as `E`. Both files append
 when resuming; use a new path to keep different runs or branches separate.
 
+Plot monitored norms with `python other/plot_progress.py --norms artifacts/layer-norms.csv`.
+Use `--series 0 --series 5` to select blocks, and `--log-gradients` for a
+logarithmic gradient axis. The individual parameter file works the same way:
+`--norms artifacts/layer-norms.csv.parameters.csv --series E --series layers.0.ln1.beta`.
+Add `--output norms.png` to save rather than display the plot. Norm plots use
+the recorded global step; repeated steps after a resumed run remain in file order.
+
 The split is by file count rather than bytes and repeats with the same corpus
 and `--validation-seed` (default 42). Training and validation use separate token
 caches; enabling the split requires tokenization once. The tokenizer vocabulary

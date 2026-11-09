@@ -325,6 +325,7 @@ if __name__ == "__main__":
             d_model=cfg["d_model"],
             n_heads=cfg["n_heads"],
             num_layers=cfg["num_layers"],
+            qk_norm=cfg.get("qk_norm", False),
         ).to(args.device)
 
         model.load_state_dict(checkpoint["model_state_dict"])
