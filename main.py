@@ -18,7 +18,7 @@ from pathlib import Path
 from datareader import PagedDataReader, TextCorpusReader, TokenizedDataReader
 from bpe import BPE, getBPE
 from corpus import load_config, text_chunks
-from tinygpt import TinyGPT
+from tinygpt import TinyGPT, MOE_DEFAULTS
 from lr_schedule import resolve_schedule
 
 
@@ -184,6 +184,7 @@ def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0, lr
             "n_heads": model.n_heads,
             "num_layers": model.num_layers,
             "qk_norm": model.qk_norm,
+            **{name: getattr(model, name) for name in MOE_DEFAULTS},
         },
     }
     descriptor, temporary = tempfile.mkstemp(prefix="checkpoint-", suffix=".tmp", dir=directory)
@@ -442,6 +443,10 @@ def parse_args(argv=None):
     )
     parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=False,
                         help="Enable per-head Q/K RMSNorm for fresh models. On resume/inference, the saved architecture takes precedence; old checkpoints disable it.")
+    parser.add_argument("--moe", action=argparse.BooleanOptionalAction, default=False, help="Use sparse MoE MLPs for fresh models; saved architecture wins on resume.")
+    parser.add_argument("--num-experts", type=int, default=4)
+    parser.add_argument("--moe-top-k", type=int, default=2)
+    parser.add_argument("--moe-aux-loss-weight", type=float, default=0.01)
     parser.add_argument("--compile-qk-norm", action="store_true",
                         help="Compile Q/K RMSNorm forward/backward with Inductor (training only; requires QK normalization). Execution option, not saved in checkpoints.")
     parser.add_argument("--compile-model", action="store_true",
@@ -543,6 +548,10 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for repeatable inference.")
     args = parser.parse_args(argv)
+    if args.num_experts < 1 or not 1 <= args.moe_top_k <= args.num_experts:
+        parser.error("Require 1 <= --moe-top-k <= --num-experts")
+    if not math.isfinite(args.moe_aux_loss_weight) or args.moe_aux_loss_weight < 0:
+        parser.error("--moe-aux-loss-weight must be finite and nonnegative")
     for name in ("beta1", "beta2"):
         value = getattr(args, name)
         if value is not None and (not math.isfinite(value) or not 0 <= value < 1):
@@ -621,6 +630,7 @@ def main(argv=None):
                 n_heads=cfg["n_heads"],
                 num_layers=cfg["num_layers"],
                 qk_norm=cfg.get("qk_norm", False),
+                **{name: cfg.get(name, value) for name, value in MOE_DEFAULTS.items()},
             ).to(args.device)
 
             model.load_state_dict(checkpoint["model_state_dict"])
@@ -777,6 +787,8 @@ def main(argv=None):
         if args.qk_norm != saved_qk_norm:
             print(f"Using checkpoint QK normalization setting: {saved_qk_norm} (overrides CLI).")
         args.qk_norm = saved_qk_norm
+        for name, default in MOE_DEFAULTS.items():
+            setattr(args, name, (ckpt_cfg or {}).get(name, default))
 
     # For BPE training we still need raw text if no tokenizer exists yet
     corpus_config = load_config(args.data_config)
@@ -857,8 +869,10 @@ def main(argv=None):
         n_heads=args.n_heads,
         num_layers=args.num_layers,
         qk_norm=args.qk_norm,
+        **{name: getattr(args, name) for name in MOE_DEFAULTS},
     ).to(args.device)
     print(f"QK normalization: {model.qk_norm}", flush=True)
+    print(f"MoE: {model.moe}; experts={model.num_experts}, top-k={model.moe_top_k}, auxiliary weight={model.moe_aux_loss_weight}", flush=True)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     lr_source = "--lr" if args.lr_explicit else "default"
     global_step = 0
@@ -963,10 +977,14 @@ def main(argv=None):
             optimizer.zero_grad(set_to_none=True)
             with compilation_progress("first training forward") if compile_training_pending else nullcontext():
                 with precision_context(args.device, dtype):
-                    logits = model(x)
+                    if model.moe:
+                        logits, aux_loss = model(x, return_aux=True)
+                    else:
+                        logits, aux_loss = model(x), 0.0
                     loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
+                    objective = loss + model.moe_aux_loss_weight * aux_loss
             with compilation_progress("first training backward") if compile_training_pending else nullcontext():
-                loss.backward()
+                objective.backward()
             if compile_training_pending:
                 print("Initial training compile warmup finished; continuing training. New shapes or modes may trigger further compilation.", flush=True)
                 compile_training_pending = False

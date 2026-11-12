@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bpe import BPE, getBPE
 from main import generate, main, parse_args, save_checkpoint
-from tinygpt import TinyGPT
+from tinygpt import TinyGPT, MOE_DEFAULTS
 
 import argparse
 from pathlib import Path
@@ -168,16 +168,16 @@ tests = [
         "name": "Capital -> Countries",
         "basePrompt": "",
         "variations": [
-            "Oslo is the capital of the country ",
-            "Stockholm is the capital of the country ",
-            "Copenhagen is the capital of the country ",
-            "Helsinki is the capital of the country",
-            "Berlin is the capital of the country",
-            "Paris is the capital of the country",
-            "Madrid is the capital of the country",
-            "Rome is the capital of the country",
-            "Lisbon is the capital of the country",
-            "Amsterdam is the capital of the country"
+            "Oslo is the capital of ",
+            "Stockholm is the capital of ",
+            "Copenhagen is the capital of ",
+            "Helsinki is the capital of ",
+            "Berlin is the capital of ",
+            "Paris is the capital of ",
+            "Madrid is the capital of ",
+            "Rome is the capital of ",
+            "Lisbon is the capital of ",
+            "Amsterdam is the capital of "
         ],
         "responses": [
             "Norway",
@@ -326,6 +326,7 @@ if __name__ == "__main__":
             n_heads=cfg["n_heads"],
             num_layers=cfg["num_layers"],
             qk_norm=cfg.get("qk_norm", False),
+            **{name: cfg.get(name, value) for name, value in MOE_DEFAULTS.items()},
         ).to(args.device)
 
         model.load_state_dict(checkpoint["model_state_dict"])

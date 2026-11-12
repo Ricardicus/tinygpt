@@ -20,6 +20,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--norms", metavar="CSV",
         help="Plot block or individual-parameter norms from a monitoring CSV.",
     )
+    parser.add_argument(
+        "--start-step",
+        help="Start the plot after this step",
+        default=0,
+        type=int
+    )
     parser.add_argument("--series", action="append", default=[], metavar="NAME",
                         help="Only plot this layer index or exact parameter name; repeat for multiple series.")
     parser.add_argument("--log-gradients", action="store_true",
@@ -78,7 +84,10 @@ def plot_validation(args):
 
     # IMPORTANT: keep original CSV order.
     # 'step' repeats per epoch, so row order is the real chronological step.
-    df = df.reset_index(drop=True)
+    if len(df) > args.start_step:
+        df = df.iloc[args.start_step:].reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
     x = df.index + 1  # global chronological step derived from row order
 
     fig, axs = plt.subplots(2)
@@ -179,7 +188,10 @@ def plot_loss(args):
 
     # IMPORTANT: keep original CSV order.
     # 'step' repeats per epoch, so row order is the real chronological step.
-    df = df.reset_index(drop=True)
+    if len(df) > args.start_step:
+        df = df.iloc[args.start_step:].reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
     x = df.index + 1  # global chronological step derived from row order
 
     plt.figure(figsize=(10, 6))
@@ -200,7 +212,7 @@ def plot_loss(args):
 def main() -> int:
     args = parse_args()
 
-    if "validation" in args.input:
+    if args.input and "validation" in args.input:
         plot_validation(args)
     else:
         plot_loss(args)

@@ -43,6 +43,9 @@ SOURCES = {
                     "url": "https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu"},
     "gutenberg": {"label": "Gutenberg books (full catalog)", "default": "0.25",
                   "url": "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"},
+    "ballast-t2": {"label": "OpenBallast T2 (OpenStax textbook passages)", "default": "full",
+                   "dataset": "OpenBallast/ballast-t2", "config": "passages",
+                   "url": "https://huggingface.co/datasets/OpenBallast/ballast-t2"},
 }
 
 
@@ -83,7 +86,7 @@ def plain_plan():
     for index, source in enumerate(SOURCES.values(), 1):
         print(f"  {index}. {source['label']}")
     while True:
-        answer = input("Sources [1,2,3,4]: ").strip() or "all"
+        answer = input(f"Sources [1-{len(names)}; default all]: ").strip() or "all"
         try:
             indices = list(range(1, len(names) + 1)) if answer.lower() == "all" else [int(i.strip()) for i in answer.split(",")]
             if not indices or any(i < 1 or i > len(names) for i in indices):
@@ -91,7 +94,7 @@ def plain_plan():
             selected_names = [name for i, name in enumerate(names, 1) if i in indices]
             break
         except ValueError:
-            print("Enter numbers from 1 to 4 separated by commas, or all.")
+            print(f"Enter numbers from 1 to {len(names)} separated by commas, or all.")
     print("Limits are saved text in decimal GB, not RAM, network traffic or caches.")
     print("Wikipedia full = all English articles in the 2023-11-01 text snapshot.")
     print("Gutenberg's GB target is soft: the final book is saved in full, even above the target.")
@@ -121,7 +124,7 @@ def tui_plan():
 
     def screen(stdscr):
         height, width = stdscr.getmaxyx()
-        if height < 19 or width < 75:
+        if height < len(SOURCES) + 15 or width < 75:
             raise curses.error("Terminal too small")
         curses.curs_set(0)
         stdscr.keypad(True)
@@ -172,11 +175,12 @@ def tui_plan():
             for index, name in enumerate(names):
                 attr = curses.A_REVERSE if cursor == index else 0
                 put(5 + index, f" [{'x' if name in checked else ' '}] {SOURCES[name]['label']:<45} {limits[name]}" + (" GB" if limits[name] != "full" else ""), attr)
-            put(10, "GB = saved UTF-8 text; RAM, network traffic and caches are extra.")
-            put(11, "Gutenberg languages: " + ", ".join(languages) + " (L to change; default English)")
-            put(12, "Gutenberg GB is a soft target: finish the final book, then stop.")
-            put(13, "Folder: " + (folder or (default_folder(selected, languages) if selected else "(select a source)")))
-            put(15, "REVIEW: Enter starts downloading; B returns to editing." if reviewing else message,
+            info_row = 6 + len(names)
+            put(info_row, "GB = saved UTF-8 text; RAM, network traffic and caches are extra.")
+            put(info_row + 1, "Gutenberg languages: " + ", ".join(languages) + " (L to change; default English)")
+            put(info_row + 2, "Gutenberg GB is a soft target: finish the final book, then stop.")
+            put(info_row + 3, "Folder: " + (folder or (default_folder(selected, languages) if selected else "(select a source)")))
+            put(info_row + 5, "REVIEW: Enter starts downloading; B returns to editing." if reviewing else message,
                 curses.A_BOLD)
             stdscr.refresh()
             key = stdscr.get_wch()
@@ -212,7 +216,7 @@ def tui_plan():
                 except ValueError as error:
                     message = str(error)
             elif key in ("l", "L"):
-                put(15, "Loading Gutenberg catalog to find its top 10 languages...", curses.A_BOLD)
+                put(info_row + 5, "Loading Gutenberg catalog to find its top 10 languages...", curses.A_BOLD)
                 stdscr.refresh()
                 try:
                     choices = gutenberg_languages()
@@ -410,7 +414,9 @@ def record_text(name, record):
         parts.append("### Response\n" + record["response"].strip())
         return "\n\n".join(parts) + "\n\n"
     text = record.get("text", "")
-    if name in ("gutenberg", "wikipedia"):
+    if name in ("gutenberg", "wikipedia", "ballast-t2"):
+        if not isinstance(text, str):
+            return ""
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         # Wikipedia is already extracted article text. Keep stubs, lists, tables
         # and code too; the prose-only filter would silently shrink a full run.
@@ -539,7 +545,8 @@ def prepare(selected, root, languages=("en",), resume=False):
                 try:
                     for record in records:
                         counts["examined"] += 1
-                        if "\x00" in record.get("text", ""):
+                        raw_text = record.get("text", "")
+                        if isinstance(raw_text, str) and "\x00" in raw_text:
                             counts["invalid"] += 1
                             continue
                         text = record_text(name, record)
@@ -558,8 +565,11 @@ def prepare(selected, root, languages=("en",), resume=False):
                         rel = Path("corpus") / name / f"{index // 1000:05d}" / f"{index:08d}.txt"
                         (root / rel).parent.mkdir(parents=True, exist_ok=True)
                         (root / rel).write_bytes(data)
-                        meta = {key: record[key] for key in
-                                ("id", "url", "title", "authors", "languages", "download_url", "category") if key in record}
+                        metadata_keys = ("id", "url", "title", "authors", "languages", "download_url", "category")
+                        if name == "ballast-t2":
+                            metadata_keys += ("chunk_id", "qid", "source_id", "source_url", "revision",
+                                              "license_id", "license_evidence", "section")
+                        meta = {key: record[key] for key in metadata_keys if key in record}
                         manifest.write(json.dumps({**meta, "kind": name, "path": rel.as_posix(),
                                                    "bytes": len(data), "sha256": digest}, ensure_ascii=False) + "\n")
                         manifest.flush()
@@ -601,6 +611,7 @@ def prepare(selected, root, languages=("en",), resume=False):
                 "from the English 2023-11-01 snapshot (not live Wikipedia or revision history).\n"
                 "Gutenberg keeps book notices.\n"
                 "Dolly retains instruction/context/response sections, including short answers.\n"
+                "OpenBallast T2 retains OpenStax passages and source/license metadata in the manifest.\n"
                 "Training uses ordinary next-token prediction over the mixed corpus.\n\n"
                 "See metadata/summary.json for source revisions, limits and actual totals,\n"
                 "and metadata/files.jsonl for document URLs, IDs and hashes. Keep metadata\n"
@@ -626,21 +637,24 @@ def main(argv=None):
     parser.add_argument("--resume", type=Path, metavar="FOLDER", help="Verify and continue a failed/interrupted download using its saved selections")
     parser.add_argument("--wikipedia", type=parse_limit, default=argparse.SUPPRESS, metavar="GB_OR_FULL",
                         help="Download English Wikipedia without prompts: a positive decimal GB amount or full")
-    parser.add_argument("--output", type=Path, help="Output folder for --wikipedia (default: automatic)")
+    parser.add_argument("--ballast-t2", type=parse_limit, default=argparse.SUPPRESS, metavar="GB_OR_FULL",
+                        help="Download OpenBallast T2 without prompts: a positive decimal GB amount or full")
+    parser.add_argument("--output", type=Path, help="Output folder for direct downloads (default: automatic)")
     args = parser.parse_args(argv)
-    direct_wikipedia = hasattr(args, "wikipedia")
-    if args.resume and (direct_wikipedia or args.output):
-        parser.error("--resume cannot be combined with --wikipedia or --output")
-    if args.output and not direct_wikipedia:
-        parser.error("--output requires --wikipedia")
-    if not args.resume and not direct_wikipedia and not sys.stdin.isatty():
+    direct = {name: getattr(args, name.replace('-', '_')) for name in ('wikipedia', 'ballast-t2')
+              if hasattr(args, name.replace('-', '_'))}
+    if args.resume and (direct or args.output):
+        parser.error("--resume cannot be combined with source options or --output")
+    if args.output and not direct:
+        parser.error("--output requires --wikipedia or --ballast-t2")
+    if not args.resume and not direct and not sys.stdin.isatty():
         parser.error("Interactive terminal required. Run this command directly in your terminal.")
     try:
         if args.resume:
             prepare({}, args.resume, resume=True)
             return
-        if direct_wikipedia:
-            selected = {"wikipedia": args.wikipedia}
+        if direct:
+            selected = direct
             root = args.output or Path(default_folder(selected))
             print_plan(selected, root)
             prepare(selected, root)

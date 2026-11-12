@@ -10,7 +10,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bpe import BPE
 from main import generate
-from tinygpt import TinyGPT
+from tinygpt import TinyGPT, MOE_DEFAULTS
 
 
 def main(argv=None):
@@ -61,7 +61,8 @@ def main(argv=None):
             parser.error("Prompt contains no encodable tokens")
     except ValueError as error:
         parser.error(str(error))
-    model = TinyGPT(qk_norm=config.get("qk_norm", False), **{name: config[name] for name in
+    model = TinyGPT(qk_norm=config.get("qk_norm", False),
+                    **{name: config.get(name, value) for name, value in MOE_DEFAULTS.items()}, **{name: config[name] for name in
                        ("vocab_size", "context_length", "d_model", "n_heads", "num_layers")}).to(args.device)
     model.load_state_dict(checkpoint["model_state_dict"])
     if args.seed is not None:

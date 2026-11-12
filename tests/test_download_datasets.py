@@ -343,7 +343,7 @@ class DownloadDatasetsTests(unittest.TestCase):
     def test_plain_wizard_reprompts_invalid_values_and_accepts_custom_folder(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "custom"
-            with patch("builtins.input", side_effect=["5", "2,4", "nan", "0.5", "full", str(root), "y"]), \
+            with patch("builtins.input", side_effect=["6", "2,4", "nan", "0.5", "full", str(root), "y"]), \
                     patch.object(builder, "plain_languages", return_value=("en", "fr")):
                 selected, actual_root, languages = builder.plain_plan()
         self.assertEqual(selected, {"dolly": 500_000_000, "gutenberg": None})
@@ -360,7 +360,7 @@ class DownloadDatasetsTests(unittest.TestCase):
         with patch.object(curses, "wrapper", side_effect=lambda f: f(screen)), \
                 patch.object(curses, "curs_set"), patch.object(builder, "validate_output", side_effect=Path):
             selected, root, languages = builder.tui_plan()
-        self.assertEqual(selected, {"dolly": 500_000_000, "fineweb-edu": 1_000_000_000, "gutenberg": 250_000_000})
+        self.assertEqual(selected, {"dolly": 500_000_000, "fineweb-edu": 1_000_000_000, "gutenberg": 250_000_000, "ballast-t2": None})
         self.assertEqual(root, Path("/tmp/tui-x"))
         self.assertEqual(languages, ("en",))
 

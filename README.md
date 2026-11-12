@@ -159,6 +159,34 @@ The column is blank when validation is disabled. Existing four-column logs are
 upgraded automatically when training restarts; historical validation values stay
 blank. Detailed validation records also go into `<log path>.validation.csv`.
 
+Enable sparse mixture-of-experts feed-forward blocks for a fresh model with:
+
+```bash
+--moe --num-experts 4 --moe-top-k 2 --moe-aux-loss-weight 0.01
+```
+
+Each block replaces its dense MLP with independent, full-width MLP experts and
+a learned router. Only the selected experts process each token; no tokens are
+dropped or limited by an expert capacity. Routing probabilities use FP32. Top-k
+weights are normalized over the selected experts for k > 1; top-1 retains its
+softmax probability so the task loss also trains the router. Training adds an
+expert-load balancing loss averaged across blocks. Logged training and validation
+losses remain cross-entropy, excluding this auxiliary term.
+
+MoE is off by default. Checkpoints save `moe`, `num_experts`, `moe_top_k`, and
+`moe_aux_loss_weight`. Missing fields default to the dense architecture; saved
+settings override CLI values on resume and inference, including the factuality
+test script. Use a fresh model path to enable MoE; dense checkpoints are not
+automatically converted. Existing dense weights and optimizer layouts are unchanged.
+
+This is a basic single-device sparse implementation, not an expert-parallel or
+fused-kernel implementation. Expert dispatch runs eagerly with variable token
+counts; `--compile-model` compiles the surrounding operations with graph breaks
+at MoE calls. Experts increase total parameters, optimizer memory and checkpoint
+size. With four full-width experts and top-2 routing, each token uses two MLPs
+per block rather than one, so this setting is not a speed optimization over the
+same-width dense model. CUDA throughput and long-run convergence need measurement.
+
 Enable QK normalization for a fresh model with `--qk-norm`. This applies separate
 learned RMSNorm scales to Q and K over each head's feature dimension, sharing
 scales across heads. V and the usual attention scaling are unchanged. RMS
@@ -365,8 +393,8 @@ pip install -r requirements.txt
 python other/download_datasets.py
 ```
 
-Available sources are English Wikipedia, Dolly 15k, FineWeb-Edu and Project
-Gutenberg's full book catalog. Use **Up/Down** to move,
+Available sources are English Wikipedia, Dolly 15k, FineWeb-Edu, Project
+Gutenberg's full book catalog, and OpenBallast T2 textbook passages. Use **Up/Down** to move,
 **Space** to toggle a source, **A** to select/deselect all, **E** to edit its
 limit, **F** for `full`, **L** for Gutenberg languages, and **O** to edit the output folder. **Ctrl-U** clears
 an edit field. Press **Enter** to review the selection, then **Enter** again to
@@ -377,7 +405,7 @@ It updates with your selection unless you enter a custom path.
 
 Each selected source accepts a positive decimal GB amount such as `0.25` or
 `1.5`, or `full`. Limits count saved UTF-8 training text, with **1 GB =
-1,000,000,000 bytes**, preserving whole documents. Wikipedia, Dolly and FineWeb-Edu
+1,000,000,000 bytes**, preserving whole documents. Wikipedia, Dolly, FineWeb-Edu and Ballast T2
 stop below their caps when the next document would exceed them. Gutenberg uses
 a **soft GB target**: it saves the entire book that reaches or crosses the target,
 then stops. The result may exceed the target by part of one book; a single book
@@ -399,7 +427,17 @@ Download Wikipedia directly without the wizard:
 ```bash
 python other/download_datasets.py --wikipedia full --output datasets/wikipedia-full
 python other/download_datasets.py --wikipedia 5 --output datasets/wikipedia-5gb
+python other/download_datasets.py --ballast-t2 full --output datasets/ballast-t2
 ```
+
+OpenBallast T2 uses the `passages` subset of `OpenBallast/ballast-t2`, pinned
+to a resolved Hub revision and streamed into individual text files. It defaults
+to `full` (the dataset card reports about 92 MB of text); a decimal GB limit is
+also supported. It preserves short definitions, examples and formulas without
+the FineWeb prose filter. The manifest retains passage IDs, source URLs,
+source revisions and license evidence. The dataset card identifies the material
+as OpenStax CC BY 4.0 and notes that figures and math markup were removed during
+upstream preparation, so some cross-references and formulas may be incomplete.
 
 The same GB/full choices are available in the interactive UI. `full` has no byte
 or article-count cap and streams every English shard to exhaustion. Empty/invalid

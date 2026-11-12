@@ -16,3 +16,6 @@ models
 *-data
 artifacts*
 *.pyc
+datasets
+pages
+test[1-9]
