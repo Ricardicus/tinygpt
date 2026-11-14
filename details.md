@@ -675,7 +675,7 @@ vocabulary size is not necessarily the same tokenizer. Download Dolly with
 `python other/download_datasets.py`, then run for example:
 
 ```bash
-python finetune.py --data datasets/dolly-full/corpus/dolly \
+python main.py finetune --data datasets/dolly-full/corpus/dolly \
   --base-model path/to/pretrained-model.pt \
   --tokenizer path/to/pretraining-tokenizer.json \
   --output models/dolly-sft.pt --epochs 3 --batch-size 2 --lr 0.00002

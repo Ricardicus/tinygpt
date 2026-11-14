@@ -613,7 +613,7 @@ def prepare(selected, root, languages=("en",), resume=False):
                 "Dolly retains instruction/context/response sections, including short answers.\n"
                 "OpenBallast T2 retains OpenStax passages and source/license metadata in the manifest.\n"
                 "train.sh uses ordinary next-token prediction over the mixed corpus.\n"
-                "For Dolly supervised fine-tuning, see the main project README and finetune.py;\n"
+                "For Dolly supervised fine-tuning, see details.md and main.py finetune;\n"
                 "it requires a pretrained model and its matching tokenizer.\n\n"
                 "See metadata/summary.json for source revisions, limits and actual totals,\n"
                 "and metadata/files.jsonl for document URLs, IDs and hashes. Keep metadata\n"
@@ -631,7 +631,7 @@ def prepare(selected, root, languages=("en",), resume=False):
             wikipedia.write_json(summary_path, summary)
     print(f"\nReady. Pretrain with: bash {shlex.quote(str(root / 'train.sh'))}")
     if "dolly" in selected:
-        print(f"For Dolly supervised fine-tuning, use finetune.py with --data {shlex.quote(str(root / 'corpus/dolly'))} and your pretrained model and tokenizer.")
+        print(f"For Dolly supervised fine-tuning, use main.py finetune with --data {shlex.quote(str(root / 'corpus/dolly'))} and your pretrained model and tokenizer.")
     return summary
 
 

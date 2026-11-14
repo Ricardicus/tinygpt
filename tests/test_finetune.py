@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 
 from bpe import BPE
-from finetune import examples, main, RESPONSE_MARKER
+from main import finetune_examples, main, RESPONSE_MARKER
 from tinygpt import TinyGPT
 
 
@@ -18,7 +18,7 @@ class FineTuneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'a.txt'
             path.write_text(text)
-            windows = list(examples(path, tok, 16))
+            windows = list(finetune_examples(path, tok, 16))
             actual = [t for _, y in windows for t in y if t != -100]
             self.assertEqual(actual, tok.encode(text.split(RESPONSE_MARKER, 1)[1]))
             self.assertTrue(any(-100 in y for _, y in windows))
@@ -40,7 +40,7 @@ class FineTuneTests(unittest.TestCase):
             base = root / 'base.pt'
             cfg = dict(vocab_size=64, context_length=16, d_model=8, n_heads=2, num_layers=1)
             torch.save({'config': cfg, 'model_state_dict': model.state_dict()}, base)
-            main(['--data', str(data), '--base-model', str(base), '--tokenizer', str(root / 'tokenizer.json'),
+            main(['finetune', '--data', str(data), '--base-model', str(base), '--tokenizer', str(root / 'tokenizer.json'),
                   '--output', str(root / 'sft.pt'), '--epochs', '1', '--device', 'cpu'])
             output = torch.load(root / 'sft.pt', weights_only=True)
             self.assertEqual(output['epoch'], 1)

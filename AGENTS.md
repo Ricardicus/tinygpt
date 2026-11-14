@@ -1,3 +1,5 @@
 # Repository instructions
 
-Do not edit `README.md`. Make documentation updates in `details.md` instead.
+- Do not edit `README.md`. Make documentation updates in `details.md` instead.
+- Feel free to suggest refactorizations
+
