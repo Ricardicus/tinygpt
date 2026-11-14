@@ -107,6 +107,11 @@ optional arguments:
   --seed SEED           Random seed for repeatable inference.
 ````
 
+## Dataset downloader
+
+There is a dataset downloader script that can be used to download datasets for llm pretraining.
+It relies on Huggingface datasets. It is found at other/download\_datasets.py. 
+
 ## More info
 
 See details.md
