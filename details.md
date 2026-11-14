@@ -666,3 +666,38 @@ Run the corpus/tokenizer and transformer regression tests with:
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+### Supervised fine-tuning with Dolly
+
+Dolly contains instruction/response examples. Start with a **pretrained model**
+and the exact tokenizer that produced its training IDs; a tokenizer with the same
+vocabulary size is not necessarily the same tokenizer. Download Dolly with
+`python other/download_datasets.py`, then run for example:
+
+```bash
+python finetune.py --data datasets/dolly-full/corpus/dolly \
+  --base-model path/to/pretrained-model.pt \
+  --tokenizer path/to/pretraining-tokenizer.json \
+  --output models/dolly-sft.pt --epochs 3 --batch-size 2 --lr 0.00002
+```
+
+The output must be a new path. The pretrained weights remain intact. The script
+uses a fresh AdamW optimizer, splits examples into training and validation sets,
+reports response-only loss and saves after each epoch. It masks instruction and
+context tokens from the loss. Long examples are split into windows; each response
+token is trained once with up to the model's context length of preceding tokens.
+There is no mid-epoch resume for this script. Save the tokenizer alongside the
+fine-tuned checkpoint and retain the Dolly dataset metadata for attribution.
+
+Use the same prompt format at inference:
+
+```bash
+python other/inference.py --model models/dolly-sft.pt \
+  --tokenizer path/to/pretraining-tokenizer.json \
+  --prompt $'### Instruction\nExplain gravity.\n\n### Response\n'
+```
+
+Include `\n\n### Context\n` and the context text before `### Response` when
+needed. This tokenizer has no dedicated end-of-response token; generation uses
+`--max-new-tokens` and may continue past the answer. The generic Dolly `train.sh`
+performs ordinary next-token training, not supervised fine-tuning.

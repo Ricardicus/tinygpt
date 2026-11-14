@@ -612,7 +612,9 @@ def prepare(selected, root, languages=("en",), resume=False):
                 "Gutenberg keeps book notices.\n"
                 "Dolly retains instruction/context/response sections, including short answers.\n"
                 "OpenBallast T2 retains OpenStax passages and source/license metadata in the manifest.\n"
-                "Training uses ordinary next-token prediction over the mixed corpus.\n\n"
+                "train.sh uses ordinary next-token prediction over the mixed corpus.\n"
+                "For Dolly supervised fine-tuning, see the main project README and finetune.py;\n"
+                "it requires a pretrained model and its matching tokenizer.\n\n"
                 "See metadata/summary.json for source revisions, limits and actual totals,\n"
                 "and metadata/files.jsonl for document URLs, IDs and hashes. Keep metadata\n"
                 "for attribution; source cards describe dataset and underlying content licenses.\n" +
@@ -627,7 +629,9 @@ def prepare(selected, root, languages=("en",), resume=False):
             summary["files"] = sum(c["files"] for c in summary["counts"].values())
             summary["bytes"] = sum(c["bytes"] for c in summary["counts"].values())
             wikipedia.write_json(summary_path, summary)
-    print(f"\nReady. Train with: bash {shlex.quote(str(root / 'train.sh'))}")
+    print(f"\nReady. Pretrain with: bash {shlex.quote(str(root / 'train.sh'))}")
+    if "dolly" in selected:
+        print(f"For Dolly supervised fine-tuning, use finetune.py with --data {shlex.quote(str(root / 'corpus/dolly'))} and your pretrained model and tokenizer.")
     return summary
 
 
