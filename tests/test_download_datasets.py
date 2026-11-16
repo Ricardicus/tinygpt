@@ -21,6 +21,33 @@ PROSE = (
 
 
 class DownloadDatasetsTests(unittest.TestCase):
+    def test_alpaca_format_download_and_cli(self):
+        records = [{'instruction': 'Classify', 'input': 'cat', 'output': 'animal'},
+                   {'instruction': 'Hello', 'input': '', 'output': 'Hi'},
+                   {'instruction': 'Empty', 'input': '', 'output': ''}]
+        self.assertEqual(builder.record_text('alpaca', records[0]),
+                         '### Instruction\nClassify\n\n### Context\ncat\n\n### Response\nanimal\n\n')
+        self.assertEqual(builder.record_text('alpaca', records[1]),
+                         '### Instruction\nHello\n\n### Response\nHi\n\n')
+        self.assertEqual(builder.record_text('alpaca', records[2]), '')
+        datasets, hub = Mock(), Mock()
+        datasets.load_dataset.return_value = records
+        hub.HfApi.return_value.dataset_info.return_value.sha = 'pinned'
+        with patch.dict('sys.modules', {'datasets': datasets, 'huggingface_hub': hub}):
+            provenance = {}
+            self.assertEqual(list(builder.source_records('alpaca', provenance)), records)
+        datasets.load_dataset.assert_called_once_with('tatsu-lab/alpaca', name=None, split='train', revision='pinned', streaming=True)
+        self.assertEqual(provenance['license'], 'cc-by-nc-4.0')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'alpaca'
+            with patch.object(builder, 'source_records', return_value=iter(records)):
+                summary = builder.prepare({'alpaca': None}, root)
+            self.assertEqual(summary['files'], 2)
+            self.assertEqual((root / 'corpus/alpaca/00000/00000000.txt').read_text(), builder.record_text('alpaca', records[0]))
+        with patch.object(builder, 'prepare') as prepare:
+            builder.main(['--alpaca', 'full', '--output', '/tmp/alpaca-cli'])
+            prepare.assert_called_once_with({'alpaca': None}, Path('/tmp/alpaca-cli'))
+
     def test_wikipedia_preserves_stubs_lists_and_code(self):
         article = "A short stub.\r\n\r\n* Item one\r\n* Item two\r\n\r\ndef example():\r\n    return 1"
         self.assertEqual(builder.record_text("wikipedia", {"text": article}),
@@ -343,7 +370,7 @@ class DownloadDatasetsTests(unittest.TestCase):
     def test_plain_wizard_reprompts_invalid_values_and_accepts_custom_folder(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "custom"
-            with patch("builtins.input", side_effect=["6", "2,4", "nan", "0.5", "full", str(root), "y"]), \
+            with patch("builtins.input", side_effect=["7", "2,4", "nan", "0.5", "full", str(root), "y"]), \
                     patch.object(builder, "plain_languages", return_value=("en", "fr")):
                 selected, actual_root, languages = builder.plain_plan()
         self.assertEqual(selected, {"dolly": 500_000_000, "gutenberg": None})
@@ -360,7 +387,7 @@ class DownloadDatasetsTests(unittest.TestCase):
         with patch.object(curses, "wrapper", side_effect=lambda f: f(screen)), \
                 patch.object(curses, "curs_set"), patch.object(builder, "validate_output", side_effect=Path):
             selected, root, languages = builder.tui_plan()
-        self.assertEqual(selected, {"dolly": 500_000_000, "fineweb-edu": 1_000_000_000, "gutenberg": 250_000_000, "ballast-t2": None})
+        self.assertEqual(selected, {"dolly": 500_000_000, "fineweb-edu": 1_000_000_000, "gutenberg": 250_000_000, "ballast-t2": None, "alpaca": None})
         self.assertEqual(root, Path("/tmp/tui-x"))
         self.assertEqual(languages, ("en",))
 

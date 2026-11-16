@@ -393,7 +393,7 @@ pip install -r requirements.txt
 python other/download_datasets.py
 ```
 
-Available sources are English Wikipedia, Dolly 15k, FineWeb-Edu, Project
+Available sources are English Wikipedia, Dolly 15k, Alpaca, FineWeb-Edu, Project
 Gutenberg's full book catalog, and OpenBallast T2 textbook passages. Use **Up/Down** to move,
 **Space** to toggle a source, **A** to select/deselect all, **E** to edit its
 limit, **F** for `full`, **L** for Gutenberg languages, and **O** to edit the output folder. **Ctrl-U** clears
@@ -406,7 +406,7 @@ It updates with your selection unless you enter a custom path.
 Each selected source accepts a positive decimal GB amount such as `0.25` or
 `1.5`, or `full`. Limits count saved UTF-8 training text, with **1 GB =
 1,000,000,000 bytes**, preserving whole documents. Wikipedia, Dolly, FineWeb-Edu and Ballast T2
-stop below their caps when the next document would exceed them. Gutenberg uses
+and Alpaca stop below their caps when the next document would exceed them. Gutenberg uses
 a **soft GB target**: it saves the entire book that reaches or crosses the target,
 then stops. The result may exceed the target by part of one book; a single book
 larger than the target is still saved in full. Results may be smaller if the
@@ -674,6 +674,12 @@ and the exact tokenizer that produced its training IDs; a tokenizer with the sam
 vocabulary size is not necessarily the same tokenizer. Download Dolly with
 `python other/download_datasets.py`, then run for example:
 
+Alpaca is also available in the downloader, including non-interactively with
+`python other/download_datasets.py --alpaca full --output datasets/alpaca`.
+Its input field becomes a `### Context` section, so the resulting
+`datasets/alpaca/corpus/alpaca` directory can be passed to `--data` below.
+Alpaca is licensed CC BY-NC 4.0; check its dataset card for terms and provenance.
+
 ```bash
 python main.py finetune --data datasets/dolly-full/corpus/dolly \
   --base-model path/to/pretrained-model.pt \
@@ -689,6 +695,13 @@ token is trained once with up to the model's context length of preceding tokens.
 There is no mid-epoch resume for this script. Save the tokenizer alongside the
 fine-tuned checkpoint and retain the Dolly dataset metadata for attribution.
 
+Fine-tuning writes per-step response loss, cumulative token-weighted loss, learning
+rate and pre-clipping gradient norm to `<output>.progress.csv` by default. Use
+`--log-progress` to select another new path. Epoch validation loss, perplexity
+and response-token count are written to `<progress path>.validation.csv`.
+Plot either file with `python other/plot_progress.py --input <path>`; monitor
+updates with `tail -f <progress path>`. Existing log paths are not overwritten.
+
 Use the same prompt format at inference:
 
 ```bash
@@ -699,5 +712,18 @@ python other/inference.py --model models/dolly-sft.pt \
 
 Include `\n\n### Context\n` and the context text before `### Response` when
 needed. This tokenizer has no dedicated end-of-response token; generation uses
-`--max-new-tokens` and may continue past the answer. The generic Dolly `train.sh`
+`--max-new-tokens` and may continue past the answer for older checkpoints. New
+fine-tuning runs append `\n\n### End Response\n` to every target response and
+store it in the checkpoint. Set `--response-end-marker` to another nonempty
+string representable by the existing tokenizer. The chat server and inference
+tool stop when they generate the saved marker; the token limit still applies if
+the model does not produce it. The generic Dolly `train.sh`
 performs ordinary next-token training, not supervised fine-tuning.
+
+Pass `--show-end-marker` to `other/inference.py` to display the marker if it
+was generated. The marker remains hidden by default.
+
+For the Dolly run based on `artifacts-2026-11-16/model.pt`, try the checkpoint
+after it is saved with `bash other/test_dolly.sh 'Explain gravity.'`. Extra
+arguments are passed to the inference tool, for example `--temperature 0
+--max-new-tokens 100`. Omit the instruction to enter it interactively.

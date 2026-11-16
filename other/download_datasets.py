@@ -46,6 +46,9 @@ SOURCES = {
     "ballast-t2": {"label": "OpenBallast T2 (OpenStax textbook passages)", "default": "full",
                    "dataset": "OpenBallast/ballast-t2", "config": "passages",
                    "url": "https://huggingface.co/datasets/OpenBallast/ballast-t2"},
+    "alpaca": {"label": "Alpaca (instructions + answers)", "default": "full",
+               "dataset": "tatsu-lab/alpaca", "config": None, "license": "cc-by-nc-4.0",
+               "url": "https://huggingface.co/datasets/tatsu-lab/alpaca"},
 }
 
 
@@ -399,19 +402,24 @@ def source_records(name, provenance, languages=("en",), completed_ids=()):
     source = SOURCES[name]
     revision = provenance.get("revision") or source.get("revision") or HfApi().dataset_info(source["dataset"]).sha
     provenance.update(dataset=source["dataset"], config=source["config"], revision=revision)
+    if "license" in source:
+        provenance["license"] = source["license"]
     return iter(load_dataset(source["dataset"], name=source["config"], split="train",
                              revision=revision, streaming=True))
 
 
 def record_text(name, record):
-    if name == "dolly":
+    if name in ("dolly", "alpaca"):
         # Preserve short answers and code; prose filters would destroy these pairs.
-        if not record.get("instruction", "").strip() or not record.get("response", "").strip():
+        instruction = record.get("instruction")
+        response = record.get("output" if name == "alpaca" else "response")
+        context = record.get("input" if name == "alpaca" else "context") or ""
+        if not isinstance(instruction, str) or not instruction.strip() or not isinstance(response, str) or not response.strip() or not isinstance(context, str):
             return ""
-        parts = ["### Instruction\n" + record["instruction"].strip()]
-        if record.get("context", "").strip():
-            parts.append("### Context\n" + record["context"].strip())
-        parts.append("### Response\n" + record["response"].strip())
+        parts = ["### Instruction\n" + instruction.strip()]
+        if context.strip():
+            parts.append("### Context\n" + context.strip())
+        parts.append("### Response\n" + response.strip())
         return "\n\n".join(parts) + "\n\n"
     text = record.get("text", "")
     if name in ("gutenberg", "wikipedia", "ballast-t2"):
@@ -610,7 +618,8 @@ def prepare(selected, root, languages=("en",), resume=False):
                 "Wikipedia preserves complete extracted article text, including stubs and lists,\n"
                 "from the English 2023-11-01 snapshot (not live Wikipedia or revision history).\n"
                 "Gutenberg keeps book notices.\n"
-                "Dolly retains instruction/context/response sections, including short answers.\n"
+                "Dolly and Alpaca retain instruction/context/response sections, including short answers.\n"
+                "Alpaca is licensed CC BY-NC 4.0; check its dataset card before use.\n"
                 "OpenBallast T2 retains OpenStax passages and source/license metadata in the manifest.\n"
                 "train.sh uses ordinary next-token prediction over the mixed corpus.\n"
                 "For Dolly supervised fine-tuning, see details.md and main.py finetune;\n"
@@ -630,8 +639,9 @@ def prepare(selected, root, languages=("en",), resume=False):
             summary["bytes"] = sum(c["bytes"] for c in summary["counts"].values())
             wikipedia.write_json(summary_path, summary)
     print(f"\nReady. Pretrain with: bash {shlex.quote(str(root / 'train.sh'))}")
-    if "dolly" in selected:
-        print(f"For Dolly supervised fine-tuning, use main.py finetune with --data {shlex.quote(str(root / 'corpus/dolly'))} and your pretrained model and tokenizer.")
+    for name in ("dolly", "alpaca"):
+        if name in selected:
+            print(f"For {name} supervised fine-tuning, use main.py finetune with --data {shlex.quote(str(root / 'corpus' / name))} and your pretrained model and tokenizer.")
     return summary
 
 
@@ -643,14 +653,16 @@ def main(argv=None):
                         help="Download English Wikipedia without prompts: a positive decimal GB amount or full")
     parser.add_argument("--ballast-t2", type=parse_limit, default=argparse.SUPPRESS, metavar="GB_OR_FULL",
                         help="Download OpenBallast T2 without prompts: a positive decimal GB amount or full")
+    parser.add_argument("--alpaca", type=parse_limit, default=argparse.SUPPRESS, metavar="GB_OR_FULL",
+                        help="Download Alpaca without prompts: a positive decimal GB amount or full")
     parser.add_argument("--output", type=Path, help="Output folder for direct downloads (default: automatic)")
     args = parser.parse_args(argv)
-    direct = {name: getattr(args, name.replace('-', '_')) for name in ('wikipedia', 'ballast-t2')
+    direct = {name: getattr(args, name.replace('-', '_')) for name in ('wikipedia', 'ballast-t2', 'alpaca')
               if hasattr(args, name.replace('-', '_'))}
     if args.resume and (direct or args.output):
         parser.error("--resume cannot be combined with source options or --output")
     if args.output and not direct:
-        parser.error("--output requires --wikipedia or --ballast-t2")
+        parser.error("--output requires a source option")
     if not args.resume and not direct and not sys.stdin.isatty():
         parser.error("Interactive terminal required. Run this command directly in your terminal.")
     try:

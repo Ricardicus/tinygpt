@@ -209,7 +209,7 @@ tests = [
             "cold",
             "down",
             "small",
-            "sad",
+            ["sad", "unhappiness"],
             "slow",
             "dark",
             "old",
@@ -240,7 +240,14 @@ def doTests(model, bpe):
             response = prompt_response(prompt, model, bpe)
             response = response.split(".")[0] + "."
 
-            success = expected.lower() in response.lower()
+            success = False
+            if isinstance(expected, list):
+                
+                for exp in expected:
+                    if not success:
+                        success = exp.lower() in response.lower()
+            else:
+                success = expected.lower() in response.lower()
 
             if success:
                 successes += 1

@@ -84,11 +84,13 @@ def plot_validation(args):
 
     # IMPORTANT: keep original CSV order.
     # 'step' repeats per epoch, so row order is the real chronological step.
+    offset = 1
     if len(df) > args.start_step:
         df = df.iloc[args.start_step:].reset_index(drop=True)
+        offset += args.start_step
     else:
         df = df.reset_index(drop=True)
-    x = df.index + 1  # global chronological step derived from row order
+    x = df.index + offset  # global chronological step derived from row order
 
     fig, axs = plt.subplots(2)
 
@@ -188,11 +190,13 @@ def plot_loss(args):
 
     # IMPORTANT: keep original CSV order.
     # 'step' repeats per epoch, so row order is the real chronological step.
+    offset = 1
     if len(df) > args.start_step:
         df = df.iloc[args.start_step:].reset_index(drop=True)
+        offset += args.start_step
     else:
         df = df.reset_index(drop=True)
-    x = df.index + 1  # global chronological step derived from row order
+    x = df.index + offset  # global chronological step derived from row order
 
     plt.figure(figsize=(10, 6))
     plt.plot(x, df["loss"], label="loss")

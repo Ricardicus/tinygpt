@@ -1,3 +1,5 @@
+import csv
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,9 +20,9 @@ class FineTuneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'a.txt'
             path.write_text(text)
-            windows = list(finetune_examples(path, tok, 16))
+            windows = list(finetune_examples(path, tok, 16, 'hello'))
             actual = [t for _, y in windows for t in y if t != -100]
-            self.assertEqual(actual, tok.encode(text.split(RESPONSE_MARKER, 1)[1]))
+            self.assertEqual(actual, tok.encode(text.split(RESPONSE_MARKER, 1)[1]) + tok.encode('hello'))
             self.assertTrue(any(-100 in y for _, y in windows))
             self.assertTrue(all(len(x) <= 16 and len(x) == len(y) for x, y in windows))
 
@@ -41,11 +43,21 @@ class FineTuneTests(unittest.TestCase):
             cfg = dict(vocab_size=64, context_length=16, d_model=8, n_heads=2, num_layers=1)
             torch.save({'config': cfg, 'model_state_dict': model.state_dict()}, base)
             main(['finetune', '--data', str(data), '--base-model', str(base), '--tokenizer', str(root / 'tokenizer.json'),
-                  '--output', str(root / 'sft.pt'), '--epochs', '1', '--device', 'cpu'])
+                  '--output', str(root / 'sft.pt'), '--epochs', '1', '--device', 'cpu', '--response-end-marker', 'hello'])
             output = torch.load(root / 'sft.pt', weights_only=True)
             self.assertEqual(output['epoch'], 1)
+            self.assertEqual(output['response_end_marker'], 'hello')
             self.assertTrue(base.exists())
             self.assertFalse(torch.equal(output['model_state_dict']['E'], model.state_dict()['E']))
+            with (root / 'sft.pt.progress.csv').open(newline='') as source:
+                rows = list(csv.DictReader(source))
+            self.assertTrue(rows)
+            self.assertGreater(float(rows[-1]['grad_norm']), 0)
+            with (root / 'sft.pt.progress.csv.validation.csv').open(newline='') as source:
+                validation = list(csv.DictReader(source))
+            self.assertEqual(len(validation), 1)
+            self.assertAlmostEqual(float(validation[0]['perplexity']),
+                                   math.exp(float(validation[0]['validation_loss'])))
 
 
 if __name__ == '__main__':

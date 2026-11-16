@@ -16,6 +16,7 @@ models
 *-data
 artifacts*
 *.pyc
+chat_app/*.sqlite3*
 datasets
 pages
 test[1-9]

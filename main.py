@@ -161,7 +161,7 @@ def evaluate(model, datareader, batch_size, max_batches, device, seed=42, dtype=
     return loss, math.exp(loss) if loss < 700 else float("inf"), total_tokens
 
 
-def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0, lr_schedule=None):
+def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0, lr_schedule=None, response_end_marker=None):
     """Atomically replace the latest checkpoint; epoch counts completed epochs.
 
     A mid-epoch checkpoint resumes weights/optimizer and restarts that epoch
@@ -187,6 +187,8 @@ def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0, lr
             **{name: getattr(model, name) for name in MOE_DEFAULTS},
         },
     }
+    if response_end_marker is not None:
+        checkpoint['response_end_marker'] = response_end_marker
     descriptor, temporary = tempfile.mkstemp(prefix="checkpoint-", suffix=".tmp", dir=directory)
     os.close(descriptor)
     try:
@@ -336,7 +338,7 @@ def stream_batches(datareader, bpe, context_length, batch_size):
 
 
 @torch.no_grad()
-def generate(model, bpe, prompt, max_new_tokens=50, device="cpu", temperature=1.0, top_k=0):
+def generate(model, bpe, prompt, max_new_tokens=50, device="cpu", temperature=1.0, top_k=0, response_end_marker=None, show_end_marker=False):
     """Generate text autoregressively from a prompt."""
     if not math.isfinite(temperature) or temperature < 0 or top_k < 0:
         raise ValueError("Temperature must be finite and nonnegative; top_k must be nonnegative")
@@ -345,6 +347,7 @@ def generate(model, bpe, prompt, max_new_tokens=50, device="cpu", temperature=1.
     # Encode prompt → token IDs
     ids = bpe.encode(prompt)
     ids = torch.tensor([ids], dtype=torch.long).to(device)  # (1, C)
+    prompt_length = ids.size(1)
 
     for _ in range(max_new_tokens):
         # Trim to context length if too long
@@ -361,9 +364,17 @@ def generate(model, bpe, prompt, max_new_tokens=50, device="cpu", temperature=1.
             probs = torch.softmax(next_token_logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
         ids = torch.cat([ids, next_id], dim=1)
+        if response_end_marker and response_end_marker in bpe.decode(ids[0, prompt_length:].tolist()):
+            break
 
     # Decode all tokens back to text
     generated = bpe.decode(ids[0].tolist())
+    if response_end_marker:
+        prefix = bpe.decode(ids[0, :prompt_length].tolist())
+        response = bpe.decode(ids[0, prompt_length:].tolist())
+        before, separator, _ = response.partition(response_end_marker)
+        response = before + (separator if show_end_marker else '')
+        return prefix + response
     return generated
 
 
@@ -595,9 +606,10 @@ def parse_args(argv=None):
     return args
 
 RESPONSE_MARKER = '\n\n### Response\n'
+DEFAULT_RESPONSE_END_MARKER = '\n\n### End Response\n'
 
 
-def finetune_examples(path, tokenizer, context_length):
+def finetune_examples(path, tokenizer, context_length, response_end_marker=DEFAULT_RESPONSE_END_MARKER):
     text = path.read_text(encoding='utf-8')
     if not text.startswith('### Instruction\n') or RESPONSE_MARKER not in text:
         raise ValueError(f'Invalid Dolly format: {path}')
@@ -607,7 +619,7 @@ def finetune_examples(path, tokenizer, context_length):
         raise ValueError(f'Empty response: {path}')
     # The marker ends in whitespace, so the tokenizer cannot merge across the boundary.
     prompt_ids = tokenizer.encode(prompt)
-    response_ids = tokenizer.encode(response)
+    response_ids = tokenizer.encode(response) + tokenizer.encode(response_end_marker)
     if not prompt_ids or not response_ids:
         raise ValueError(f'Empty tokenized prompt or response: {path}')
     tokens = prompt_ids + response_ids
@@ -622,10 +634,10 @@ def finetune_examples(path, tokenizer, context_length):
         yield x, y
 
 
-def finetune_batches(files, tokenizer, context_length, batch_size):
+def finetune_batches(files, tokenizer, context_length, batch_size, response_end_marker=DEFAULT_RESPONSE_END_MARKER):
     pending = []
     for path in files:
-        for pair in finetune_examples(path, tokenizer, context_length):
+        for pair in finetune_examples(path, tokenizer, context_length, response_end_marker):
             pending.append(pair)
             if len(pending) == batch_size:
                 yield finetune_collate(pending)
@@ -647,6 +659,8 @@ def finetune_main(argv=None):
     p.add_argument('--base-model', type=Path, required=True)
     p.add_argument('--tokenizer', type=Path, required=True, help='Exact tokenizer used for pretraining')
     p.add_argument('--output', type=Path, required=True, help='New output checkpoint; must not already exist')
+    p.add_argument('--log-progress', type=Path, default=None, help='Training CSV path (default: output path plus .progress.csv)')
+    p.add_argument('--response-end-marker', default=DEFAULT_RESPONSE_END_MARKER, help='Text appended to every response and used to stop generation')
     p.add_argument('--device', default=default_device())
     p.add_argument('--epochs', type=int, default=3)
     p.add_argument('--batch-size', type=int, default=2)
@@ -656,6 +670,12 @@ def finetune_main(argv=None):
     args = p.parse_args(argv)
     if args.output.exists() or args.output.resolve() == args.base_model.resolve():
         p.error('--output must be a new path distinct from the base model')
+    progress_path = args.log_progress or Path(str(args.output) + '.progress.csv')
+    validation_path = Path(str(progress_path) + '.validation.csv')
+    if progress_path.exists() or validation_path.exists():
+        p.error('Progress and validation log paths must not already exist')
+    if progress_path.resolve() in (args.output.resolve(), args.base_model.resolve(), args.tokenizer.resolve()):
+        p.error('Progress log must be distinct from model and tokenizer paths')
     if args.epochs < 1 or args.batch_size < 1 or not 0 < args.lr or not 0 < args.validation_fraction < 1:
         p.error('epochs, batch size, learning rate and validation fraction must be positive; validation fraction must be below 1')
     files = sorted(args.data.rglob('*.txt'))
@@ -671,6 +691,8 @@ def finetune_main(argv=None):
     tok.load(str(args.tokenizer))
     if not tok.preserve_whitespace:
         p.error('Fine-tuning requires a whitespace-preserving tokenizer')
+    if not args.response_end_marker or tok.decode(tok.encode(args.response_end_marker)) != args.response_end_marker:
+        p.error('Response end marker must be nonempty and exactly representable by the tokenizer')
     if tok.vocab_size != cfg['vocab_size'] or not tok.vocab or max(tok.vocab.values()) >= cfg['vocab_size']:
         p.error('Tokenizer vocabulary does not match checkpoint; use the exact pretraining tokenizer')
     model = TinyGPT(qk_norm=cfg.get('qk_norm', False),
@@ -678,13 +700,15 @@ def finetune_main(argv=None):
                     **{name: cfg[name] for name in ('vocab_size', 'context_length', 'd_model', 'n_heads', 'num_layers')}).to(args.device)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    prepare_progress_log(progress_path)
+    print(f'Training progress: {progress_path}; validation: {validation_path}', flush=True)
     step = 0
     print(f'Fine-tuning {len(training):,} examples; validating on {len(validation):,}.', flush=True)
     for epoch in range(args.epochs):
         rng.shuffle(training)
         model.train()
         total = count = 0
-        for x, y in finetune_batches(training, tok, cfg['context_length'], args.batch_size):
+        for x, y in finetune_batches(training, tok, cfg['context_length'], args.batch_size, args.response_end_marker):
             x, y = x.to(args.device), y.to(args.device)
             optimizer.zero_grad(set_to_none=True)
             if model.moe:
@@ -693,25 +717,33 @@ def finetune_main(argv=None):
                 logits, aux = model(x), 0
             loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
             (loss + model.moe_aux_loss_weight * aux).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
             optimizer.step()
             n = (y != -100).sum().item()
             total += loss.item() * n
             count += n
             step += 1
+            write_progress_row(progress_path, [epoch + 1, step, loss.item(), total / count, '', args.lr, grad_norm.item()])
             if step % 100 == 0:
                 print(f'Epoch {epoch + 1} step {step}: response loss {total / count:.4f}', flush=True)
         model.eval()
         val_total = val_count = 0
         with torch.no_grad():
-            for x, y in finetune_batches(validation, tok, cfg['context_length'], args.batch_size):
+            for x, y in finetune_batches(validation, tok, cfg['context_length'], args.batch_size, args.response_end_marker):
                 x, y = x.to(args.device), y.to(args.device)
                 logits = model(x)
                 loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), reduction='sum')
                 val_total += loss.item()
                 val_count += (y != -100).sum().item()
         print(f'Epoch {epoch + 1}: train response loss {total / count:.4f}; validation response loss {val_total / val_count:.4f}', flush=True)
-        save_checkpoint(str(args.output), model, optimizer, epoch + 1, val_total / val_count, step)
+        val_loss = val_total / val_count
+        with validation_path.open('a', newline='') as output:
+            writer = csv.writer(output)
+            if epoch == 0:
+                writer.writerow(['epoch', 'global_step', 'validation_loss', 'perplexity', 'tokens'])
+            writer.writerow([epoch + 1, step, val_loss, math.exp(val_loss), val_count])
+        save_checkpoint(str(args.output), model, optimizer, epoch + 1, val_total / val_count, step,
+                        response_end_marker=args.response_end_marker)
         print(f'Saved {args.output}', flush=True)
 
 

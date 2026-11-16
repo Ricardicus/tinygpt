@@ -27,6 +27,8 @@ def main(argv=None):
                         help="Sampling temperature; 0 is greedy (default: 1).")
     parser.add_argument("--top-k", type=int, default=0,
                         help="Sample from the top K tokens; 0 uses all tokens (default: 0).")
+    parser.add_argument("--show-end-marker", action="store_true",
+                        help="Show the checkpoint's response end marker when generated.")
     args = parser.parse_args(argv)
     if not math.isfinite(args.temperature) or args.temperature < 0 or args.top_k < 0:
         parser.error("--temperature must be finite and nonnegative; --top-k must be nonnegative")
@@ -68,7 +70,9 @@ def main(argv=None):
     if args.seed is not None:
         torch.manual_seed(args.seed)
     result = generate(model, tokenizer, prompt, args.max_new_tokens, args.device,
-                      temperature=args.temperature, top_k=args.top_k)
+                      temperature=args.temperature, top_k=args.top_k,
+                      response_end_marker=checkpoint.get('response_end_marker'),
+                      show_end_marker=args.show_end_marker)
     if not tokenizer.preserve_whitespace:
         result = result.replace(tokenizer.get_end_of_word_mark(), " ")
     print(result)

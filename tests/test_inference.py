@@ -15,6 +15,21 @@ from tinygpt import TinyGPT
 
 
 class InferenceTests(unittest.TestCase):
+    def test_show_end_marker_only_when_generated(self):
+        class FixedModel(torch.nn.Module):
+            context_length = 4
+
+            def forward(self, inputs):
+                return torch.tensor([0., 1.]).expand(1, inputs.shape[1], 2)
+
+        tokenizer = Mock()
+        tokenizer.encode.return_value = [0]
+        tokenizer.decode.side_effect = lambda ids: ''.join(['prompt', 'answer<end>extra'][token] for token in ids)
+        model = FixedModel()
+        self.assertEqual(generate(model, tokenizer, 'prompt', 2, temperature=0, response_end_marker='<end>'), 'promptanswer')
+        self.assertEqual(generate(model, tokenizer, 'prompt', 2, temperature=0, response_end_marker='<end>', show_end_marker=True), 'promptanswer<end>')
+        self.assertEqual(generate(model, tokenizer, 'prompt', 0, temperature=0, response_end_marker='<end>', show_end_marker=True), 'prompt')
+
     def test_sampling_filters_unlikely_tokens_and_supports_greedy_generation(self):
         class FixedModel(torch.nn.Module):
             context_length = 2
