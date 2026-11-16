@@ -5,6 +5,7 @@ import re
 import heapq
 from collections import Counter, OrderedDict
 from datetime import timedelta, datetime
+from corpus import text_chunks
 
 
 class BPE:
@@ -66,15 +67,16 @@ class BPE:
         self.character_freq.update(text)
         self.alphabet.update(text)
 
-    def restrict_alphabet(self, max_symbols):
+    def restrict_alphabet(self, max_symbols, keep_chars=""):
         """Keep frequent characters and map excluded characters to one token."""
         required = set(" \t\r\n'\"<->?!:")
+        required.update(keep_chars)
         if max_symbols < len(required) + 1:
-            raise ValueError(f"Alphabet cap must allow at least {len(required) + 1} base tokens")
+            raise ValueError(f"Alphabet cap must allow at least {len(required) + 1} base tokens for required characters and <unk>")
         # Preserve ordinary printable ASCII when the cap has enough room.
         ascii_chars = {chr(code) for code in range(32, 127)} | set("\t\r\n")
-        if max_symbols >= len(ascii_chars) + 1:
-            required = ascii_chars
+        if max_symbols >= len(required | ascii_chars) + 1:
+            required |= ascii_chars
         candidates = sorted(self.base_alphabet() - required,
                             key=lambda char: (-self.character_freq[char], char))
         allowed = required | set(candidates[:max_symbols - len(required) - 1])
@@ -353,6 +355,7 @@ def getBPE(
     character_sources=(),
     bpe_alphabet_policy="limit",
     bpe_max_chars=0,
+    bpe_keep_chars="",
 ):
     """Load existing tokenizer or train a new one."""
     if tokenizer_path and os.path.exists(tokenizer_path):
@@ -363,6 +366,8 @@ def getBPE(
             lower_case=lower_case,
         )
         bpe.load()
+        if bpe_keep_chars:
+            print('Using an existing tokenizer; --bpe-keep-chars cannot change its vocabulary.', flush=True)
         if verbose:
             print(f"Using existing tokenizer from '{tokenizer_path}'")
         return bpe
@@ -378,9 +383,13 @@ def getBPE(
     bpe = BPE(
         vocab_size=vocab_size,
         verbose=verbose,
-        model_file=(tokenizer_path or default_tokenizer),
+        model_file=(tokenizer_path or "bpe_model.json"),
         lower_case=lower_case,
     )
+    keep_chars = bpe_keep_chars.lower() if lower_case else bpe_keep_chars
+    bpe.alphabet.update(keep_chars)
+    if bpe_max_chars and len(set(" \t\r\n'\"<->?!:") | set(keep_chars)) + 1 > bpe_max_chars:
+        raise ValueError('--bpe-max-chars is too small for required characters and <unk>')
     if verbose:
         if tokenizer_path:
             print(
@@ -426,7 +435,7 @@ def getBPE(
         cap = bpe_max_chars or max(len(set(" \t\r\n'\"<->?!:")) + 1, bpe.vocab_size // 2)
         if cap >= bpe.vocab_size:
             raise ValueError("Vocabulary is too small to hold reserved symbols plus merges")
-        bpe.restrict_alphabet(cap)
+        bpe.restrict_alphabet(cap, keep_chars=keep_chars)
         print(f"Limiting BPE base alphabet from {base_size:,} to {len(bpe.base_alphabet()):,} tokens. "
               f"Less frequent characters map to <unk>; vocabulary stays at {bpe.vocab_size:,}.", flush=True)
     elif bpe_alphabet_policy == "expand" and base_size >= bpe.vocab_size:

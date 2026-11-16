@@ -199,6 +199,48 @@ def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0, lr
             os.unlink(temporary)
 
 
+def minify_main(argv=None):
+    parser = argparse.ArgumentParser(prog='main.py minify', description='Export a checkpoint without optimizer state for inference or fresh fine-tuning.')
+    parser.add_argument('--model', type=Path, required=True, help='Existing checkpoint')
+    parser.add_argument('--output', type=Path, required=True, help='New output file; never overwrites an existing file')
+    args = parser.parse_args(argv)
+    if args.model.resolve() == args.output.resolve():
+        parser.error('--output must be distinct from --model')
+    if not args.model.is_file():
+        parser.error('--model must be an existing file')
+    if args.output.exists():
+        parser.error('--output must not already exist')
+    try:
+        checkpoint = torch.load(args.model, map_location='cpu', weights_only=True, mmap=True)
+    except RuntimeError as error:
+        if 'mmap can only be used' not in str(error):
+            raise
+        checkpoint = torch.load(args.model, map_location='cpu', weights_only=True)
+    if not isinstance(checkpoint, dict):
+        parser.error('Expected a checkpoint dictionary or model state dictionary')
+    if 'model_state_dict' in checkpoint:
+        if not isinstance(checkpoint['model_state_dict'], dict):
+            parser.error('Invalid model_state_dict in checkpoint')
+        keys = ('model_state_dict', 'config', 'response_end_marker', 'epoch', 'step', 'global_step', 'loss')
+        result = {key: checkpoint[key] for key in keys if key in checkpoint}
+    elif checkpoint and all(isinstance(value, torch.Tensor) for value in checkpoint.values()):
+        result = checkpoint
+    else:
+        parser.error('No model state found in checkpoint')
+    try:
+        with args.output.open('xb') as output:
+            try:
+                torch.save(result, output)
+            except BaseException:
+                output.close()
+                args.output.unlink()
+                raise
+    except FileExistsError:
+        parser.error('--output must not already exist')
+    print(f'Saved {args.output} ({args.output.stat().st_size:,} bytes; source {args.model.stat().st_size:,} bytes).')
+    print('Optimizer state and learning-rate schedule are not included; resuming training uses a fresh optimizer.')
+
+
 PROGRESS_COLUMNS = ["epoch", "step", "loss", "mean_loss", "validation_loss", "lr", "grad_norm"]
 
 
@@ -389,7 +431,7 @@ def default_device():
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Train TinyGPT using a BPE tokenizer with streaming data. Use `main.py finetune --help` for supervised fine-tuning."
+        description="Train TinyGPT using a BPE tokenizer with streaming data. Use `main.py finetune --help` for supervised fine-tuning or `main.py minify --help` for checkpoint export."
     )
     parser.add_argument(
         "--tokenizer",
@@ -514,6 +556,8 @@ def parse_args(argv=None):
                         help="New tokenizer behavior when characters exceed vocabulary capacity: limit rare characters to <unk> (default), expand vocabulary, or error.")
     parser.add_argument("--bpe-max-chars", type=int, default=0,
                         help="Optional base alphabet token cap, including reserved symbols and <unk>, for policy limit; 0 caps to half the vocabulary only when it overflows.")
+    parser.add_argument("--bpe-keep-chars", default="", metavar="TEXT",
+                        help="Characters to guarantee in a newly trained tokenizer, even when limiting the alphabet.")
     parser.add_argument(
         "--prompt",
         type=str,
@@ -757,6 +801,8 @@ def main(argv=None):
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] == "finetune":
         return finetune_main(arguments[1:])
+    if arguments and arguments[0] == "minify":
+        return minify_main(arguments[1:])
     args = parse_args(arguments)
 
     # ---------------------------------------------------------
@@ -985,6 +1031,7 @@ def main(argv=None):
         character_sources=validation_files or (),
         bpe_alphabet_policy=args.bpe_alphabet_policy,
         bpe_max_chars=args.bpe_max_chars,
+        bpe_keep_chars=args.bpe_keep_chars,
     )
     args.vocab_size = bpe.vocab_size
 

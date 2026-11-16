@@ -3,6 +3,21 @@
 Build your own language model on your own data.
 BPE tokenizer, only supports pretraining, no RL.
 
+## Smaller inference checkpoints
+
+To export a checkpoint without its optimizer state or learning-rate schedule:
+
+```bash
+python main.py minify --model path/to/model.pt --output path/to/model-small.pt
+```
+
+The output must be a new file. Model weights, architecture, response end marker,
+and progress metadata are retained; weights are not quantized. The original file
+is unchanged. Keep the matching tokenizer separately. The exported checkpoint
+works for inference and as a fine-tuning base, but cannot resume the original
+optimizer or learning-rate schedule. Continuing pretraining uses a fresh optimizer
+and may retain the saved epoch and step counters.
+
 ## How 
 
 ```bash
@@ -76,6 +91,18 @@ reserved symbols and `<unk>`), even when the full alphabet would fit. The defaul
 `0` chooses a cap automatically only when the alphabet overflows. Use
 `--bpe-alphabet-policy expand` to preserve all observed characters by growing the
 target to a power of two, or `--bpe-alphabet-policy error` to stop on overflow.
+For example, reserve Swedish and Spanish characters while limiting the alphabet:
+
+```bash
+--lower-case false --bpe-max-chars 256 --bpe-keep-chars 'åäöÅÄÖáéíóúüñ¿¡ÁÉÍÓÚÜÑ'
+```
+
+These characters are retained even if absent from the sampled corpus; other
+characters outside the cap map to `<unk>`. The cap includes the reserved
+characters, whitespace, punctuation and `<unk>`. If it is too small for the
+requested characters, training fails. With lower-casing enabled, requested
+characters are lower-cased too. This option only affects new tokenizers; it
+cannot modify an existing tokenizer or make it compatible with an old model.
 These options apply only to a new tokenizer. Existing tokenizers retain their
 saved size and fallback policy. To switch from an existing 32,768-token tokenizer
 to 8,192 tokens, select fresh `--tokenizer` and `--model` paths and restart model
@@ -393,10 +420,14 @@ pip install -r requirements.txt
 python other/download_datasets.py
 ```
 
-Available sources are English Wikipedia, Dolly 15k, Alpaca, FineWeb-Edu, Project
+Available sources are Wikipedia, Dolly 15k, Alpaca, FineWeb-Edu, Project
 Gutenberg's full book catalog, and OpenBallast T2 textbook passages. Use **Up/Down** to move,
 **Space** to toggle a source, **A** to select/deselect all, **E** to edit its
-limit, **F** for `full`, **L** for Gutenberg languages, and **O** to edit the output folder. **Ctrl-U** clears
+limit, **F** for `full`, **W** for Wikipedia languages and per-language limits,
+**L** for Gutenberg languages, and **O** to edit the output folder. For example,
+enter `en=10,sv=2,fr=full` on the Wikipedia language prompt. Language codes
+must correspond to configurations available in the pinned Wikimedia snapshot.
+**Ctrl-U** clears
 an edit field. Press **Enter** to review the selection, then **Enter** again to
 download; **B** returns to editing and **Q** cancels. The suggested folder includes
 the source names and limits, for example
@@ -427,6 +458,7 @@ Download Wikipedia directly without the wizard:
 ```bash
 python other/download_datasets.py --wikipedia full --output datasets/wikipedia-full
 python other/download_datasets.py --wikipedia 5 --output datasets/wikipedia-5gb
+python other/download_datasets.py --wikipedia-language en=10 --wikipedia-language sv=2 --output datasets/wikipedia-en-sv
 python other/download_datasets.py --ballast-t2 full --output datasets/ballast-t2
 ```
 

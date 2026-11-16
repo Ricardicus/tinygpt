@@ -16,6 +16,7 @@ import io
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import sqlite3
@@ -31,7 +32,7 @@ else:
 
 # A small registry keeps adding sources independent of the selection UI.
 SOURCES = {
-    "wikipedia": {"label": "Wikipedia (English, complete 2023-11-01 snapshot)", "default": "0.25",
+    "wikipedia": {"label": "Wikipedia (2023-11-01 snapshot)", "default": "0.25",
                   "dataset": wikipedia.DATASET, "config": wikipedia.CONFIG,
                   "revision": wikipedia.REVISION,
                   "url": "https://huggingface.co/datasets/wikimedia/wikipedia"},
@@ -50,6 +51,31 @@ SOURCES = {
                "dataset": "tatsu-lab/alpaca", "config": None, "license": "cc-by-nc-4.0",
                "url": "https://huggingface.co/datasets/tatsu-lab/alpaca"},
 }
+
+
+def source_spec(name):
+    if name.startswith('wikipedia@'):
+        language = name.removeprefix('wikipedia@')
+        if not re.fullmatch(r'[a-z][a-z0-9-]{0,19}', language):
+            raise ValueError(f'Invalid Wikipedia language code: {language}')
+        return {**SOURCES['wikipedia'], 'label': f'Wikipedia ({language}, 2023-11-01 snapshot)',
+                'config': f'20231101.{language}'}
+    return SOURCES[name]
+
+
+def wikipedia_selections(value):
+    selected = {}
+    for item in value.split(','):
+        parts = item.strip().split('=', 1)
+        if len(parts) != 2:
+            raise ValueError('Use language=GB or language=full, separated by commas')
+        language, limit = (part.strip().lower() for part in parts)
+        name = 'wikipedia@' + language
+        source_spec(name)
+        if name in selected:
+            raise ValueError(f'Duplicate Wikipedia language: {language}')
+        selected[name] = parse_limit(limit)
+    return selected
 
 
 def parse_limit(value):
@@ -99,12 +125,21 @@ def plain_plan():
         except ValueError:
             print(f"Enter numbers from 1 to {len(names)} separated by commas, or all.")
     print("Limits are saved text in decimal GB, not RAM, network traffic or caches.")
-    print("Wikipedia full = all English articles in the 2023-11-01 text snapshot.")
+    print("Wikipedia uses language-specific 2023-11-01 snapshots.")
     print("Gutenberg's GB target is soft: the final book is saved in full, even above the target.")
     print("Full FineWeb-Edu is a very large collection. Gutenberg full = all selected-language books.")
     languages = plain_languages() if "gutenberg" in selected_names else ("en",)
     selected = {}
     for name in selected_names:
+        if name == 'wikipedia':
+            while True:
+                value = input('Wikipedia languages and limits (e.g. en=0.25,sv=1) [en=0.25]: ').strip() or 'en=0.25'
+                try:
+                    selected.update(wikipedia_selections(value))
+                    break
+                except ValueError as error:
+                    print(error)
+            continue
         while True:
             value = input(f"{SOURCES[name]['label']} - GB or full [{SOURCES[name]['default']}]: ")
             try:
@@ -139,6 +174,7 @@ def tui_plan():
         message = ""
         reviewing = False
         languages = ("en",)
+        wiki_limits = None
 
         def put(row, value, attr=0):
             height, width = stdscr.getmaxyx()
@@ -171,17 +207,19 @@ def tui_plan():
 
         while True:
             stdscr.erase()
-            selected = {name: parse_limit(limits[name]) for name in names if name in checked}
+            selected = {name: parse_limit(limits[name]) for name in names if name in checked and not (name == 'wikipedia' and wiki_limits is not None)}
+            if 'wikipedia' in checked and wiki_limits is not None:
+                selected.update(wiki_limits)
             put(0, "TinyGPT | Dataset downloader", curses.A_BOLD)
             put(2, "Up/Down: move   Space: select   A: all/none   E: edit GB   F: full")
-            put(3, "L: Gutenberg languages   O: output folder   Enter: review/start   Q: cancel")
+            put(3, "W: Wikipedia languages   L: Gutenberg languages   O: folder   Enter: review   Q: cancel")
             for index, name in enumerate(names):
                 attr = curses.A_REVERSE if cursor == index else 0
                 put(5 + index, f" [{'x' if name in checked else ' '}] {SOURCES[name]['label']:<45} {limits[name]}" + (" GB" if limits[name] != "full" else ""), attr)
             info_row = 6 + len(names)
             put(info_row, "GB = saved UTF-8 text; RAM, network traffic and caches are extra.")
             put(info_row + 1, "Gutenberg languages: " + ", ".join(languages) + " (L to change; default English)")
-            put(info_row + 2, "Gutenberg GB is a soft target: finish the final book, then stop.")
+            put(info_row + 2, "Wikipedia: " + (', '.join(f'{key.split("@", 1)[1]}={"full" if value is None else f"{value / 1e9:g}"}' for key, value in wiki_limits.items()) if wiki_limits is not None else 'en=' + limits['wikipedia']) + ' (W to edit)')
             put(info_row + 3, "Folder: " + (folder or (default_folder(selected, languages) if selected else "(select a source)")))
             put(info_row + 5, "REVIEW: Enter starts downloading; B returns to editing." if reviewing else message,
                 curses.A_BOLD)
@@ -208,6 +246,8 @@ def tui_plan():
             elif key in ("a", "A"):
                 checked = set() if len(checked) == len(names) else set(names)
             elif key in ("f", "F"):
+                if names[cursor] == 'wikipedia':
+                    wiki_limits = None
                 limits[names[cursor]] = "full"
             elif key in ("e", "E"):
                 name = names[cursor]
@@ -215,6 +255,8 @@ def tui_plan():
                 try:
                     cap = parse_limit(value)
                     limits[name] = "full" if cap is None else format(Decimal(cap) / 1_000_000_000, "f")
+                    if name == 'wikipedia':
+                        wiki_limits = None
                     message = ""
                 except ValueError as error:
                     message = str(error)
@@ -227,6 +269,13 @@ def tui_plan():
                     message = ""
                 except (OSError, ValueError) as error:
                     message = f"Catalog unavailable: {error}"
+            elif key in ('w', 'W'):
+                initial = ','.join(f'{name.split("@", 1)[1]}={"full" if cap is None else format(Decimal(cap) / 1_000_000_000, "f")}' for name, cap in wiki_limits.items()) if wiki_limits is not None else 'en=' + limits['wikipedia']
+                try:
+                    wiki_limits = wikipedia_selections(edit('Wikipedia languages (en=1,sv=full): ', initial))
+                    message = ''
+                except ValueError as error:
+                    message = str(error)
             elif key in ("o", "O"):
                 folder = edit("Folder (blank = automatic, Ctrl-U clears): ", folder).strip()
             elif key in ("\n", "\r", curses.KEY_ENTER):
@@ -245,7 +294,7 @@ def tui_plan():
 def print_plan(selected, root, languages=("en",)):
     print(f"\nOutput: {root}")
     for name, limit in selected.items():
-        print(f"  {SOURCES[name]['label']}: {'full' if limit is None else f'{limit / 1e9:g} GB'}")
+        print(f"  {source_spec(name)['label']}: {'full' if limit is None else f'{limit / 1e9:g} GB'}")
     if "wikipedia" in selected:
         print("  Wikipedia: all extracted English article text; 6,407,814 source articles.")
         print("  Snapshot metadata: about 11.63 GB compressed / 20.20 GB dataset size.")
@@ -399,7 +448,7 @@ def source_records(name, provenance, languages=("en",), completed_ids=()):
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     from datasets import load_dataset
     from huggingface_hub import HfApi
-    source = SOURCES[name]
+    source = source_spec(name)
     revision = provenance.get("revision") or source.get("revision") or HfApi().dataset_info(source["dataset"]).sha
     provenance.update(dataset=source["dataset"], config=source["config"], revision=revision)
     if "license" in source:
@@ -423,7 +472,7 @@ def record_text(name, record):
         parts.append("### Response\n" + response.strip())
         return "\n\n".join(parts) + "\n\n"
     text = record.get("text", "")
-    if name in ("gutenberg", "wikipedia", "ballast-t2"):
+    if name in ("gutenberg", "wikipedia", "ballast-t2") or name.startswith('wikipedia@'):
         if not isinstance(text, str):
             return ""
         text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -441,8 +490,13 @@ def restore_download(root, summary, hashes):
     last_report = time.monotonic()
     verified_files = verified_bytes = 0
     selected = summary["limits_bytes"]
-    if not selected or any(name not in SOURCES for name in selected):
+    if not selected:
         raise ValueError("Unrecognized dataset sources in the saved summary")
+    try:
+        for name in selected:
+            source_spec(name)
+    except (KeyError, ValueError):
+        raise ValueError("Unrecognized dataset sources in the saved summary") from None
     counts = {name: Counter(summary.get("counts", {}).get(name, {})) for name in selected}
     for count in counts.values():
         count.update(files=-count["files"], bytes=-count["bytes"])
@@ -542,10 +596,10 @@ def prepare(selected, root, languages=("en",), resume=False):
                     print(f"{name}: already finished; reusing {counts['files']:,} verified documents.", flush=True)
                     continue
                 summary["counts"][name] = counts
-                provenance = summary["sources"].get(name, {"url": SOURCES[name]["url"]})
+                provenance = summary["sources"].get(name, {"url": source_spec(name)["url"]})
                 summary["sources"][name] = provenance
                 wikipedia.write_json(summary_path, summary)
-                print(f"\n{SOURCES[name]['label']}: connecting...", flush=True)
+                print(f"\n{source_spec(name)['label']}: connecting...", flush=True)
                 records = (source_records(name, provenance, languages, completed_books) if name == "gutenberg" and resume
                            else source_records(name, provenance, languages) if name == "gutenberg"
                            else source_records(name, provenance))
@@ -617,7 +671,7 @@ def prepare(selected, root, languages=("en",), resume=False):
                 "Full means all available records at the recorded source revision/catalog,\n"
                 "after exact deduplication. FineWeb-Edu uses prose filtering.\n"
                 "Wikipedia preserves complete extracted article text, including stubs and lists,\n"
-                "from the English 2023-11-01 snapshot (not live Wikipedia or revision history).\n"
+                "from the selected 2023-11-01 language snapshots (not live Wikipedia or revision history).\n"
                 "Gutenberg keeps book notices.\n"
                 "Dolly and Alpaca retain instruction/context/response sections, including short answers.\n"
                 "Alpaca is licensed CC BY-NC 4.0; check its dataset card before use.\n"
@@ -628,7 +682,7 @@ def prepare(selected, root, languages=("en",), resume=False):
                 "See metadata/summary.json for source revisions, limits and actual totals,\n"
                 "and metadata/files.jsonl for document URLs, IDs and hashes. Keep metadata\n"
                 "for attribution; source cards describe dataset and underlying content licenses.\n" +
-                "\n".join(f"- {SOURCES[name]['label']}: {SOURCES[name]['url']}" for name in selected) + "\n",
+                "\n".join(f"- {source_spec(name)['label']}: {source_spec(name)['url']}" for name in selected) + "\n",
                 encoding="utf-8")
             summary["status"] = "complete"
         except BaseException as error:
@@ -652,6 +706,8 @@ def main(argv=None):
     parser.add_argument("--resume", type=Path, metavar="FOLDER", help="Verify and continue a failed/interrupted download using its saved selections")
     parser.add_argument("--wikipedia", type=parse_limit, default=argparse.SUPPRESS, metavar="GB_OR_FULL",
                         help="Download English Wikipedia without prompts: a positive decimal GB amount or full")
+    parser.add_argument('--wikipedia-language', action='append', default=[], metavar='CODE=GB_OR_FULL',
+                        help='Wikipedia language and per-language limit; repeat or separate with commas')
     parser.add_argument("--ballast-t2", type=parse_limit, default=argparse.SUPPRESS, metavar="GB_OR_FULL",
                         help="Download OpenBallast T2 without prompts: a positive decimal GB amount or full")
     parser.add_argument("--alpaca", type=parse_limit, default=argparse.SUPPRESS, metavar="GB_OR_FULL",
@@ -660,6 +716,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     direct = {name: getattr(args, name.replace('-', '_')) for name in ('wikipedia', 'ballast-t2', 'alpaca')
               if hasattr(args, name.replace('-', '_'))}
+    try:
+        for item in args.wikipedia_language:
+            choices = wikipedia_selections(item)
+            if direct.keys() & choices.keys() or ('wikipedia' in direct and 'wikipedia@en' in choices):
+                raise ValueError('Duplicate Wikipedia language selection')
+            direct.update(choices)
+    except ValueError as error:
+        parser.error(str(error))
     if args.resume and (direct or args.output):
         parser.error("--resume cannot be combined with source options or --output")
     if args.output and not direct:

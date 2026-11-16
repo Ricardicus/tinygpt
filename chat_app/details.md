@@ -11,7 +11,21 @@ Open http://127.0.0.1:8000. The default checkpoint is
 `artifacts-2026-11-02/tokenizer.json`. Select different files with `--model`
 and `--tokenizer`; use the tokenizer used to train the checkpoint. Choose a
 device with `--device cpu` or `--device cuda`, and change the port with `--port`.
-The server loads the model at startup; restart it to load a newer checkpoint.
+To choose among checkpoints, put `.pt` files in one directory and run:
+
+```bash
+venv/bin/python chat_app/server.py --model-dir path/to/checkpoints --tokenizer path/to/tokenizer.json
+```
+
+The first filename alphabetically loads at startup, or pass `--model` with a
+checkpoint inside that directory to choose the initial model. Select a model in
+the chat header; use the refresh button to discover files added later. To reload
+an updated checkpoint, select another model and switch back, or restart the server.
+Without `--model-dir`, the initial model's folder
+is used. All selectable models must use the exact same tokenizer supplied at
+startup. Equal vocabulary sizes alone do not establish tokenizer compatibility.
+Switching may temporarily require memory for both models; a failed load leaves
+the previous model active. Switching affects all clients connected to the server.
 
 Chats are stored locally in `chat_app/chats.sqlite3`. Use `--database` to select
 another location. Use the delete button beside a conversation in the sidebar to

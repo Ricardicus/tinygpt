@@ -56,6 +56,9 @@ class ChatAppTests(unittest.TestCase):
             config = dict(vocab_size=64, context_length=16, d_model=8, n_heads=2, num_layers=1)
             model = TinyGPT(**config)
             torch.save({'config': config, 'model_state_dict': model.state_dict(), 'epoch': 1}, root / 'model.pt')
+            torch.save({'config': config, 'model_state_dict': model.state_dict(), 'epoch': 2, 'response_end_marker': '<end>'}, root / 'second.pt')
+            bad_config = {**config, 'vocab_size': 32}
+            torch.save({'config': bad_config, 'model_state_dict': {}}, root / 'bad.pt')
             server = ChatServer(('127.0.0.1', 0), root / 'model.pt', root / 'tokenizer.json', root / 'chats.db', 'cpu')
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -68,6 +71,15 @@ class ChatAppTests(unittest.TestCase):
 
             try:
                 self.assertEqual(request('/api/info')['epoch'], 1)
+                self.assertEqual(request('/api/models')['models'], ['bad.pt', 'model.pt', 'second.pt'])
+                self.assertEqual(request('/api/models/select', {'model': 'second.pt'})['epoch'], 2)
+                self.assertEqual(request('/api/info')['response_end_marker'], '<end>')
+                self.assertEqual(request('/api/models')['current'], 'second.pt')
+                for name in ('../outside.pt', 'bad.pt'):
+                    with self.assertRaises(HTTPError) as error:
+                        request('/api/models/select', {'model': name})
+                    self.assertEqual(error.exception.code, 400)
+                self.assertEqual(request('/api/info')['epoch'], 2)
                 chat = request('/api/chats', {})['id']
                 body = json.dumps({'chat_id': chat, 'content': 'Hello', 'max_tokens': 2, 'temperature': 0}).encode()
                 with urlopen(Request(base + '/api/message/stream', data=body, headers={'Content-Type': 'application/json'})) as response:
@@ -78,6 +90,8 @@ class ChatAppTests(unittest.TestCase):
                 self.assertEqual([message['role'] for message in messages], ['user', 'assistant'])
                 self.assertEqual(messages[1]['content'], answer)
                 self.assertEqual(request('/api/chats')[0]['title'], 'Hello')
+                request('/api/models/select', {'model': 'model.pt'})
+                self.assertEqual(request(f'/api/chats/{chat}'), messages)
                 other = request('/api/chats', {})['id']
                 with urlopen(Request(base + f'/api/chats/{chat}', method='DELETE')) as response:
                     self.assertTrue(json.load(response)['deleted'])

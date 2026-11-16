@@ -14,6 +14,46 @@ from tinygpt import TinyGPT
 
 
 class CheckpointTests(unittest.TestCase):
+    def test_minify_preserves_weights_and_inference_metadata(self):
+        model = TinyGPT(20, 4, 12, 3, 1)
+        optimizer = torch.optim.AdamW(model.parameters())
+        model(torch.tensor([[1, 2, 3, 4]])).square().mean().backward()
+        optimizer.step()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source.pt'
+            target = Path(directory) / 'small.pt'
+            training.save_checkpoint(source, model, optimizer, 1, 1.5, 5, response_end_marker='<end>')
+            with contextlib.redirect_stdout(io.StringIO()):
+                training.main(['minify', '--model', str(source), '--output', str(target)])
+            original = torch.load(source, weights_only=True)
+            result = torch.load(target, weights_only=True)
+            self.assertNotIn('optimizer_state_dict', result)
+            self.assertNotIn('lr_schedule', result)
+            self.assertEqual(result['config'], original['config'])
+            self.assertEqual(result['response_end_marker'], '<end>')
+            self.assertEqual(result['global_step'], 5)
+            for name, tensor in model.state_dict().items():
+                torch.testing.assert_close(result['model_state_dict'][name], tensor, rtol=0, atol=0)
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                training.main(['minify', '--model', str(source), '--output', str(target)])
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                training.main(['minify', '--model', str(source), '--output', str(source)])
+            self.assertIn('optimizer_state_dict', torch.load(source, weights_only=True))
+
+    def test_minify_accepts_legacy_state_dict_and_cleans_failed_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source.pt'
+            target = Path(directory) / 'small.pt'
+            torch.save({'weight': torch.ones(2)}, source, _use_new_zipfile_serialization=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                training.main(['minify', '--model', str(source), '--output', str(target)])
+            torch.testing.assert_close(torch.load(target, weights_only=True)['weight'], torch.ones(2))
+            failed = Path(directory) / 'failed.pt'
+            with patch.object(training.torch, 'save', side_effect=OSError('disk full')):
+                with self.assertRaises(OSError):
+                    training.main(['minify', '--model', str(source), '--output', str(failed)])
+            self.assertFalse(failed.exists())
+
     def test_beta_arguments(self):
         args = training.parse_args([])
         self.assertIsNone(args.beta1)

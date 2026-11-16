@@ -209,7 +209,7 @@ tests = [
             "cold",
             "down",
             "small",
-            ["sad", "unhappiness"],
+            ["sad", "unhappiness", "not happy"],
             "slow",
             "dark",
             "old",

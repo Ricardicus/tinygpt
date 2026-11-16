@@ -31,34 +31,53 @@ def format_prompt(messages):
 
 
 class ChatServer(ThreadingHTTPServer):
-    def __init__(self, address, model_path, tokenizer_path, database, device):
+    def __init__(self, address, model_path, tokenizer_path, database, device, model_dir=None):
         super().__init__(address, Handler)
         self.database = database
         self.lock = threading.Lock()
         self.device = device
+        self.model_dir = Path(model_dir or Path(model_path).parent).resolve()
+        self.tokenizer_path = Path(tokenizer_path).resolve()
         self.response_end_marker = None
         self.tokenizer = BPE()
         self.tokenizer.load(str(tokenizer_path))
+        self.load_model(Path(model_path))
+        with self.connect() as db:
+            db.executescript('CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY, title TEXT NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP);'
+                             'CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL);')
+
+    def available_models(self):
+        return sorted(path.name for path in self.model_dir.glob('*.pt')
+                      if path.is_file() and path.resolve().parent == self.model_dir)
+
+    def load_model(self, model_path):
         checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
-        self.response_end_marker = checkpoint.get('response_end_marker')
         config = checkpoint['config']
         if (not self.tokenizer.preserve_whitespace or not self.tokenizer.vocab
                 or self.tokenizer.vocab_size != config['vocab_size']
                 or min(self.tokenizer.vocab.values()) < 0
                 or max(self.tokenizer.vocab.values()) >= config['vocab_size']):
             raise ValueError('A matching whitespace-preserving tokenizer is required')
-        self.model = TinyGPT(qk_norm=config.get('qk_norm', False),
+        model = TinyGPT(qk_norm=config.get('qk_norm', False),
                              **{key: config.get(key, value) for key, value in MOE_DEFAULTS.items()},
                              **{key: config[key] for key in ('vocab_size', 'context_length', 'd_model', 'n_heads', 'num_layers')})
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.to(device).eval()
-        self.info = {'model': str(model_path), 'tokenizer': str(tokenizer_path), 'device': str(device),
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.to(self.device).eval()
+        info = {'model': str(model_path.resolve()), 'tokenizer': str(self.tokenizer_path), 'device': str(self.device),
                      'config': config, 'epoch': checkpoint.get('epoch'), 'step': checkpoint.get('global_step'),
-                     'parameters': sum(parameter.numel() for parameter in self.model.parameters()),
-                     'response_end_marker': self.response_end_marker}
-        with self.connect() as db:
-            db.executescript('CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY, title TEXT NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP);'
-                             'CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL);')
+                     'parameters': sum(parameter.numel() for parameter in model.parameters()),
+                     'response_end_marker': checkpoint.get('response_end_marker')}
+        self.model = model
+        self.response_end_marker = info['response_end_marker']
+        self.info = info
+
+    def select_model(self, name):
+        if not isinstance(name, str) or name not in self.available_models():
+            raise ValueError('Model must be a .pt file in the configured model directory')
+        path = self.model_dir / name
+        with self.lock:
+            self.load_model(path)
+            return self.info
 
     def connect(self):
         db = sqlite3.connect(self.database, timeout=30)
@@ -131,6 +150,8 @@ class Handler(BaseHTTPRequestHandler):
         with self.server.connect() as db:
             if self.path == '/api/info':
                 return self.respond(200, self.server.info)
+            if self.path == '/api/models':
+                return self.respond(200, {'models': self.server.available_models(), 'current': Path(self.server.info['model']).name})
             if self.path == '/api/chats':
                 return self.respond(200, [dict(id=row[0], title=row[1], created=row[2]) for row in db.execute('SELECT id, title, created FROM chats ORDER BY id DESC')])
             if self.path.startswith('/api/chats/'):
@@ -162,6 +183,8 @@ class Handler(BaseHTTPRequestHandler):
             if length < 1 or length > 100000:
                 raise ValueError('Invalid request size')
             data = json.loads(self.rfile.read(length))
+            if self.path == '/api/models/select':
+                return self.respond(200, self.server.select_model(data['model']))
             if self.path == '/api/chats':
                 with self.server.connect() as db:
                     cursor = db.execute('INSERT INTO chats (title) VALUES (?)', ('New conversation',))
@@ -218,13 +241,26 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--model', type=Path, default=ROOT / 'dolly15k/artifacts/dolly-sft.pt')
+    parser.add_argument('--model', type=Path, help='Initial checkpoint (default: first model in --model-dir, or the Dolly checkpoint)')
+    parser.add_argument('--model-dir', type=Path, help='Directory containing selectable .pt checkpoints')
     parser.add_argument('--tokenizer', type=Path, default=ROOT / 'artifacts-2026-11-02/tokenizer.json')
     parser.add_argument('--database', type=Path, default=Path(__file__).parent / 'chats.sqlite3')
     parser.add_argument('--port', type=int, default=8000)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
-    server = ChatServer(('127.0.0.1', args.port), args.model, args.tokenizer, args.database, args.device)
+    model_dir = args.model_dir.expanduser().resolve() if args.model_dir else None
+    if model_dir and not model_dir.is_dir():
+        parser.error('--model-dir must be an existing directory')
+    model = args.model.expanduser().resolve() if args.model else None
+    if model_dir and model and model.parent != model_dir:
+        parser.error('--model must be inside --model-dir')
+    if model is None and model_dir:
+        models = sorted(path for path in model_dir.glob('*.pt') if path.is_file() and path.resolve().parent == model_dir)
+        if not models:
+            parser.error('--model-dir contains no .pt files')
+        model = models[0]
+    model = model or ROOT / 'dolly15k/artifacts/dolly-sft.pt'
+    server = ChatServer(('127.0.0.1', args.port), model, args.tokenizer, args.database, args.device, model_dir)
     print(f'Open http://127.0.0.1:{args.port}', flush=True)
     server.serve_forever()
 

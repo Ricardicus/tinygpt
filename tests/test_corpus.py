@@ -222,6 +222,23 @@ class CorpusTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 getBPE([], vocab_size=256, bpe_max_chars=cap, verbose=False)
 
+    def test_required_characters_survive_alphabet_limit_and_reload(self):
+        from main import getBPE, parse_args
+        keep = 'åäöÅÄÖáéíóúüñ¿¡ÁÉÍÓÚÜÑ'
+        text = 'hello world ' + ''.join(chr(0x4e00 + index) for index in range(200))
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            path = Path(directory) / 'tokenizer.json'
+            tokenizer = getBPE([text], vocab_size=256, bpe_part=1, bpe_max_chars=128,
+                               bpe_keep_chars=keep, tokenizer_path=path, lower_case=False, verbose=False)
+            self.assertEqual(tokenizer.decode(tokenizer.encode(keep)), keep)
+            self.assertEqual(tokenizer.decode(tokenizer.encode('🦄')), '<unk>')
+            restored = BPE(model_file=path)
+            restored.load()
+            self.assertEqual(restored.decode(restored.encode(keep)), keep)
+        self.assertEqual(parse_args(['--bpe-keep-chars', keep]).bpe_keep_chars, keep)
+        with self.assertRaisesRegex(ValueError, 'too small'):
+            getBPE([text], vocab_size=256, bpe_max_chars=13, bpe_keep_chars=keep, verbose=False)
+
     def test_cache_invalidates_for_corpus_and_tokenizer(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'data'

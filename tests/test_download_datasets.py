@@ -21,6 +21,56 @@ PROSE = (
 
 
 class DownloadDatasetsTests(unittest.TestCase):
+    def test_wikipedia_language_limits_and_stream_configuration(self):
+        selected = builder.wikipedia_selections('en=0.25,sv=full,fr=1')
+        self.assertEqual(selected, {'wikipedia@en': 250_000_000, 'wikipedia@sv': None, 'wikipedia@fr': 1_000_000_000})
+        for value in ('../x=1', 'sv=1,sv=2', 'sv', 'sv=-1'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                builder.wikipedia_selections(value)
+        datasets = Mock()
+        datasets.load_dataset.return_value = [{'text': 'Hej'}]
+        with patch.dict('sys.modules', {'datasets': datasets, 'huggingface_hub': Mock()}):
+            provenance = {}
+            self.assertEqual(list(builder.source_records('wikipedia@sv', provenance)), [{'text': 'Hej'}])
+        datasets.load_dataset.assert_called_once_with('wikimedia/wikipedia', name='20231101.sv',
+                                                     split='train', revision=builder.wikipedia.REVISION, streaming=True)
+        self.assertEqual(provenance['config'], '20231101.sv')
+        with patch.object(builder, 'prepare') as prepare:
+            builder.main(['--wikipedia-language', 'en=0.25', '--wikipedia-language', 'sv=full', '--output', '/tmp/wiki-multi'])
+            prepare.assert_called_once_with({'wikipedia@en': 250_000_000, 'wikipedia@sv': None}, Path('/tmp/wiki-multi'))
+
+    def test_wikipedia_languages_save_and_resume_independently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'multi'
+            english = {'text': 'English text'}
+            swedish = {'text': 'Svensk text'}
+            def interrupted(name, provenance):
+                if name == 'wikipedia@en':
+                    return iter([english])
+                def records():
+                    yield swedish
+                    raise OSError('offline')
+                return records()
+            with patch.object(builder, 'source_records', side_effect=interrupted), self.assertRaises(OSError):
+                builder.prepare({'wikipedia@en': None, 'wikipedia@sv': None}, root)
+            with patch.object(builder, 'source_records', return_value=iter([swedish, {'text': 'Mer svenska'}])) as source:
+                summary = builder.prepare({}, root, resume=True)
+            self.assertEqual(summary['counts']['wikipedia@en']['files'], 1)
+            self.assertEqual(summary['counts']['wikipedia@sv']['files'], 2)
+            self.assertEqual(source.call_args.args[0], 'wikipedia@sv')
+
+    def test_tui_selects_wikipedia_languages_with_independent_limits(self):
+        import curses
+        screen = Mock()
+        screen.getmaxyx.return_value = (24, 110)
+        screen.get_wch.side_effect = ['w', '\x15', *'en=1,sv=0.5', '\n', '\n', '\n']
+        with patch.object(curses, 'wrapper', side_effect=lambda callback: callback(screen)), \
+                patch.object(curses, 'curs_set'), patch.object(builder, 'validate_output', side_effect=Path):
+            selected, _, _ = builder.tui_plan()
+        self.assertEqual(selected['wikipedia@en'], 1_000_000_000)
+        self.assertEqual(selected['wikipedia@sv'], 500_000_000)
+        self.assertNotIn('wikipedia', selected)
+
     def test_alpaca_format_download_and_cli(self):
         records = [{'instruction': 'Classify', 'input': 'cat', 'output': 'animal'},
                    {'instruction': 'Hello', 'input': '', 'output': 'Hi'},
