@@ -416,9 +416,10 @@ def record_text(name, record):
         context = record.get("input" if name == "alpaca" else "context") or ""
         if not isinstance(instruction, str) or not instruction.strip() or not isinstance(response, str) or not response.strip() or not isinstance(context, str):
             return ""
-        parts = ["### Instruction\n" + instruction.strip()]
+        parts = []
         if context.strip():
             parts.append("### Context\n" + context.strip())
+        parts.append("### Instruction\n" + instruction.strip())
         parts.append("### Response\n" + response.strip())
         return "\n\n".join(parts) + "\n\n"
     text = record.get("text", "")

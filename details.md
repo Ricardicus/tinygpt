@@ -710,8 +710,9 @@ python other/inference.py --model models/dolly-sft.pt \
   --prompt $'### Instruction\nExplain gravity.\n\n### Response\n'
 ```
 
-Include `\n\n### Context\n` and the context text before `### Response` when
-needed. This tokenizer has no dedicated end-of-response token; generation uses
+Include `### Context\n` and the context text before `### Instruction` when
+needed. Fine-tuning also accepts older files with context after the instruction
+and rearranges them during training. This tokenizer has no dedicated end-of-response token; generation uses
 `--max-new-tokens` and may continue past the answer for older checkpoints. New
 fine-tuning runs append `\n\n### End Response\n` to every target response and
 store it in the checkpoint. Set `--response-end-marker` to another nonempty

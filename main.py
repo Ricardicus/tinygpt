@@ -611,9 +611,15 @@ DEFAULT_RESPONSE_END_MARKER = '\n\n### End Response\n'
 
 def finetune_examples(path, tokenizer, context_length, response_end_marker=DEFAULT_RESPONSE_END_MARKER):
     text = path.read_text(encoding='utf-8')
-    if not text.startswith('### Instruction\n') or RESPONSE_MARKER not in text:
+    if RESPONSE_MARKER not in text:
         raise ValueError(f'Invalid Dolly format: {path}')
     prompt, response = text.split(RESPONSE_MARKER, 1)
+    if prompt.startswith('### Instruction\n'):
+        if '\n\n### Context\n' in prompt:
+            instruction, context = prompt.split('\n\n### Context\n', 1)
+            prompt = '### Context\n' + context + '\n\n' + instruction
+    elif not (prompt.startswith('### Context\n') and '\n\n### Instruction\n' in prompt):
+        raise ValueError(f'Invalid Dolly format: {path}')
     prompt += RESPONSE_MARKER
     if not response.strip():
         raise ValueError(f'Empty response: {path}')

@@ -26,7 +26,7 @@ class DownloadDatasetsTests(unittest.TestCase):
                    {'instruction': 'Hello', 'input': '', 'output': 'Hi'},
                    {'instruction': 'Empty', 'input': '', 'output': ''}]
         self.assertEqual(builder.record_text('alpaca', records[0]),
-                         '### Instruction\nClassify\n\n### Context\ncat\n\n### Response\nanimal\n\n')
+                         '### Context\ncat\n\n### Instruction\nClassify\n\n### Response\nanimal\n\n')
         self.assertEqual(builder.record_text('alpaca', records[1]),
                          '### Instruction\nHello\n\n### Response\nHi\n\n')
         self.assertEqual(builder.record_text('alpaca', records[2]), '')
@@ -97,7 +97,7 @@ class DownloadDatasetsTests(unittest.TestCase):
 
     def test_dolly_preserves_short_responses_and_context(self):
         text = builder.record_text("dolly", {"instruction": "Add 1 and 1", "context": "Use integers", "response": "2"})
-        self.assertEqual(text, "### Instruction\nAdd 1 and 1\n\n### Context\nUse integers\n\n### Response\n2\n\n")
+        self.assertEqual(text, "### Context\nUse integers\n\n### Instruction\nAdd 1 and 1\n\n### Response\n2\n\n")
         self.assertEqual(builder.record_text("dolly", {"instruction": "Incomplete"}), "")
 
     def test_gutenberg_keeps_notices_and_normalizes_boundaries(self):

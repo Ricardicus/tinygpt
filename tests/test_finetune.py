@@ -3,6 +3,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 import torch
 
@@ -12,6 +13,19 @@ from tinygpt import TinyGPT
 
 
 class FineTuneTests(unittest.TestCase):
+    def test_old_and_new_context_order_use_same_prompt(self):
+        tokenizer = Mock()
+        tokenizer.encode.side_effect = lambda text: list(text.encode())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'example.txt'
+            for text in ('### Instruction\nQuestion\n\n### Context\nBackground',
+                         '### Context\nBackground\n\n### Instruction\nQuestion'):
+                path.write_text(text + RESPONSE_MARKER + 'Answer')
+                tokenizer.reset_mock()
+                list(finetune_examples(path, tokenizer, 128, '<end>'))
+                self.assertEqual(tokenizer.encode.call_args_list[0].args[0],
+                                 '### Context\nBackground\n\n### Instruction\nQuestion' + RESPONSE_MARKER)
+
     def test_masks_prompt_and_covers_long_response(self):
         text = '### Instruction\nSay hello' + RESPONSE_MARKER + ('hello world! ' * 20) + '\n\n'
         tok = BPE(vocab_size=80, lower_case=False)
