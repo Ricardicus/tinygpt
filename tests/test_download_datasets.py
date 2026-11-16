@@ -70,6 +70,10 @@ class DownloadDatasetsTests(unittest.TestCase):
         self.assertEqual(selected['wikipedia@en'], 1_000_000_000)
         self.assertEqual(selected['wikipedia@sv'], 500_000_000)
         self.assertNotIn('wikipedia', selected)
+        wikipedia_rows = [call.args[2] for call in screen.addnstr.call_args_list
+                          if len(call.args) > 2 and 'Wikipedia (2023-11-01 snapshot)' in str(call.args[2])]
+        self.assertIn('per-language (W)', wikipedia_rows[-1])
+        self.assertNotIn('0.25 GB', wikipedia_rows[-1])
 
     def test_alpaca_format_download_and_cli(self):
         records = [{'instruction': 'Classify', 'input': 'cat', 'output': 'animal'},

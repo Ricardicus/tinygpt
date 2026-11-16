@@ -215,7 +215,9 @@ def tui_plan():
             put(3, "W: Wikipedia languages   L: Gutenberg languages   O: folder   Enter: review   Q: cancel")
             for index, name in enumerate(names):
                 attr = curses.A_REVERSE if cursor == index else 0
-                put(5 + index, f" [{'x' if name in checked else ' '}] {SOURCES[name]['label']:<45} {limits[name]}" + (" GB" if limits[name] != "full" else ""), attr)
+                limit_label = ('per-language (W)' if name == 'wikipedia' and wiki_limits is not None
+                               else limits[name] + (' GB' if limits[name] != 'full' else ''))
+                put(5 + index, f" [{'x' if name in checked else ' '}] {SOURCES[name]['label']:<45} {limit_label}", attr)
             info_row = 6 + len(names)
             put(info_row, "GB = saved UTF-8 text; RAM, network traffic and caches are extra.")
             put(info_row + 1, "Gutenberg languages: " + ", ".join(languages) + " (L to change; default English)")
