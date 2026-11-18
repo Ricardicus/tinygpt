@@ -50,7 +50,18 @@ SOURCES = {
     "alpaca": {"label": "Alpaca (instructions + answers)", "default": "full",
                "dataset": "tatsu-lab/alpaca", "config": None, "license": "cc-by-nc-4.0",
                "url": "https://huggingface.co/datasets/tatsu-lab/alpaca"},
+    "dolly-alpaca": {"label": "Dolly 15k (Alpaca format)", "default": "full",
+                      "dataset": "llm-wizard/dolly-15k-instruction-alpaca-format", "config": None,
+                      "license": "cc-by-3.0", "url": "https://huggingface.co/datasets/llm-wizard/dolly-15k-instruction-alpaca-format"},
+    "alpaca-gpt4": {"label": "Alpaca GPT-4", "default": "full", "dataset": "vicgalle/alpaca-gpt4",
+                    "config": None, "license": "cc-by-nc-4.0", "url": "https://huggingface.co/datasets/vicgalle/alpaca-gpt4"},
+    "alpaca-cleaned": {"label": "Alpaca cleaned", "default": "full", "dataset": "yahma/alpaca-cleaned",
+                       "config": None, "license": "cc-by-4.0", "url": "https://huggingface.co/datasets/yahma/alpaca-cleaned"},
+    "gpt4-llm-cleaned": {"label": "GPT-4 LLM cleaned", "default": "full", "dataset": "teknium/GPT4-LLM-Cleaned",
+                         "config": None, "url": "https://huggingface.co/datasets/teknium/GPT4-LLM-Cleaned"},
 }
+
+ALPACA_SOURCES = ('alpaca', 'dolly-alpaca', 'alpaca-gpt4', 'alpaca-cleaned', 'gpt4-llm-cleaned')
 
 
 def source_spec(name):
@@ -162,7 +173,7 @@ def tui_plan():
 
     def screen(stdscr):
         height, width = stdscr.getmaxyx()
-        if height < len(SOURCES) + 15 or width < 75:
+        if height < len(SOURCES) + 14 or width < 75:
             raise curses.error("Terminal too small")
         curses.curs_set(0)
         stdscr.keypad(True)
@@ -460,11 +471,11 @@ def source_records(name, provenance, languages=("en",), completed_ids=()):
 
 
 def record_text(name, record):
-    if name in ("dolly", "alpaca"):
+    if name == 'dolly' or name in ALPACA_SOURCES:
         # Preserve short answers and code; prose filters would destroy these pairs.
         instruction = record.get("instruction")
-        response = record.get("output" if name == "alpaca" else "response")
-        context = record.get("input" if name == "alpaca" else "context") or ""
+        response = record.get("output" if name in ALPACA_SOURCES else "response")
+        context = record.get("input" if name in ALPACA_SOURCES else "context") or ""
         if not isinstance(instruction, str) or not instruction.strip() or not isinstance(response, str) or not response.strip() or not isinstance(context, str):
             return ""
         parts = []
@@ -593,7 +604,7 @@ def prepare(selected, root, languages=("en",), resume=False):
             for name, limit in selected.items():
                 counts = Counter(summary["counts"].get(name, {}))
                 counts.update(files=0, bytes=0, examined=0)
-                if counts["files"] and (counts["stopped_at_byte_limit"] or counts["source_exhausted"]
+                if (counts["files"] or counts["duplicates"]) and (counts["stopped_at_byte_limit"] or counts["source_exhausted"]
                                         or (limit is not None and counts["bytes"] >= limit)):
                     print(f"{name}: already finished; reusing {counts['files']:,} verified documents.", flush=True)
                     continue
@@ -656,7 +667,7 @@ def prepare(selected, root, languages=("en",), resume=False):
                     close = getattr(records, "close", None)
                     if close:
                         close()
-                if not counts["files"]:
+                if not counts["files"] and not (counts["source_exhausted"] and counts["duplicates"]):
                     raise ValueError(f"No usable {name} documents fit; select a larger limit")
                 hashes.commit()
                 print(f"{name}: finished, {counts['files']:,} documents, {counts['bytes'] / 1e9:.4f} GB", flush=True)
@@ -675,8 +686,8 @@ def prepare(selected, root, languages=("en",), resume=False):
                 "Wikipedia preserves complete extracted article text, including stubs and lists,\n"
                 "from the selected 2023-11-01 language snapshots (not live Wikipedia or revision history).\n"
                 "Gutenberg keeps book notices.\n"
-                "Dolly and Alpaca retain instruction/context/response sections, including short answers.\n"
-                "Alpaca is licensed CC BY-NC 4.0; check its dataset card before use.\n"
+                "Dolly and Alpaca-format datasets retain instruction/context/response sections, including short answers.\n"
+                "Check each selected dataset card for its license and applicable terms.\n"
                 "OpenBallast T2 retains OpenStax passages and source/license metadata in the manifest.\n"
                 "train.sh uses ordinary next-token prediction over the mixed corpus.\n"
                 "For Dolly supervised fine-tuning, see details.md and main.py finetune;\n"
@@ -696,7 +707,7 @@ def prepare(selected, root, languages=("en",), resume=False):
             summary["bytes"] = sum(c["bytes"] for c in summary["counts"].values())
             wikipedia.write_json(summary_path, summary)
     print(f"\nReady. Pretrain with: bash {shlex.quote(str(root / 'train.sh'))}")
-    for name in ("dolly", "alpaca"):
+    for name in ('dolly', *ALPACA_SOURCES):
         if name in selected:
             print(f"For {name} supervised fine-tuning, use main.py finetune with --data {shlex.quote(str(root / 'corpus' / name))} and your pretrained model and tokenizer.")
     return summary
@@ -714,9 +725,12 @@ def main(argv=None):
                         help="Download OpenBallast T2 without prompts: a positive decimal GB amount or full")
     parser.add_argument("--alpaca", type=parse_limit, default=argparse.SUPPRESS, metavar="GB_OR_FULL",
                         help="Download Alpaca without prompts: a positive decimal GB amount or full")
+    for name in ALPACA_SOURCES[1:]:
+        parser.add_argument('--' + name, type=parse_limit, default=argparse.SUPPRESS, metavar='GB_OR_FULL',
+                            help=f'Download {SOURCES[name]["label"]} without prompts: GB amount or full')
     parser.add_argument("--output", type=Path, help="Output folder for direct downloads (default: automatic)")
     args = parser.parse_args(argv)
-    direct = {name: getattr(args, name.replace('-', '_')) for name in ('wikipedia', 'ballast-t2', 'alpaca')
+    direct = {name: getattr(args, name.replace('-', '_')) for name in ('wikipedia', 'ballast-t2', *ALPACA_SOURCES)
               if hasattr(args, name.replace('-', '_'))}
     try:
         for item in args.wikipedia_language:

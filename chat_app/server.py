@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Local browser interface for a TinyGPT checkpoint."""
 import argparse
+from contextlib import closing
+from datetime import datetime, timezone
 import json
 import math
 import sqlite3
@@ -25,16 +27,20 @@ def format_prompt(messages):
             f"{'User' if role == 'user' else 'Assistant'}: {content}"
             for role, content in history
         )
-        instruction = (f'Previous conversation:\n{conversation}\n\n'
-                       f'Now, with all that, here is the instruction:\n{instruction}')
+        return f'### Context\n{conversation}\n\n### Instruction\n{instruction}\n\n### Response\n'
     return f'### Instruction\n{instruction}\n\n### Response\n'
 
 
 class ChatServer(ThreadingHTTPServer):
-    def __init__(self, address, model_path, tokenizer_path, database, device, model_dir=None):
+    def __init__(self, address, model_path, tokenizer_path, database, device, model_dir=None, log_io=None):
         super().__init__(address, Handler)
         self.database = database
         self.lock = threading.Lock()
+        self.log_lock = threading.Lock()
+        self.log_io = Path(log_io).expanduser() if log_io else None
+        if self.log_io:
+            with self.log_io.open('a', encoding='utf-8'):
+                pass
         self.device = device
         self.model_dir = Path(model_dir or Path(model_path).parent).resolve()
         self.tokenizer_path = Path(tokenizer_path).resolve()
@@ -84,7 +90,7 @@ class ChatServer(ThreadingHTTPServer):
         db.execute('PRAGMA foreign_keys = ON')
         return db
 
-    def generate_stream(self, messages, max_tokens, temperature, top_k):
+    def generate_stream(self, messages, max_tokens, temperature, top_k, metadata=None):
         prompt = format_prompt(messages)
         ids = self.tokenizer.encode(prompt)
         if not ids:
@@ -92,6 +98,10 @@ class ChatServer(ThreadingHTTPServer):
         generated = []
         emitted = 0
         with self.lock, torch.inference_mode():
+            if metadata is not None:
+                metadata.update(model=self.info['model'], tokenizer=self.info['tokenizer'],
+                                context_length=self.model.context_length, prompt_tokens=len(ids),
+                                initial_model_input=self.tokenizer.decode(ids[-self.model.context_length:]))
             for _ in range(max_tokens):
                 inputs = torch.tensor([ids[-self.model.context_length:]], dtype=torch.long, device=self.device)
                 logits = self.model(inputs)[0, -1]
@@ -106,6 +116,8 @@ class ChatServer(ThreadingHTTPServer):
                 ids.append(token)
                 generated.append(token)
                 text = self.tokenizer.decode(generated)
+                if metadata is not None:
+                    metadata['raw_response'] = text
                 marker = (self.response_end_marker.rstrip('\r\n') or self.response_end_marker) if self.response_end_marker else None
                 if marker and marker in text:
                     visible = text.split(marker, 1)[0]
@@ -127,6 +139,25 @@ class ChatServer(ThreadingHTTPServer):
 
     def generate(self, messages, max_tokens, temperature, top_k):
         return ''.join(self.generate_stream(messages, max_tokens, temperature, top_k))
+
+    def recorded_generate(self, chat_id, messages, max_tokens, temperature, top_k):
+        metadata = {}
+        chunks = []
+        completed = False
+        try:
+            with closing(self.generate_stream(messages, max_tokens, temperature, top_k, metadata)) as stream:
+                for chunk in stream:
+                    chunks.append(chunk)
+                    yield chunk
+            completed = True
+        finally:
+            if self.log_io is not None:
+                record = {'timestamp': datetime.now(timezone.utc).isoformat(), 'chat_id': chat_id,
+                          'prompt': format_prompt(messages), 'response': ''.join(chunks),
+                          'complete': completed, 'max_tokens': max_tokens,
+                          'temperature': temperature, 'top_k': top_k, **metadata}
+                with self.log_lock, self.log_io.open('a', encoding='utf-8') as output:
+                    output.write(json.dumps(record, ensure_ascii=False) + '\n')
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -209,10 +240,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 try:
                     chunks = []
-                    for chunk in self.server.generate_stream(messages + [('user', content)], max_tokens, temperature, top_k):
-                        chunks.append(chunk)
-                        self.wfile.write((json.dumps({'content': chunk}) + '\n').encode())
-                        self.wfile.flush()
+                    with closing(self.server.recorded_generate(chat_id, messages + [('user', content)], max_tokens, temperature, top_k)) as stream:
+                        for chunk in stream:
+                            chunks.append(chunk)
+                            self.wfile.write((json.dumps({'content': chunk}) + '\n').encode())
+                            self.wfile.flush()
                     answer = ''.join(chunks)
                     self.save_exchange(chat_id, content, answer, messages)
                     self.wfile.write((json.dumps({'done': True}) + '\n').encode())
@@ -223,7 +255,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write((json.dumps({'error': str(error)}) + '\n').encode())
                     self.wfile.flush()
                 return
-            answer = self.server.generate(messages + [('user', content)], max_tokens, temperature, top_k)
+            answer = ''.join(self.server.recorded_generate(chat_id, messages + [('user', content)], max_tokens, temperature, top_k))
             self.save_exchange(chat_id, content, answer, messages)
             self.respond(200, {'content': answer})
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
@@ -245,6 +277,7 @@ def main():
     parser.add_argument('--model-dir', type=Path, help='Directory containing selectable .pt checkpoints')
     parser.add_argument('--tokenizer', type=Path, default=ROOT / 'artifacts-2026-11-02/tokenizer.json')
     parser.add_argument('--database', type=Path, default=Path(__file__).parent / 'chats.sqlite3')
+    parser.add_argument('--log-io', type=Path, help='Append prompts and generated responses to this JSONL file')
     parser.add_argument('--port', type=int, default=8000)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
@@ -260,7 +293,7 @@ def main():
             parser.error('--model-dir contains no .pt files')
         model = models[0]
     model = model or ROOT / 'dolly15k/artifacts/dolly-sft.pt'
-    server = ChatServer(('127.0.0.1', args.port), model, args.tokenizer, args.database, args.device, model_dir)
+    server = ChatServer(('127.0.0.1', args.port), model, args.tokenizer, args.database, args.device, model_dir, args.log_io)
     print(f'Open http://127.0.0.1:{args.port}', flush=True)
     server.serve_forever()
 

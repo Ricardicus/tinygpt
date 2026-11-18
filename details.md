@@ -1,5 +1,15 @@
 # Tiny GPT
 
+## Trim Gutenberg files
+
+Preview removal of Gutenberg headers and footers recursively with
+`python other/trim_gutenberg.py --gutenberg-folder path/to/gutenberg --dry-run`.
+Omit `--dry-run` to replace matching `.txt` files in place with the text between
+their first start marker and following end marker. Files with missing markers or
+empty bodies are skipped, and leading blank lines are removed. This removes Gutenberg notices from the trimmed files;
+keep the originals and attribution information separately. Do not trim inside a
+downloader-managed corpus you intend to resume: its manifest hashes would change.
+
 Build your own language model on your own data.
 BPE tokenizer, only supports pretraining, no RL.
 
@@ -711,6 +721,22 @@ Alpaca is also available in the downloader, including non-interactively with
 Its input field becomes a `### Context` section, so the resulting
 `datasets/alpaca/corpus/alpaca` directory can be passed to `--data` below.
 Alpaca is licensed CC BY-NC 4.0; check its dataset card for terms and provenance.
+
+The downloader also offers `--dolly-alpaca`, `--alpaca-gpt4`,
+`--alpaca-cleaned`, and `--gpt4-llm-cleaned`, each accepting `full` or a GB
+limit. They are also available in the interactive source list. Their Alpaca
+`instruction`, `input`, and `output` fields become the same context, instruction,
+and response sections used by the fine-tuning script. For example:
+
+```bash
+python other/download_datasets.py --alpaca-gpt4 full --alpaca-cleaned full --output datasets/alpaca-variants
+python main.py finetune --data datasets/alpaca-variants/corpus --base-model path/to/pretrained-model.pt --tokenizer path/to/tokenizer.json --output models/alpaca-variants.pt
+```
+
+The source revisions and dataset cards are recorded in the download metadata.
+The variants can overlap: exact formatted duplicates are removed across the
+download, but similar examples and shared instructions with different responses
+remain. Check the individual dataset cards for licenses and use restrictions.
 
 ```bash
 python main.py finetune --data datasets/dolly-full/corpus/dolly \

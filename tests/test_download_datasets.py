@@ -21,6 +21,41 @@ PROSE = (
 
 
 class DownloadDatasetsTests(unittest.TestCase):
+    def test_alpaca_variants_download_in_finetuning_format(self):
+        variants = {
+            'dolly-alpaca': 'llm-wizard/dolly-15k-instruction-alpaca-format',
+            'alpaca-gpt4': 'vicgalle/alpaca-gpt4',
+            'alpaca-cleaned': 'yahma/alpaca-cleaned',
+            'gpt4-llm-cleaned': 'teknium/GPT4-LLM-Cleaned',
+        }
+        for name, dataset in variants.items():
+            with self.subTest(name=name):
+                row = {'instruction': 'Answer', 'input': 'Context', 'output': 'Yes', 'category': 'qa'}
+                datasets, hub = Mock(), Mock()
+                datasets.load_dataset.return_value = [row]
+                hub.HfApi.return_value.dataset_info.return_value.sha = 'pinned'
+                provenance = {}
+                with patch.dict('sys.modules', {'datasets': datasets, 'huggingface_hub': hub}):
+                    self.assertEqual(list(builder.source_records(name, provenance)), [row])
+                datasets.load_dataset.assert_called_once_with(dataset, name=None, split='train', revision='pinned', streaming=True)
+                self.assertEqual(provenance['dataset'], dataset)
+                self.assertEqual(builder.record_text(name, row),
+                                 '### Context\nContext\n\n### Instruction\nAnswer\n\n### Response\nYes\n\n')
+                self.assertEqual(builder.record_text(name, {**row, 'input': '', 'output': ''}), '')
+                with patch.object(builder, 'prepare') as prepare:
+                    builder.main(['--' + name, 'full', '--output', '/tmp/variant'])
+                    prepare.assert_called_once_with({name: None}, Path('/tmp/variant'))
+
+    def test_fully_duplicate_variant_completes(self):
+        row = {'instruction': 'Hello', 'input': '', 'output': 'Hi'}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'duplicates'
+            with patch.object(builder, 'source_records', side_effect=lambda name, meta: iter([row])):
+                result = builder.prepare({'alpaca-gpt4': None, 'alpaca-cleaned': None}, root)
+            self.assertEqual(result['status'], 'complete')
+            self.assertEqual(result['counts']['alpaca-cleaned']['duplicates'], 1)
+            self.assertEqual(result['counts']['alpaca-cleaned']['files'], 0)
+
     def test_wikipedia_language_limits_and_stream_configuration(self):
         selected = builder.wikipedia_selections('en=0.25,sv=full,fr=1')
         self.assertEqual(selected, {'wikipedia@en': 250_000_000, 'wikipedia@sv': None, 'wikipedia@fr': 1_000_000_000})
@@ -424,7 +459,7 @@ class DownloadDatasetsTests(unittest.TestCase):
     def test_plain_wizard_reprompts_invalid_values_and_accepts_custom_folder(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "custom"
-            with patch("builtins.input", side_effect=["7", "2,4", "nan", "0.5", "full", str(root), "y"]), \
+            with patch("builtins.input", side_effect=["11", "2,4", "nan", "0.5", "full", str(root), "y"]), \
                     patch.object(builder, "plain_languages", return_value=("en", "fr")):
                 selected, actual_root, languages = builder.plain_plan()
         self.assertEqual(selected, {"dolly": 500_000_000, "gutenberg": None})
@@ -441,7 +476,7 @@ class DownloadDatasetsTests(unittest.TestCase):
         with patch.object(curses, "wrapper", side_effect=lambda f: f(screen)), \
                 patch.object(curses, "curs_set"), patch.object(builder, "validate_output", side_effect=Path):
             selected, root, languages = builder.tui_plan()
-        self.assertEqual(selected, {"dolly": 500_000_000, "fineweb-edu": 1_000_000_000, "gutenberg": 250_000_000, "ballast-t2": None, "alpaca": None})
+        self.assertEqual(selected, {"dolly": 500_000_000, "fineweb-edu": 1_000_000_000, "gutenberg": 250_000_000, "ballast-t2": None, "alpaca": None, "dolly-alpaca": None, "alpaca-gpt4": None, "alpaca-cleaned": None, "gpt4-llm-cleaned": None})
         self.assertEqual(root, Path("/tmp/tui-x"))
         self.assertEqual(languages, ("en",))
 

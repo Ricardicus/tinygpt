@@ -27,6 +27,15 @@ startup. Equal vocabulary sizes alone do not establish tokenizer compatibility.
 Switching may temporarily require memory for both models; a failed load leaves
 the previous model active. Switching affects all clients connected to the server.
 
+To log generation inputs and outputs, add `--log-io path/to/generations.jsonl`.
+Each JSON line records the full formatted prompt, initial context-window input,
+visible response, raw generated text (including any end marker), model and
+tokenizer paths, sampling settings, timestamp and
+completion status. An interrupted stream may have `complete: false`. The file is
+appended across runs; it contains conversation text and is separate from chat
+history, so deleting a chat does not remove its log entries. Logging is disabled
+unless the flag is supplied.
+
 Chats are stored locally in `chat_app/chats.sqlite3`. Use `--database` to select
 another location. Use the delete button beside a conversation in the sidebar to
 remove it and its messages. The server listens only on localhost and has no authentication;
@@ -38,5 +47,5 @@ if present, or at the requested token limit. Trailing line breaks in the marker
 are not required for stopping. Older
 conversation context is truncated to fit the model's context window. Dolly was
 trained on instruction/response examples rather than multi-turn conversations,
-so conversational behavior may be limited. Previous messages are placed inside
-the instruction as a labelled conversation, followed by the latest instruction.
+so conversational behavior may be limited. Previous questions and answers are
+placed in a `### Context` section before the latest `### Instruction`.
