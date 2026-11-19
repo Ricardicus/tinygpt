@@ -103,6 +103,19 @@ def compilation_progress(stage, interval=15):
         thread.join()
 
 
+def configure_compilation(model, args):
+    if args.compile_model:
+        print("Setting up whole-model compilation (includes QK normalization when enabled)...", flush=True)
+        model.compile()
+    elif args.compile_qk_norm:
+        print("Setting up QK normalization compilation...", flush=True)
+        model.compile_qk_norms()
+    else:
+        return False
+    print("Compiler configured. Compilation is lazy: first validation, training forward and backward calls warm up separately. Further shapes may recompile.", flush=True)
+    return True
+
+
 def write_layer_norms(path, model, epoch, global_step):
     """Record block norms and selected individual tensors before clipping/update."""
     def norm(tensors):
@@ -239,29 +252,33 @@ def minify_checkpoint(args, parser):
 PROGRESS_COLUMNS = ["epoch", "step", "loss", "mean_loss", "validation_loss", "lr", "grad_norm"]
 
 
-def prepare_progress_log(path):
+def prepare_progress_log(path, columns=PROGRESS_COLUMNS):
     """Add missing metric columns to legacy logs, leaving old values unknown."""
     path = Path(path)
     if not path.exists() or path.stat().st_size == 0:
         with path.open("w", newline="") as output:
-            csv.writer(output).writerow(PROGRESS_COLUMNS)
+            csv.writer(output).writerow(columns)
         return
     with path.open(newline="") as source:
         reader = csv.reader(source)
         header = next(reader)
-        if header == PROGRESS_COLUMNS:
+        if header == columns:
+            with path.open("rb+") as output:
+                output.seek(-1, os.SEEK_END)
+                if output.read(1) not in (b"\n", b"\r"):
+                    output.write(b"\n")
             return
-        if header not in (PROGRESS_COLUMNS[:4], PROGRESS_COLUMNS[:5], PROGRESS_COLUMNS[:6]):
+        if len(header) < 4 or header != columns[:len(header)]:
             raise ValueError(f"Unexpected progress CSV columns in {path}: {header}")
         descriptor, temporary = tempfile.mkstemp(prefix="progress-", suffix=".tmp", dir=path.parent)
         try:
             with os.fdopen(descriptor, "w", newline="") as output:
                 writer = csv.writer(output)
-                writer.writerow(PROGRESS_COLUMNS)
+                writer.writerow(columns)
                 for row in reader:
                     if len(row) != len(header):
                         raise ValueError(f"Malformed progress CSV row in {path}: {row}")
-                    writer.writerow([*row, *([""] * (len(PROGRESS_COLUMNS) - len(header)))])
+                    writer.writerow([*row, *([""] * (len(columns) - len(header)))])
             os.replace(temporary, path)
         finally:
             if os.path.exists(temporary):
@@ -424,6 +441,13 @@ def default_device():
     return "mps" if torch.backends.mps.is_available() else "cpu"
 
 
+def add_compile_arguments(parser):
+    parser.add_argument("--compile-qk-norm", action="store_true",
+                        help="Compile Q/K RMSNorm forward/backward with Inductor (training only; requires QK normalization). Execution option, not saved in checkpoints.")
+    parser.add_argument("--compile-model", action="store_true",
+                        help="Compile the whole model with Inductor during training; takes precedence over --compile-qk-norm. Not saved in checkpoints.")
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Pretrain, fine-tune, or run inference with TinyGPT.",
@@ -496,10 +520,7 @@ def parse_args(argv=None):
     parser.add_argument("--num-experts", type=int, default=4)
     parser.add_argument("--moe-top-k", type=int, default=2)
     parser.add_argument("--moe-aux-loss-weight", type=float, default=0.01)
-    parser.add_argument("--compile-qk-norm", action="store_true",
-                        help="Compile Q/K RMSNorm forward/backward with Inductor (training only; requires QK normalization). Execution option, not saved in checkpoints.")
-    parser.add_argument("--compile-model", action="store_true",
-                        help="Compile the whole model with Inductor during training; takes precedence over --compile-qk-norm. Not saved in checkpoints.")
+    add_compile_arguments(parser)
     parser.add_argument("--beta1", type=float, default=None,
                         help="AdamW beta1: default 0.9 for new runs; omitted on resume preserves the saved value.")
     parser.add_argument("--beta2", type=float, default=None,
@@ -617,7 +638,12 @@ def parse_args(argv=None):
     finetune_parser.add_argument('--lr', type=float, default=2e-5, help='AdamW learning rate (default: %(default)s)')
     finetune_parser.add_argument('--validation-fraction', type=float, default=0.05,
                                  help='Fraction of files held out for validation (default: %(default)s)')
+    finetune_parser.add_argument('--validation-every-steps', type=int, default=0,
+                                 help='Validate every N optimizer steps and at epoch end (default: epoch end only)')
+    finetune_parser.add_argument('--save-every-steps', type=int, default=0,
+                                 help='Save the latest checkpoint every N optimizer steps and at epoch end (default: epoch end only)')
     finetune_parser.add_argument('--seed', type=int, default=42, help='Seed for splitting and shuffling files (default: %(default)s)')
+    add_compile_arguments(finetune_parser)
     finetune_parser.set_defaults(command_handler=finetune, command_parser=finetune_parser)
 
     minify_parser = commands.add_parser("minify", help="Export a checkpoint without optimizer state.")
@@ -733,12 +759,16 @@ def finetune(args, parser):
         parser.error('--output must be a new path distinct from the base model')
     progress_path = args.log_progress or Path(str(args.output) + '.progress.csv')
     validation_path = Path(str(progress_path) + '.validation.csv')
-    if progress_path.exists() or validation_path.exists():
-        parser.error('Progress and validation log paths must not already exist')
-    if progress_path.resolve() in (args.output.resolve(), args.base_model.resolve(), args.tokenizer.resolve()):
-        parser.error('Progress log must be distinct from model and tokenizer paths')
+    log_paths = {progress_path.resolve(), validation_path.resolve()}
+    protected_paths = {args.output.resolve(), args.base_model.resolve(), args.tokenizer.resolve()}
+    if len(log_paths) != 2 or log_paths & protected_paths:
+        parser.error('Progress and validation logs must be distinct from each other and from model and tokenizer paths')
     if args.epochs < 1 or args.batch_size < 1 or not 0 < args.lr or not 0 < args.validation_fraction < 1:
         parser.error('epochs, batch size, learning rate and validation fraction must be positive; validation fraction must be below 1')
+    if args.validation_every_steps < 0:
+        parser.error('--validation-every-steps must be nonnegative')
+    if args.save_every_steps < 0:
+        parser.error('--save-every-steps must be nonnegative')
     files = sorted(args.data.rglob('*.txt'))
     if len(files) < 2:
         parser.error('Fine-tuning data must contain at least two .txt files')
@@ -748,6 +778,8 @@ def finetune(args, parser):
     validation, training = files[:nval], files[nval:]
     checkpoint = torch.load(args.base_model, map_location='cpu', weights_only=True)
     cfg = checkpoint['config']
+    if args.compile_qk_norm and not args.compile_model and not cfg.get('qk_norm', False):
+        parser.error('--compile-qk-norm requires a QK-normalized base checkpoint')
     tok = BPE()
     tok.load(str(args.tokenizer))
     if not tok.preserve_whitespace:
@@ -760,50 +792,108 @@ def finetune(args, parser):
                     **{name: cfg.get(name, value) for name, value in MOE_DEFAULTS.items()},
                     **{name: cfg[name] for name in ('vocab_size', 'context_length', 'd_model', 'n_heads', 'num_layers')}).to(args.device)
     model.load_state_dict(checkpoint['model_state_dict'])
+    num_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    print(
+        f'Base checkpoint: {args.base_model}\n'
+        f'Tokenizer path: {args.tokenizer}\n'
+        f'Vocab size: {model.vocab_size:,}\n'
+        f'Context length: {model.context_length:,}\n'
+        f'Num layers: {model.num_layers}\n'
+        f'Embedding dimension: {model.d_model:,}\n'
+        f'Heads: {model.n_heads}\n'
+        f'Device: {args.device}\n'
+        f'QK normalization: {model.qk_norm}\n'
+        f'MoE: {model.moe}; experts={model.num_experts}, top-k={model.moe_top_k}, auxiliary weight={model.moe_aux_loss_weight}\n'
+        f'Total trainable parameters: {num_params:,}',
+        flush=True,
+    )
+    context_length = cfg['context_length']
+    print(f'Counting training windows across {len(training):,} examples...', flush=True)
+    training_windows = sum(
+        1 for path in training
+        for _ in finetune_examples(path, tok, context_length, args.response_end_marker)
+    )
+    steps_per_epoch = (training_windows + args.batch_size - 1) // args.batch_size
+    compile_training_pending = configure_compilation(model, args)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    prepare_progress_log(progress_path)
+    prepare_progress_log(progress_path, [*PROGRESS_COLUMNS, 'tokens_per_second'])
+    prepare_progress_log(validation_path, ['epoch', 'global_step', 'validation_loss', 'perplexity', 'tokens'])
     print(f'Training progress: {progress_path}; validation: {validation_path}', flush=True)
-    step = 0
-    print(f'Fine-tuning {len(training):,} examples; validating on {len(validation):,}.', flush=True)
-    for epoch in range(args.epochs):
-        rng.shuffle(training)
-        model.train()
-        total = count = 0
-        for x, y in finetune_batches(training, tok, cfg['context_length'], args.batch_size, args.response_end_marker):
-            x, y = x.to(args.device), y.to(args.device)
-            optimizer.zero_grad(set_to_none=True)
-            if model.moe:
-                logits, aux = model(x, return_aux=True)
-            else:
-                logits, aux = model(x), 0
-            loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-            (loss + model.moe_aux_loss_weight * aux).backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
-            optimizer.step()
-            n = (y != -100).sum().item()
-            total += loss.item() * n
-            count += n
-            step += 1
-            write_progress_row(progress_path, [epoch + 1, step, loss.item(), total / count, '', args.lr, grad_norm.item()])
-            if step % 100 == 0:
-                print(f'Epoch {epoch + 1} step {step}: response loss {total / count:.4f}', flush=True)
+
+    @torch.no_grad()
+    def report_validation(epoch, step):
         model.eval()
         val_total = val_count = 0
-        with torch.no_grad():
-            for x, y in finetune_batches(validation, tok, cfg['context_length'], args.batch_size, args.response_end_marker):
+        try:
+            for x, y in finetune_batches(validation, tok, context_length, args.batch_size, args.response_end_marker):
                 x, y = x.to(args.device), y.to(args.device)
                 logits = model(x)
                 loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), reduction='sum')
                 val_total += loss.item()
                 val_count += (y != -100).sum().item()
-        print(f'Epoch {epoch + 1}: train response loss {total / count:.4f}; validation response loss {val_total / val_count:.4f}', flush=True)
+        finally:
+            model.train()
         val_loss = val_total / val_count
+        perplexity = math.exp(val_loss)
+        print(f'Validation | Step {step:,} | Response loss: {val_loss:.4f} | Perplexity: {perplexity:.2f}',
+              flush=True)
         with validation_path.open('a', newline='') as output:
-            writer = csv.writer(output)
-            if epoch == 0:
-                writer.writerow(['epoch', 'global_step', 'validation_loss', 'perplexity', 'tokens'])
-            writer.writerow([epoch + 1, step, val_loss, math.exp(val_loss), val_count])
-        save_checkpoint(str(args.output), model, optimizer, epoch + 1, val_total / val_count, step,
+            csv.writer(output).writerow([epoch, step, val_loss, perplexity, val_count])
+        return val_loss
+
+    step = 0
+    print(f'Fine-tuning {len(training):,} examples ({steps_per_epoch:,} steps per epoch); '
+          f'validating on {len(validation):,}.', flush=True)
+    for epoch in range(args.epochs):
+        rng.shuffle(training)
+        model.train()
+        total = count = 0
+        timing_tokens = 0
+        timing_seconds = 0.0
+        batches = finetune_batches(training, tok, context_length, args.batch_size, args.response_end_marker)
+        for epoch_step, (x, y) in enumerate(batches, start=1):
+            start_time = time.perf_counter()
+            x, y = x.to(args.device), y.to(args.device)
+            optimizer.zero_grad(set_to_none=True)
+            with compilation_progress("first training forward") if compile_training_pending else nullcontext():
+                if model.moe:
+                    logits, aux = model(x, return_aux=True)
+                else:
+                    logits, aux = model(x), 0
+                loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+            with compilation_progress("first training backward") if compile_training_pending else nullcontext():
+                (loss + model.moe_aux_loss_weight * aux).backward()
+            compile_training_pending = False
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+            optimizer.step()
+            n = (y != -100).sum().item()
+            loss_value = loss.item()
+            step_seconds = max(time.perf_counter() - start_time, 1e-9)
+            timing_seconds += step_seconds
+            timing_tokens += x.numel()
+            total += loss_value * n
+            count += n
+            step += 1
+            epoch_end = epoch_step == steps_per_epoch
+            val_loss = None
+            if epoch_end or (args.validation_every_steps and step % args.validation_every_steps == 0):
+                val_loss = report_validation(epoch + 1, step)
+            write_progress_row(progress_path, [epoch + 1, step, loss_value, total / count, val_loss,
+                                               args.lr, grad_norm.item(), x.numel() / step_seconds])
+            if not epoch_end and args.save_every_steps and step % args.save_every_steps == 0:
+                checkpoint_loss = val_loss if val_loss is not None else total / count
+                save_checkpoint(args.output, model, optimizer, epoch, checkpoint_loss, step, epoch_step,
+                                response_end_marker=args.response_end_marker)
+                print(f'Checkpoint saved at optimizer step {step:,}: {args.output}', flush=True)
+            if step % 100 == 0 or epoch_end:
+                epoch_progress = epoch_step / steps_per_epoch
+                print(f'Epoch {epoch + 1}/{args.epochs} | Step {step:6d} ({epoch_progress:7.2%}) | '
+                      f'Response loss: {total / count:.4f} | {timing_tokens / timing_seconds:,.0f} tokens/s',
+                      flush=True)
+                timing_tokens = 0
+                timing_seconds = 0.0
+        print(f'Epoch {epoch + 1}: train response loss {total / count:.4f}; validation response loss {val_loss:.4f}', flush=True)
+        save_checkpoint(args.output, model, optimizer, epoch + 1, val_loss, step,
                         response_end_marker=args.response_end_marker)
         print(f'Saved {args.output}', flush=True)
 
@@ -1114,15 +1204,7 @@ def main(argv=None):
                           args.beta2 if args.beta2 is not None else beta2)
     print("AdamW betas: " + ", ".join(str(group["betas"]) for group in optimizer.param_groups), flush=True)
 
-    compile_enabled = args.compile_model or args.compile_qk_norm
-    if args.compile_model:
-        print("Setting up whole-model compilation (includes QK normalization when enabled)...", flush=True)
-        model.compile()
-    elif args.compile_qk_norm:
-        print("Setting up QK normalization compilation...", flush=True)
-        model.compile_qk_norms()
-    if compile_enabled:
-        print("Compiler configured. Compilation is lazy: first validation, training forward and backward calls warm up separately. Further shapes may recompile.", flush=True)
+    compile_enabled = configure_compilation(model, args)
 
     saved_schedule = checkpoint.get("lr_schedule") if ckpt_state is not None else None
     steps_per_epoch = (len(datareader) + args.batch_size - 1) // args.batch_size

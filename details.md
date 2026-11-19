@@ -751,15 +751,32 @@ uses a fresh AdamW optimizer, splits examples into training and validation sets,
 reports response-only loss and saves after each epoch. It masks instruction and
 context tokens from the loss. Long examples are split into windows; each response
 token is trained once with up to the model's context length of preceding tokens.
-There is no mid-epoch resume for this script. Save the tokenizer alongside the
+Use `--save-every-steps N` to also save every N optimizer steps. Intermediate
+saves atomically replace the checkpoint at `--output`. The default, `0`, saves
+only at epoch end. Fine-tuning can use an intermediate checkpoint as a new base
+with a fresh optimizer. Save the tokenizer alongside the
 fine-tuned checkpoint and retain the Dolly dataset metadata for attribution.
+
+Fine-tuning counts training windows before the first epoch and prints the epoch
+completion percentage and average tokens per second every 100 steps and at
+epoch end. The CSV also records per-step `tokens_per_second`. Throughput counts
+all input positions, including prompt and padding, and measures training-step
+time including any compilation during the step.
+
+Pass `--compile-model` to compile the whole model during fine-tuning, or
+`--compile-qk-norm` to compile only Q/K normalization on a QK-normalized
+checkpoint. If both are given, whole-model compilation takes precedence.
+Different batch shapes may trigger additional compilation.
 
 Fine-tuning writes per-step response loss, cumulative token-weighted loss, learning
 rate and pre-clipping gradient norm to `<output>.progress.csv` by default. Use
-`--log-progress` to select another new path. Epoch validation loss, perplexity
+`--log-progress` to select another path. Use `--validation-every-steps N` to
+evaluate the held-out split every N optimizer steps as well as at each epoch
+end. The default, `0`, evaluates only at epoch end. Validation loss, perplexity
 and response-token count are written to `<progress path>.validation.csv`.
 Plot either file with `python other/plot_progress.py --input <path>`; monitor
-updates with `tail -f <progress path>`. Existing log paths are not overwritten.
+updates with `tail -f <progress path>`. Existing logs receive new rows, with
+epoch and step numbering starting over for each fine-tuning run.
 
 Use the same prompt format at inference:
 
