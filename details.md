@@ -124,7 +124,8 @@ keeping checkpoint parameter names and shapes compatible. `--precision auto`
 otherwise; use `--precision float32` to keep full precision or
 `--precision bfloat16` to require native CUDA BF16. Model weights and optimizer
 state remain FP32. Validation uses the same precision as training. The console
-reports average full training-step time and tokens per second over each ten-step
+reports epoch completion as a percentage beside the step number. It also reports
+average full training-step time and tokens per second over each ten-step
 reporting interval, including backward/optimizer work and transfers but excluding
 batch preparation, validation and checkpoint writing. These replace the old
 forward-only `Inference` timer. Actual speed depends on the GPU and workload.

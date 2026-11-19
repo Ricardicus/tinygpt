@@ -19,17 +19,17 @@ pip install -r requirements.txt
 Check out the CLI flags:
 
 ```bash
-$ python main.py --help
-usage: main.py [-h] [--tokenizer TOKENIZER] [--vocab_size VOCAB_SIZE] [--verbose VERBOSE] [--lower-case LOWER_CASE] [--bpe-part BPE_PART] [--epochs EPOCHS] [--context-length CONTEXT_LENGTH] [--d-model D_MODEL] [--n-heads N_HEADS]
-               [--num-layers NUM_LAYERS] [--lr LR] [--qk-norm | --no-qk-norm] [--moe | --no-moe] [--num-experts NUM_EXPERTS] [--moe-top-k MOE_TOP_K] [--moe-aux-loss-weight MOE_AUX_LOSS_WEIGHT] [--compile-qk-norm] [--compile-model] [--beta1 BETA1]
-               [--beta2 BETA2] [--lr-schedule {constant,cosine}] [--warmup-steps WARMUP_STEPS] [--lr-decay-steps LR_DECAY_STEPS] [--min-lr-ratio MIN_LR_RATIO] [--batch-size BATCH_SIZE] [--model MODEL] [--data-config DATA_CONFIG]
-               [--bpe-max-words BPE_MAX_WORDS] [--rawdata RAWDATA] [--oneliners ONELINERS] [--device DEVICE] [--precision {auto,float32,bfloat16}] [--bpe-alphabet-policy {limit,expand,error}] [--bpe-max-chars BPE_MAX_CHARS] [--prompt PROMPT]
-               [--max-new-tokens MAX_NEW_TOKENS] [--log-progress LOG_PROGRESS] [--monitor-layer-norms CSV] [--monitor-layer-norms-every N] [--save-every-steps SAVE_EVERY_STEPS] [--validation-fraction VALIDATION_FRACTION]
-               [--validation-every-steps VALIDATION_EVERY_STEPS] [--validation-batches VALIDATION_BATCHES] [--validation-seed VALIDATION_SEED] [--temperature TEMPERATURE] [--top-k TOP_K] [--seed SEED]
+$ usage: main.py [-h] [--tokenizer TOKENIZER] [--vocab_size VOCAB_SIZE] [--verbose VERBOSE] [--lower-case LOWER_CASE] [--bpe-part BPE_PART] [--epochs EPOCHS] [--context-length CONTEXT_LENGTH] [--d-model D_MODEL] [--n-heads N_HEADS] [--num-layers NUM_LAYERS] [--lr LR]
+               [--qk-norm | --no-qk-norm] [--moe | --no-moe] [--num-experts NUM_EXPERTS] [--moe-top-k MOE_TOP_K] [--moe-aux-loss-weight MOE_AUX_LOSS_WEIGHT] [--compile-qk-norm] [--compile-model] [--beta1 BETA1] [--beta2 BETA2] [--lr-schedule {constant,cosine}]
+               [--warmup-steps WARMUP_STEPS] [--lr-decay-steps LR_DECAY_STEPS] [--min-lr-ratio MIN_LR_RATIO] [--batch-size BATCH_SIZE] [--model MODEL] [--data-config DATA_CONFIG] [--bpe-max-words BPE_MAX_WORDS] [--rawdata RAWDATA] [--oneliners ONELINERS]
+               [--device DEVICE] [--precision {auto,float32,bfloat16}] [--bpe-alphabet-policy {limit,expand,error}] [--bpe-max-chars BPE_MAX_CHARS] [--bpe-keep-chars TEXT] [--prompt PROMPT] [--max-new-tokens MAX_NEW_TOKENS] [--log-progress LOG_PROGRESS]
+               [--monitor-layer-norms CSV] [--monitor-layer-norms-every N] [--save-every-steps SAVE_EVERY_STEPS] [--validation-fraction VALIDATION_FRACTION] [--validation-every-steps VALIDATION_EVERY_STEPS] [--validation-batches VALIDATION_BATCHES]
+               [--validation-seed VALIDATION_SEED] [--temperature TEMPERATURE] [--top-k TOP_K] [--seed SEED]
+               {finetune,minify} ...
 
-Train TinyGPT using a BPE tokenizer with streaming data.
+Pretrain, fine-tune, or run inference with TinyGPT.
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
   --tokenizer TOKENIZER
                         Path to tokenizer file (will load or create). Default: tokenizer.json.
@@ -48,8 +48,8 @@ optional arguments:
                         Number of transformer layers. Default 6.
   --lr LR               Learning rate (cosine peak): 0.0003 for new runs; omitted on resume preserves the saved rate/schedule, explicitly supplied overrides it.
   --qk-norm, --no-qk-norm
-                        Enable per-head Q/K RMSNorm for fresh models. On resume/inference, the saved architecture takes precedence; old checkpoints disable it. (default: False)
-  --moe, --no-moe       Use sparse MoE MLPs for fresh models; saved architecture wins on resume. (default: False)
+                        Enable per-head Q/K RMSNorm for fresh models. On resume/inference, the saved architecture takes precedence; old checkpoints disable it.
+  --moe, --no-moe       Use sparse MoE MLPs for fresh models; saved architecture wins on resume.
   --num-experts NUM_EXPERTS
   --moe-top-k MOE_TOP_K
   --moe-aux-loss-weight MOE_AUX_LOSS_WEIGHT
@@ -82,6 +82,8 @@ optional arguments:
                         New tokenizer behavior when characters exceed vocabulary capacity: limit rare characters to <unk> (default), expand vocabulary, or error.
   --bpe-max-chars BPE_MAX_CHARS
                         Optional base alphabet token cap, including reserved symbols and <unk>, for policy limit; 0 caps to half the vocabulary only when it overflows.
+  --bpe-keep-chars TEXT
+                        Characters to guarantee in a newly trained tokenizer, even when limiting the alphabet.
   --prompt PROMPT       Text prompt to generate from. If set together with --model, training is skipped.
   --max-new-tokens MAX_NEW_TOKENS
                         Maximum number of tokens to generate during inference.
@@ -105,6 +107,13 @@ optional arguments:
                         Sampling temperature; lower is less random, 0 is greedy (default: 1).
   --top-k TOP_K         Sample from the top K tokens; 0 uses the full vocabulary (default: 0).
   --seed SEED           Random seed for repeatable inference.
+
+commands:
+  {finetune,minify}
+    finetune            Fine-tune a pretrained model on instruction/response examples.
+    minify              Export a checkpoint without optimizer state.
+
+Use finetune --help or minify --help for command-specific options.
 ````
 
 ## Dataset downloader

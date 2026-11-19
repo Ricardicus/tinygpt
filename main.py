@@ -4,7 +4,6 @@ import torch.optim as optim
 import argparse
 import csv
 import os
-import sys
 from itertools import islice
 import time
 import tempfile
@@ -199,11 +198,7 @@ def save_checkpoint(path, model, optimizer, epoch, loss, global_step, step=0, lr
             os.unlink(temporary)
 
 
-def minify_main(argv=None):
-    parser = argparse.ArgumentParser(prog='main.py minify', description='Export a checkpoint without optimizer state for inference or fresh fine-tuning.')
-    parser.add_argument('--model', type=Path, required=True, help='Existing checkpoint')
-    parser.add_argument('--output', type=Path, required=True, help='New output file; never overwrites an existing file')
-    args = parser.parse_args(argv)
+def minify_checkpoint(args, parser):
     if args.model.resolve() == args.output.resolve():
         parser.error('--output must be distinct from --model')
     if not args.model.is_file():
@@ -431,7 +426,8 @@ def default_device():
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Train TinyGPT using a BPE tokenizer with streaming data. Use `main.py finetune --help` for supervised fine-tuning or `main.py minify --help` for checkpoint export."
+        description="Pretrain, fine-tune, or run inference with TinyGPT.",
+        epilog="Use finetune --help or minify --help for command-specific options.",
     )
     parser.add_argument(
         "--tokenizer",
@@ -602,7 +598,36 @@ def parse_args(argv=None):
                         help="Sample from the top K tokens; 0 uses the full vocabulary (default: 0).")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for repeatable inference.")
+
+    commands = parser.add_subparsers(title="commands", metavar="{finetune,minify}")
+    finetune_parser = commands.add_parser(
+        "finetune", help="Fine-tune a pretrained model on instruction/response examples.",
+        description="Supervised fine-tuning on formatted instruction/response files.",
+    )
+    finetune_parser.add_argument('--data', type=Path, required=True, help='Directory containing training examples (.txt)')
+    finetune_parser.add_argument('--base-model', type=Path, required=True, help='Pretrained checkpoint')
+    finetune_parser.add_argument('--tokenizer', type=Path, required=True, help='Exact tokenizer used for pretraining')
+    finetune_parser.add_argument('--output', type=Path, required=True, help='New output checkpoint')
+    finetune_parser.add_argument('--log-progress', type=Path, default=None, help='Training CSV path (defaults to output path plus .progress.csv)')
+    finetune_parser.add_argument('--response-end-marker', default=DEFAULT_RESPONSE_END_MARKER,
+                                 help='Text appended to every response and used to stop generation')
+    finetune_parser.add_argument('--device', default=default_device(), help='Compute device')
+    finetune_parser.add_argument('--epochs', type=int, default=3, help='Number of training epochs (default: %(default)s)')
+    finetune_parser.add_argument('--batch-size', type=int, default=2, help='Training windows per batch (default: %(default)s)')
+    finetune_parser.add_argument('--lr', type=float, default=2e-5, help='AdamW learning rate (default: %(default)s)')
+    finetune_parser.add_argument('--validation-fraction', type=float, default=0.05,
+                                 help='Fraction of files held out for validation (default: %(default)s)')
+    finetune_parser.add_argument('--seed', type=int, default=42, help='Seed for splitting and shuffling files (default: %(default)s)')
+    finetune_parser.set_defaults(command_handler=finetune, command_parser=finetune_parser)
+
+    minify_parser = commands.add_parser("minify", help="Export a checkpoint without optimizer state.")
+    minify_parser.add_argument('--model', type=Path, required=True, help='Existing checkpoint')
+    minify_parser.add_argument('--output', type=Path, required=True, help='New output file; never overwrites an existing file')
+    minify_parser.set_defaults(command_handler=minify_checkpoint, command_parser=minify_parser)
+
     args = parser.parse_args(argv)
+    if hasattr(args, "command_handler"):
+        return args
     if args.num_experts < 1 or not 1 <= args.moe_top_k <= args.num_experts:
         parser.error("Require 1 <= --moe-top-k <= --num-experts")
     if not math.isfinite(args.moe_aux_loss_weight) or args.moe_aux_loss_weight < 0:
@@ -703,34 +728,20 @@ def finetune_collate(items):
     return x, y
 
 
-def finetune_main(argv=None):
-    p = argparse.ArgumentParser(prog='main.py finetune', description='Supervised fine-tuning on Dolly instruction/response files.')
-    p.add_argument('--data', type=Path, required=True, help='Dolly corpus directory')
-    p.add_argument('--base-model', type=Path, required=True)
-    p.add_argument('--tokenizer', type=Path, required=True, help='Exact tokenizer used for pretraining')
-    p.add_argument('--output', type=Path, required=True, help='New output checkpoint; must not already exist')
-    p.add_argument('--log-progress', type=Path, default=None, help='Training CSV path (default: output path plus .progress.csv)')
-    p.add_argument('--response-end-marker', default=DEFAULT_RESPONSE_END_MARKER, help='Text appended to every response and used to stop generation')
-    p.add_argument('--device', default=default_device())
-    p.add_argument('--epochs', type=int, default=3)
-    p.add_argument('--batch-size', type=int, default=2)
-    p.add_argument('--lr', type=float, default=2e-5)
-    p.add_argument('--validation-fraction', type=float, default=0.05)
-    p.add_argument('--seed', type=int, default=42)
-    args = p.parse_args(argv)
+def finetune(args, parser):
     if args.output.exists() or args.output.resolve() == args.base_model.resolve():
-        p.error('--output must be a new path distinct from the base model')
+        parser.error('--output must be a new path distinct from the base model')
     progress_path = args.log_progress or Path(str(args.output) + '.progress.csv')
     validation_path = Path(str(progress_path) + '.validation.csv')
     if progress_path.exists() or validation_path.exists():
-        p.error('Progress and validation log paths must not already exist')
+        parser.error('Progress and validation log paths must not already exist')
     if progress_path.resolve() in (args.output.resolve(), args.base_model.resolve(), args.tokenizer.resolve()):
-        p.error('Progress log must be distinct from model and tokenizer paths')
+        parser.error('Progress log must be distinct from model and tokenizer paths')
     if args.epochs < 1 or args.batch_size < 1 or not 0 < args.lr or not 0 < args.validation_fraction < 1:
-        p.error('epochs, batch size, learning rate and validation fraction must be positive; validation fraction must be below 1')
+        parser.error('epochs, batch size, learning rate and validation fraction must be positive; validation fraction must be below 1')
     files = sorted(args.data.rglob('*.txt'))
     if len(files) < 2:
-        p.error('Dolly corpus must contain at least two .txt files')
+        parser.error('Fine-tuning data must contain at least two .txt files')
     rng = random.Random(args.seed)
     rng.shuffle(files)
     nval = min(len(files) - 1, max(1, round(len(files) * args.validation_fraction)))
@@ -740,11 +751,11 @@ def finetune_main(argv=None):
     tok = BPE()
     tok.load(str(args.tokenizer))
     if not tok.preserve_whitespace:
-        p.error('Fine-tuning requires a whitespace-preserving tokenizer')
+        parser.error('Fine-tuning requires a whitespace-preserving tokenizer')
     if not args.response_end_marker or tok.decode(tok.encode(args.response_end_marker)) != args.response_end_marker:
-        p.error('Response end marker must be nonempty and exactly representable by the tokenizer')
+        parser.error('Response end marker must be nonempty and exactly representable by the tokenizer')
     if tok.vocab_size != cfg['vocab_size'] or not tok.vocab or max(tok.vocab.values()) >= cfg['vocab_size']:
-        p.error('Tokenizer vocabulary does not match checkpoint; use the exact pretraining tokenizer')
+        parser.error('Tokenizer vocabulary does not match checkpoint; use the exact pretraining tokenizer')
     model = TinyGPT(qk_norm=cfg.get('qk_norm', False),
                     **{name: cfg.get(name, value) for name, value in MOE_DEFAULTS.items()},
                     **{name: cfg[name] for name in ('vocab_size', 'context_length', 'd_model', 'n_heads', 'num_layers')}).to(args.device)
@@ -798,12 +809,9 @@ def finetune_main(argv=None):
 
 
 def main(argv=None):
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] == "finetune":
-        return finetune_main(arguments[1:])
-    if arguments and arguments[0] == "minify":
-        return minify_main(arguments[1:])
-    args = parse_args(arguments)
+    args = parse_args(argv)
+    if hasattr(args, "command_handler"):
+        return args.command_handler(args, args.command_parser)
 
     # ---------------------------------------------------------
     # --- Inference-only mode (skip training) ---
@@ -1230,8 +1238,10 @@ def main(argv=None):
                 last_progress_position = write_progress_row(args.log_progress, last_progress_row)
 
             if args.verbose and step % 10 == 0:
+                epoch_progress = step / steps_per_epoch
                 print(
-                    f"Epoch {epoch + 1}/{args.epochs} | Step {step:6d} | Avg Loss: {avg_loss:.4f} | "
+                    f"Epoch {epoch + 1}/{args.epochs} | Step {step:6d} ({epoch_progress:7.2%}) | "
+                    f"Avg Loss: {avg_loss:.4f} | "
                     f"LR: {current_lr:.3g} | "
                     f"Train step: {timing_seconds / timing_steps:.4f}s | "
                     f"{timing_tokens / max(timing_seconds, 1e-9):,.0f} tokens/s",
