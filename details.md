@@ -1,824 +1,285 @@
-# Tiny GPT
+# TinyGPT
 
-## Trim Gutenberg files
+TinyGPT is a single-device PyTorch project for training a decoder-only language model on your own text. You choose the corpus, train a byte-pair encoding (BPE) tokenizer, and pretrain a transformer to predict the next token. You can then use the checkpoint to complete text, or fine-tune it on instruction/response pairs and talk to it through a local chat server.
 
-Preview removal of Gutenberg headers and footers recursively with
-`python other/trim_gutenberg.py --gutenberg-folder path/to/gutenberg --dry-run`.
-Omit `--dry-run` to replace matching `.txt` files in place with the text between
-their first start marker and following end marker. Files with missing markers or
-empty bodies are skipped, and leading blank lines are removed. This removes Gutenberg notices from the trimmed files;
-keep the originals and attribution information separately. Do not trim inside a
-downloader-managed corpus you intend to resume: its manifest hashes would change.
+Two files travel together. **`tokenizer.json`** maps text to token IDs. **`model.pt`** holds the weights that give those particular IDs meaning. Keep the exact tokenizer with every model derived from it, including fine-tuned and minified copies. A matching vocabulary size alone cannot establish compatibility.
 
-Build your own language model on your own data.
-BPE tokenizer, only supports pretraining, no RL.
+[First run](#first-run) · [Corpus preparation](#corpus-preparation) · [Tokenizer](#tokenizer) · [Model architecture](#model-architecture) · [Pretraining](#pretraining) · [Monitoring and validation](#monitoring-and-validation) · [Checkpoints and resume](#checkpoints-and-resume) · [Supervised fine-tuning](#supervised-fine-tuning) · [Inference and chat](#inference-and-chat)
 
-## Smaller inference checkpoints
+## First run
 
-To export a checkpoint without its optimizer state or learning-rate schedule:
-
-```bash
-python main.py minify --model path/to/model.pt --output path/to/model-small.pt
-```
-
-The output must be a new file. Model weights, architecture, response end marker,
-and progress metadata are retained; weights are not quantized. The original file
-is unchanged. Keep the matching tokenizer separately. The exported checkpoint
-works for inference and as a fine-tuning base, but cannot resume the original
-optimizer or learning-rate schedule. Continuing pretraining uses a fresh optimizer
-and may retain the saved epoch and step counters.
-
-## How 
+From the repository root, create a Python environment and install the project dependencies. The examples below use Bash.
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
-``` 
-
-Check out the CLI flags:
-
-```bash
-$ python main.py -h
-usage: main.py [-h] [--tokenizer TOKENIZER] [--vocab_size VOCAB_SIZE] [--verbose VERBOSE] [--lower-case LOWER_CASE] [--bpe-part BPE_PART]
-               [--epochs EPOCHS] [--context-length CONTEXT_LENGTH] [--d-model D_MODEL] [--n-heads N_HEADS] [--num-layers NUM_LAYERS] [--lr LR]
-               [--batch-size BATCH_SIZE] [--model MODEL] [--rawdata RAWDATA] [--oneliners ONELINERS] [--device DEVICE] [--prompt PROMPT]
-               [--max-new-tokens MAX_NEW_TOKENS]
-
-Train TinyGPT using a BPE tokenizer with streaming data.
-
-options:
-  -h, --help            show this help message and exit
-  --tokenizer TOKENIZER
-                        Path to tokenizer file (will load or create). Default: tokenizer.json.
-  --vocab_size VOCAB_SIZE
-                        Vocabulary size for BPE training (default: 1920).
-  --verbose VERBOSE     Enable verbose output (default: true).
-  --lower-case LOWER_CASE
-                        Only handle lower-case (default: true).
-  --bpe-part BPE_PART   Fraction of dataset used to train BPE.
-  --epochs EPOCHS       Training epochs for TinyGPT.
-  --context-length CONTEXT_LENGTH
-                        Context length (sequence length). Default: {default_model_context_length}.
-  --d-model D_MODEL     Embedding size (model width). Default 240
-  --n-heads N_HEADS     Number of heads in tranformer multi head self attention block. Default 5
-  --num-layers NUM_LAYERS
-                        Number of transformer layers. Default 6.
-  --lr LR               Learning rate. Default 0.0003.
-  --batch-size BATCH_SIZE
-                        Batch size (approximate, streaming). Default 16.
-  --model MODEL         Where to store the model data.
-  --rawdata RAWDATA     Folder where raw text corpus data resides.
-  --oneliners ONELINERS
-                        Files that are best read one at a time as text corpus
-  --device DEVICE       Compute device.
-  --prompt PROMPT       Text prompt to generate from. If set together with --model, training is skipped.
-  --max-new-tokens MAX_NEW_TOKENS
-                        Maximum number of tokens to generate during inference.
+python -m pip install -r requirements.txt
 ```
 
-Place your raw data files under the folder "rawdata" and the program will by default
-train a BPE tokenizer on the data. With --bpe-part you can set a percentage of all
-the data included in the tokenization effort. It typically takes a while.
-
-With verbose output enabled (the default), startup reports file discovery,
-tokenizer input counting and processing, cache identity checks, and token cache
-loading/saving. Slow scans report progress about every two seconds. Initial reader
-setup discovers files without reading the entire corpus just to print a count;
-a new tokenizer counts input chunks separately when needed.
-
-Large English corpora can contain thousands of distinct Unicode characters.
-New tokenizers default to `--bpe-alphabet-policy limit`: if the base alphabet
-cannot fit `--vocab_size`, keep the most frequent characters within roughly half
-the vocabulary, reserving the rest for BPE merges. Ordinary printable ASCII and
-basic whitespace are retained when the cap permits. Excluded characters map to
-`<unk>` during both training and encoding; their original spelling is lost.
-Character frequencies include all scanned training and validation text, while
-word-pair frequencies for merges use only the training sample.
-
-Use `--bpe-max-chars 1024` to set an explicit base alphabet token cap (including
-reserved symbols and `<unk>`), even when the full alphabet would fit. The default
-`0` chooses a cap automatically only when the alphabet overflows. Use
-`--bpe-alphabet-policy expand` to preserve all observed characters by growing the
-target to a power of two, or `--bpe-alphabet-policy error` to stop on overflow.
-For example, reserve Swedish and Spanish characters while limiting the alphabet:
+To try the whole workflow without a download, use two documents from this checkout as a tiny corpus. This example uses the CPU, a small model, and eager execution so you can check that everything works before spending time on a real run. Keep the same shell for the inference command.
 
 ```bash
---lower-case false --bpe-max-chars 256 --bpe-keep-chars 'åäöÅÄÖáéíóúüñ¿¡ÁÉÍÓÚÜÑ'
+RUN=$(mktemp -d)
+mkdir "$RUN/corpus"
+cp README.md details.md "$RUN/corpus/"
+
+python main.py --rawdata "$RUN/corpus" \
+  --tokenizer "$RUN/tokenizer.json" --model "$RUN/model.pt" \
+  --vocab_size 256 --bpe-part 1 --lower-case false \
+  --d-model 64 --n-heads 4 --num-layers 2 --context-length 64 \
+  --epochs 1 --device cpu --no-compile-loss \
+  --validation-fraction 0.5 --log-progress "$RUN/progress.csv"
+
+python other/inference.py --model "$RUN/model.pt" \
+  --prompt "TinyGPT" --max-new-tokens 20 --device cpu
 ```
 
-These characters are retained even if absent from the sampled corpus; other
-characters outside the cap map to `<unk>`. The cap includes the reserved
-characters, whitespace, punctuation and `<unk>`. If it is too small for the
-requested characters, training fails. With lower-casing enabled, requested
-characters are lower-cased too. This option only affects new tokenizers; it
-cannot modify an existing tokenizer or make it compatible with an old model.
-These options apply only to a new tokenizer. Existing tokenizers retain their
-saved size and fallback policy. To switch from an existing 32,768-token tokenizer
-to 8,192 tokens, select fresh `--tokenizer` and `--model` paths and restart model
-training; lowering the CLI value does not change a loaded tokenizer/checkpoint.
+The first command learns a tokenizer, holds out one document, trains on the other, and saves the checkpoint. The inference script finds `tokenizer.json` beside it. Expect this small run to exercise the pipeline, with very little data from which to learn useful completions.
 
-Training uses PyTorch's optimized causal attention and layer normalization while
-keeping checkpoint parameter names and shapes compatible. `--precision auto`
-(the default) uses BF16 autocast on CUDA GPUs with native support, and FP32
-otherwise; use `--precision float32` to keep full precision or
-`--precision bfloat16` to require native CUDA BF16. Model weights and optimizer
-state remain FP32. Validation uses the same precision as training. The console
-reports epoch completion as a percentage beside the step number. It also reports
-average full training-step time and tokens per second over each ten-step
-reporting interval, including backward/optimizer work and transfers but excluding
-batch preparation, validation and checkpoint writing. These replace the old
-forward-only `Inference` timer. Actual speed depends on the GPU and workload.
+For the full option lists, run `python main.py --help`, `python main.py finetune --help`, or `python main.py minify --help`. Each script under `other/` has its own entry point.
 
-Once the tokenizer is trained, it will try to train the model on your data.
+## Corpus preparation
 
-If you provide the program with --model it will read its hyperparameters from that
-saved pytorch-file. 
+### Download a corpus
 
-Training saves the latest model and optimizer to `--model` every 1,000 optimizer
-steps and at the end of each epoch. Set `--save-every-steps 500` to change the
-interval, or `0` for epoch-end saves only. Each save atomically replaces the
-previous checkpoint. Restarting with the same model path resumes saved weights
-and optimizer state; a checkpoint saved during an epoch restarts that epoch with
-a new shuffle rather than restoring the exact data position. Changes to the
-save interval apply when launching a new training process.
+Run `python other/download_datasets.py` to select sources, limits, and an output directory. Use **Space** to select sources, **E** to edit a limit, **F** for the full source, and **Enter** to review and confirm. **W** sets Wikipedia languages and individual quotas. **L** selects Gutenberg languages. Use `--plain` for a line-based wizard.
 
-On resume, an explicitly supplied `--lr` overrides the saved optimizer learning
-rate while retaining its moments, step counters and other optimizer settings.
-For example, add `--lr 0.00003` to continue at a lower constant rate. Omitting
-`--lr` preserves the checkpoint's saved rate; a new run defaults to `0.0003`.
-Startup prints the effective rate and whether it came from the checkpoint or
-the command line. If a launcher supplies `--lr` already, that counts as explicit;
-append the desired `--lr` to its arguments to override the launcher's value.
-With a cosine schedule, `--lr` instead overrides its peak rate while retaining
-the saved schedule position.
-
-Enable linear warmup followed by cosine learning-rate decay for a new run by
-adding these flags to `main.py` or a prepared dataset's `train.sh`:
+For a repeatable multilingual Wikipedia selection, put each language and its quota on the command line. Spanish uses `es` and Swedish uses `sv`.
 
 ```bash
---lr 0.0003 --lr-schedule cosine --warmup-steps 2000 --min-lr-ratio 0.1
+python other/download_datasets.py \
+  --wikipedia-language en=15 --wikipedia-language es=10 --wikipedia-language sv=10 \
+  --output datasets/wiki-mix
 ```
 
-Here the first update uses `0.0003 / 2000`, update 2,000 reaches `0.0003`, and
-the final planned update reaches `0.00003`. The rate remains at that floor if
-training continues. Without an explicit `--warmup-steps`, warmup uses 10% of
-planned updates, capped at 1,000. Set it to `0` to start at the peak immediately.
-`--lr-decay-steps N` explicitly sets the total schedule length **including warmup**;
-otherwise it is computed from training windows, batch size, and requested epochs.
-Choose a total greater than the warmup count.
+Limits count saved UTF-8 text in decimal GB. A source can run out before reaching its quota. `full` consumes the available source after filtering and deduplication.
 
-Checkpoints save the peak, floor ratio, warmup count, total length, and starting
-global step. Resuming restores these settings without repeating warmup, even if
-the data traversal restarts an epoch. Changing `--epochs` or batch size does not
-automatically change an existing schedule's length. Explicit schedule flags
-override saved settings; `--lr-decay-steps` changes the total length from the
-original schedule start, not the number of additional updates. To enable cosine
-on an older constant-rate checkpoint, pass `--lr-schedule cosine`; its new schedule
-starts at the checkpoint's global step. Use `--warmup-steps 0` when continuing a
-model that is already warm. `--lr-schedule constant` disables a saved schedule
-and retains the optimizer's latest rate unless `--lr` overrides it.
+| Source | What goes into the corpus |
+| --- | --- |
+| Wikipedia | Article text from the pinned November 2023 snapshot, including short entries and lists. `--wikipedia 5` selects up to 5 GB of English. The interactive **W** field also accepts lists such as `en=10,sv=2,es=full`. |
+| FineWeb-Edu | Filtered web prose. Select it in the wizard to combine it with Wikipedia or books. |
+| Project Gutenberg | Whole books with their notices. The wizard offers multiple catalog languages and one shared quota. The final book can take the download over that target. |
+| OpenBallast T2 | OpenStax textbook passages, including short definitions and examples. Use `--ballast-t2 full` or give a GB limit. The manifest records passage IDs and source information. |
+| Dolly and Alpaca variants | One formatted instruction/response example per file. These can be mixed or used individually for [supervised fine-tuning](#supervised-fine-tuning). |
 
-The default remains constant-rate training for new runs and old checkpoints.
-The console reports the active rate, and `progress.csv` includes an `lr` column
-containing the rate actually used for each optimizer update. Existing four- and
-five-column progress logs are upgraded, leaving historical rates blank.
+The downloader writes training documents under `corpus/` and source revisions, hashes, URLs, and actual sizes under `metadata/`. It drops exact duplicates across selected sources. Keep the metadata for attribution and consult the recorded dataset cards for the terms of each source.
 
-Enable validation with `--validation-fraction 0.05` (the prepared dataset's
-`train.sh` uses this by default after refreshing helpers). A deterministic split
-holds out 5% of whole files from model training. Validation reports token-weighted
-cross-entropy loss and perplexity before training, every 1,000 optimizer steps,
-and at epoch end. Lower is better. Use `--validation-every-steps 500` to change
-the interval and `--validation-batches 100` to cap evaluation cost. Every check
-uses the same sampled windows across the held-out corpus. With `--log-progress`,
-each progress row includes the latest `validation_loss`, carried forward between
-checks. The last row of each epoch includes that epoch's final validation result.
-The column is blank when validation is disabled. Existing four-column logs are
-upgraded automatically when training restarts; historical validation values stay
-blank. Detailed validation records also go into `<log path>.validation.csv`.
+A completed download includes `training_data.json` and a `train.sh` launcher. To continue an interrupted download, run `python other/download_datasets.py --resume datasets/wiki-mix`. Resume verifies the saved manifest, file sizes, and hashes. Keep a downloader-managed corpus intact if you plan to resume it.
 
-Enable sparse mixture-of-experts feed-forward blocks for a fresh model with:
+### Bring your own files
 
-```bash
---moe --num-experts 4 --moe-top-k 2 --moe-aux-loss-weight 0.01
-```
-
-Each block replaces its dense MLP with independent, full-width MLP experts and
-a learned router. Only the selected experts process each token; no tokens are
-dropped or limited by an expert capacity. Routing probabilities use FP32. Top-k
-weights are normalized over the selected experts for k > 1; top-1 retains its
-softmax probability so the task loss also trains the router. Training adds an
-expert-load balancing loss averaged across blocks. Logged training and validation
-losses remain cross-entropy, excluding this auxiliary term.
-
-MoE is off by default. Checkpoints save `moe`, `num_experts`, `moe_top_k`, and
-`moe_aux_loss_weight`. Missing fields default to the dense architecture; saved
-settings override CLI values on resume and inference, including the factuality
-test script. Use a fresh model path to enable MoE; dense checkpoints are not
-automatically converted. Existing dense weights and optimizer layouts are unchanged.
-
-This is a basic single-device sparse implementation, not an expert-parallel or
-fused-kernel implementation. Expert dispatch runs eagerly with variable token
-counts; `--compile-model` compiles the surrounding operations with graph breaks
-at MoE calls. Experts increase total parameters, optimizer memory and checkpoint
-size. With four full-width experts and top-2 routing, each token uses two MLPs
-per block rather than one, so this setting is not a speed optimization over the
-same-width dense model. CUDA throughput and long-run convergence need measurement.
-
-Enable QK normalization for a fresh model with `--qk-norm`. This applies separate
-learned RMSNorm scales to Q and K over each head's feature dimension, sharing
-scales across heads. V and the usual attention scaling are unchanged. RMS
-statistics use FP32 with epsilon 1e-6; normalized Q/K return to the attention
-dtype, so BF16 mixed precision remains supported.
-
-QK normalization is disabled by default. Checkpoints save this architecture
-setting; resume and inference use the saved value, overriding the CLI setting.
-Older checkpoints without the setting use the original architecture. To enable
-QK normalization, choose a fresh model path; this flag does not convert existing
-models. Both `main.py --prompt` and `other/inference.py` support either format.
-
-For Q/K-only compilation during pretraining, use `--no-compile-loss` and add
-`--compile-qk-norm` alongside `--qk-norm` (or resume a QK-normalized checkpoint).
-This compiles only the normalization calls with TorchInductor, retaining FP32
-normalization arithmetic and the attention dtype. Initial steps include
-compilation overhead; measure throughput after warmup. This execution setting is
-not saved: specify it again on resume. Weights and optimizer checkpoint keys stay
-unchanged. Compilation requires a working PyTorch/Inductor toolchain; failures
-are reported rather than silently falling back to eager execution.
-
-On the training GPU, compare eager, compiled and native RMSNorm with:
-
-```bash
-python other/benchmark_qk_norm.py
-```
-
-Defaults match batch 16, context 1024, 18 heads of dimension 64 with BF16.
-The benchmark uses QKV-style strided inputs, checks output and gradient agreement,
-and measures warmed-up forward/backward time and additional peak allocated memory.
-The native variant explicitly keeps the same FP32 arithmetic and epsilon.
-This is a normalization microbenchmark; verify gains with full training throughput
-under the same monitoring settings before drawing conclusions about run time.
-
-Pretraining compiles the training forward pass and cross-entropy together by
-default. MoE training includes the weighted router auxiliary loss in the backward
-objective and logs cross-entropy. `--no-compile-loss` uses the eager loss.
-The independent `--compile-model` flag compiles the model for validation too
-and still compiles the training model when using eager loss. For fully eager
-pretraining, pass `--no-compile-loss` and omit both model and Q/K compilation
-flags. Compare throughput after warmup because new shapes can trigger compilation.
-
-Pretraining uses fused AdamW on CUDA by default. Pass `--no-fused-adamw` to
-use standard AdamW. Both pretraining options apply on resume. Switching the
-optimizer backend carries over the saved moments, update counters, and optimizer
-hyperparameters. Different floating-point kernels can produce small numerical
-differences and training trajectories can diverge over many updates.
-
-Set AdamW's momentum coefficients with `--beta1 0.9 --beta2 0.95`.
-New runs default to beta1=0.9 and beta2=0.999. On resume, omitted values retain
-their checkpoint settings; explicitly supplied values override only that beta,
-preserving optimizer moments. Values must be finite and in `[0, 1)`.
-The effective betas are printed at startup and saved in checkpoints.
-
-Use `--monitor-layer-norms artifacts/layer-norms.csv --monitor-layer-norms-every 100`
-to record each transformer layer's combined parameter and gradient L2 norms every
-100 optimizer steps. Gradients are measured before clipping and parameters before
-the update. The interval uses the global step, including when resuming a checkpoint.
-The default interval is 1; less frequent measurements reduce monitoring overhead.
-The same flag also writes individual tensor norms to
-`artifacts/layer-norms.csv.parameters.csv`: token and positional embeddings,
-final LayerNorm, and all parameters in the first three transformer blocks (layers
-0–2). These measurements use the same steps and pre-clipping/pre-update timing.
-The tied token embedding/output matrix appears once as `E`. Both files append
-when resuming; use a new path to keep different runs or branches separate.
-
-Plot monitored norms with `python other/plot_progress.py --norms artifacts/layer-norms.csv`.
-Use `--series 0 --series 5` to select blocks, and `--log-gradients` for a
-logarithmic gradient axis. The individual parameter file works the same way:
-`--norms artifacts/layer-norms.csv.parameters.csv --series E --series layers.0.ln1.beta`.
-Add `--output norms.png` to save rather than display the plot. Norm plots use
-the recorded global step; repeated steps after a resumed run remain in file order.
-
-The split is by file count rather than bytes and repeats with the same corpus
-and `--validation-seed` (default 42). Training and validation use separate token
-caches; enabling the split requires tokenization once. The tokenizer vocabulary
-is shared; a new tokenizer learns merges from training files and includes
-held-out characters for encoding. A prepared tokenizer may have learned merges
-from the full corpus. Models trained before validation was enabled have already
-seen the corpus, so use a fresh model path for an unseen-data evaluation.
-Disable validation with `--validation-fraction 0` (the default for `main.py`).
-
-Generate text from a trained checkpoint:
-
-```bash
-python other/inference.py --model raw-data/artifacts/model.pt \
-  --prompt "Once upon a time" --max-new-tokens 100
-```
-
-The script loads the model architecture from the checkpoint and defaults to
-`tokenizer.json` beside the model. Use `--tokenizer PATH` if it is elsewhere;
-it must be the tokenizer used during training. Omit `--prompt` to enter it
-interactively. Output includes the prompt followed by the generated text.
-Use `--seed 42` for repeatable sampling and `--device cpu` to select the CPU.
-
-Add `--tokens-per-second` to `other/inference.py` for a summary on stderr after
-generation. It divides the actual number of generated tokens (including any
-hidden end marker) by elapsed generation time. Timing includes prompt processing
-and decoding and starts after checkpoint loading.
-
-Both inference scripts and the chat server automatically cache attention keys and
-values for each response. After reading the prompt, the model processes one new
-token per forward pass while the prefix fits in the context window. When the
-window slides, the model recomputes the retained tokens because their learned
-absolute positions have shifted. A prompt that already fills the window
-therefore gets no incremental decoding speedup. The cache lives in device memory
-for the current generation and works with existing checkpoints. Pass
-`--no-kv-cache` to either inference script or to `chat_app/server.py` at startup
-to recompute the current window for every generated token.
-
-For more conservative generation, both `main.py` and `other/inference.py` accept
-`--temperature 0.7 --top-k 40 --seed 42`. Temperature 0 selects the most probable
-token each time; the defaults (temperature 1 and top-k 0) retain unrestricted
-sampling. Start with 50–100 new tokens to assess coherence. Sampling controls
-can reduce unlikely continuations but do not establish factual accuracy.
-Inference uses the saved tokenizer's case setting, preserving case when it was
-trained with `--lower-case false`.
-
-# Other
-
-## Interactive dataset downloader
-
-### Audit a corpus before excluding foreign scripts or symbols
-
-The read-only character audit accepts a prepared dataset folder or its `corpus/`
-folder and produces per-file measurements, context examples and removal estimates:
-
-```bash
-python other/audit_corpus.py datasets/wikipedia-0.25gb_fineweb-edu-20gb_gutenberg-1gb_en
-```
-
-The default `--policy english` accepts printable ASCII, tab/CR/LF, Latin letters
-(including accents), combining marks and common English typography. To measure
-everything that an ASCII-only tokenizer would replace, add `--policy ascii`.
-Hebrew, CJK and other non-Latin letters are flagged under either policy.
-These are character suitability checks, not language identification or proof of
-data poisoning: legitimate English text can quote foreign names or mathematical
-symbols, while non-English Latin-script text and malicious English text can pass.
-
-Reports default to a new timestamped folder under `<dataset>/audits/`:
-
-- `files.csv`: every file's path, source, MB/GB, percentage of characters outside
-  policy, affected byte percentage, and percentage of letters from non-Latin scripts.
-- `flagged-files.jsonl`: flagged files with reasons, Unicode names/code points,
-  line numbers, character offsets and nearby text (`--examples 3` per file by default).
-- `characters.csv`: character frequencies, Unicode names, file counts and whether
-  the policy accepts each character. Includes accepted non-ASCII characters too.
-- `summary.json`: totals by source and whole-file removal estimates for thresholds
-  of 0%, 0.1%, 1%, 5% and 10%. Each scenario includes MB/GB removed, percentage of
-  the corpus lost, source breakdowns, and the cost of dropping entire affected
-  sources instead of just their files.
-
-A removal threshold applies to the percentage of decoded characters, including
-whitespace, and flags files **strictly above** the threshold. For example,
-`--thresholds 0,1,5,20` compares removing any affected file with removing only files
-above 1%, 5% or 20%. Removal estimates count each whole file's original bytes,
-not just the unsupported characters. Nothing is deleted, filtered or replaced.
-Invalid UTF-8 bytes and control characters are reported too. The audit streams
-file contents and prints progress during discovery and scanning. Use
-`--output PATH` to choose a new report directory outside the corpus.
-
-### Apply reviewed audit exclusions to training
-
-Choose a threshold after reviewing the report. Generate an editable exclusion
-list and config from an existing audit without rescanning any corpus text:
-
-```bash
-python other/audit_corpus.py --from-report /path/to/audit-report --exclude-above 1
-```
-
-This selects files with **more than 1%** outside-policy characters; 1% is an
-example decision threshold, not an automatic conclusion about poisoning.
-It creates `exclusions-gt-1/` inside the report, containing:
-
-- `excluded-files.txt`: one exact corpus-relative path per line; review/edit it.
-- `training_data.json`: references that list and preserves the audited suffixes,
-  directory exclusions and any prior file exclusions.
-- `selection.json`: threshold, policy, selected file count and MB/GB impact.
-
-The command prints the new config path. Add it to your training launch command:
-
-```bash
-bash "$dataset_dir/train.sh" --data-config /path/to/audit-report/exclusions-gt-1/training_data.json
-```
-
-Keep your other model/training arguments when adding this option. You can also
-generate the candidate alongside a new audit with
-`python other/audit_corpus.py "$dataset_dir" --exclude-above 1`. Different
-thresholds produce separate review folders; existing configs/reports are never
-overwritten. Generating a list does not activate it or delete any corpus files.
-
-The shared corpus config also supports manual exclusions:
+Point `--rawdata` at the root to scan. Both tokenizer training and pretraining use the same recursive file selection. The repository's [default corpus config](training_data.json) includes text, Markdown, and several source-code suffixes. For a cloned repository, a custom `--data-config` like this one selects prose and C sources.
 
 ```json
 {
-  "suffixes": [".txt"],
-  "exclude_dirs": [],
-  "exclude_files": ["gutenberg/00001/00001612.txt"],
-  "exclude_files_from": ["excluded-files.txt"]
+  "suffixes": [".txt", ".md", ".c", ".h"],
+  "exclude_dirs": [".git", "venv", "build"],
+  "exclude_files": ["drafts/unfinished.md"]
 }
 ```
 
-Exclusion paths identify files relative to the `--rawdata` corpus root; do not
-prefix them with `corpus/`. They are exact paths, not filename/glob matches.
-Referenced list filenames resolve relative to the config file, so the config and
-list can move together between machines. Blank lines and `#` comments in lists
-are ignored. Missing lists and invalid/escaping paths produce errors.
+File exclusions are exact paths relative to the corpus root. `exclude_files_from` accepts a list of filenames containing one exclusion per line. Those list filenames resolve relative to the config. Blank lines and `#` comments are ignored. Readers skip symlinks, decode text as UTF-8 with replacement, reject NUL-containing data, and omit words longer than 4,096 characters. Use `--lower-case false` to preserve case in prose or code.
 
-Exclusions apply before tokenizer preparation and the train/validation split,
-and tokenized readers honor them with explicit file lists as well. Token caches
-automatically invalidate when the effective file selection changes. Existing
-tokenizers and model checkpoints retain what they already learned; use fresh
-tokenizer/model paths to train solely on the filtered corpus.
+### Inspect and clean the data
 
-### Download datasets interactively
-
-Choose several sources, limits and a destination in a checkbox terminal UI:
+Use the character audit to find files that may need review before training. The default `english` policy accepts Latin letters, combining marks, and common English typography. `--policy ascii` applies a narrower character set. Use the excerpts to judge whether the flagged characters belong in your corpus.
 
 ```bash
-source venv/bin/activate
-pip install -r requirements.txt
-python other/download_datasets.py
+python other/audit_corpus.py datasets/wiki-mix --output audits/wiki-mix
+python other/audit_corpus.py --from-report audits/wiki-mix --exclude-above 1
 ```
 
-Available sources are Wikipedia, Dolly 15k, Alpaca, FineWeb-Edu, Project
-Gutenberg's full book catalog, and OpenBallast T2 textbook passages. Use **Up/Down** to move,
-**Space** to toggle a source, **A** to select/deselect all, **E** to edit its
-limit, **F** for `full`, **W** for Wikipedia languages and per-language limits,
-**L** for Gutenberg languages, and **O** to edit the output folder. For example,
-enter `en=10,sv=2,fr=full` on the Wikipedia language prompt. Language codes
-must correspond to configurations available in the pinned Wikimedia snapshot.
-**Ctrl-U** clears
-an edit field. Press **Enter** to review the selection, then **Enter** again to
-download; **B** returns to editing and **Q** cancels. The suggested folder includes
-the source names and limits, for example
-`datasets/wikipedia-0.25gb_dolly-full_fineweb-edu-1gb_gutenberg-0.25gb_en`.
-It updates with your selection unless you enter a custom path.
+Review `files.csv` for per-file percentages, `flagged-files.jsonl` for excerpts, `characters.csv` for character counts, and `summary.json` for estimated whole-file removal sizes by source. The second command selects files with **more than 1%** outside-policy characters. Edit `exclusions-gt-1/excluded-files.txt` and pass the adjacent `training_data.json` to the trainer to apply that selection before the validation split and tokenizer scan.
 
-Each selected source accepts a positive decimal GB amount such as `0.25` or
-`1.5`, or `full`. Limits count saved UTF-8 training text, with **1 GB =
-1,000,000,000 bytes**, preserving whole documents. Wikipedia, Dolly, FineWeb-Edu and Ballast T2
-and Alpaca stop below their caps when the next document would exceed them. Gutenberg uses
-a **soft GB target**: it saves the entire book that reaches or crosses the target,
-then stops. The result may exceed the target by part of one book; a single book
-larger than the target is still saved in full. Results may be smaller if the
-source ends first. Network traffic, streaming
-buffers, caches, filesystem overhead and training RAM are additional.
-`full` processes the entire pinned source after source-specific filtering and deduplication.
-Wikipedia preserves complete extracted article text, including short stubs, lists,
-and code; it does not apply the prose filters used by the separate
-`prepare_wikipedia_dataset.py` script. It uses Wikimedia's complete English
-`20231101.en` snapshot (6,407,814 articles), pinned to revision
-`b04c8d1ceb2f5cd4588862100d08de323dccfbaa`. This is article text from November 2023,
-not live Wikipedia, images, or edit history. The source metadata lists about
-11.63 GB compressed and 20.20 GB of dataset data; saved text and filesystem space
-differ, so 27 GB is not a fixed download size.
+To strip Gutenberg front and back matter, run `python other/trim_gutenberg.py --gutenberg-folder path/to/books --dry-run`. On a working copy, omit `--dry-run` to keep the text between the first start marker and its following end marker and remove leading blank lines. The tool skips missing markers and empty bodies. Keep the original notices and attribution with your source copy.
 
-Download Wikipedia directly without the wizard:
+### Other dataset builders
+
+| Script under `other/` | When to use it |
+| --- | --- |
+| `prepare_wikipedia_dataset.py` | Build a filtered English Wikipedia subset. Defaults to 256 MiB in `wikipedia-downloaded-data`. Use `--max-mib` or `--max-files` to change the size. This builder removes recognizable code, markup, short fragments, and duplicates. |
+| `prepare_wikipedia_fineweb_dataset.py` | Combine the verified Wikipedia subset with up to 1 GiB of filtered FineWeb-Edu from `sample-10BT`. Set `--wikipedia-dir`, `--wikipedia-mib`, or `--fineweb-mib` as needed. The launcher in `wikipedia-fineweb-data` defaults to a 512-wide, eight-layer model. |
+| `prepare_books_and_code_dataset.py` | Build a corpus of books, Rust and C/C++ repositories, and Linux. It records revisions and licenses and offers `--fresh-downloads`. Requires Git. |
+| `gutenberg_top10.py` | Download a small collection from Gutenberg's popular titles. Use `--top50` for a larger collection. |
+
+The Wikipedia/FineWeb builder has its own recovery options. `--resume` verifies the manifest and continues collection. `--finalize-existing` verifies the files and prepares a launcher from the text already collected, even if the download fell short of the target. For an older partial build, `--fineweb-revision COMMIT` supplies its known source revision.
+
+## Tokenizer
+
+BPE starts with individual characters and learns merges for frequent adjacent symbols. The resulting vocabulary determines which strings can be represented by a single token. New tokenizers preserve spaces, tabs, blank lines, and line endings. An existing `--tokenizer` file is loaded with its saved encoding rules. Choose fresh tokenizer **and model** paths when changing the vocabulary.
+
+| Setting | Effect when training a new tokenizer |
+| --- | --- |
+| `--vocab_size` | Target number of vocabulary entries, including base characters, reserved symbols, and learned merges. |
+| `--bpe-part` | Fraction of training text chunks used for merge statistics. Files are shuffled before traversal, then the first fraction of chunks is used. All selected text is scanned for character coverage, including held-out files when validation is enabled. |
+| `--bpe-max-words` | Cap on distinct words retained for merge learning. The default is 100,000. This bounds the word table even when the corpus is much larger. |
+| `--bpe-alphabet-policy` | `limit` (default) maps rare characters to `<unk>` when the base alphabet would fill the vocabulary. The automatic cap reserves roughly half the vocabulary for merges. `expand` grows the vocabulary on overflow and `error` stops training. |
+| `--bpe-max-chars` and `--bpe-keep-chars` | Set a specific base-alphabet cap and guarantee characters within it. Reserved symbols also consume slots. Characters mapped to `<unk>` lose their original spelling. |
+
+For English, Swedish, and Spanish together, one example is `--vocab_size 16384 --lower-case false --bpe-max-chars 256 --bpe-keep-chars 'åäöÅÄÖáéíóúüñ¿¡ÁÉÍÓÚÜÑ'`. Character selection affects new tokenizers only. `--bpe-part` controls the tokenizer sample. The model trains on every complete training window.
+
+## Model architecture
+
+TinyGPT is a causal transformer. It adds learned position embeddings to token embeddings, passes them through a stack of attention and feed-forward blocks, and projects the result back into the vocabulary using the token embedding weights. During pretraining, the target at each position is the following token.
+
+| Option | What it controls |
+| --- | --- |
+| `--context-length` | Maximum input window, measured in tokenizer tokens. |
+| `--d-model`, `--num-layers`, `--n-heads` | Hidden width, depth, and number of attention heads. Width must be divisible by head count. |
+| `--qk-norm` | Applies learned RMS normalization to queries and keys within each head. Statistics use FP32 and the result uses the attention dtype. |
+| `--moe --num-experts 4 --moe-top-k 2 --moe-aux-loss-weight 0.01` | Replaces each dense feed-forward block with routed experts. Each token goes to its selected experts. The optimizer objective includes a load-balancing term. The reported loss measures token prediction. |
+
+Dense blocks are the default. MoE adds expert parameters and optimizer state even though each token uses only a subset. Expert dispatch runs eagerly on one device. Q/K normalization and MoE are architecture choices for a **fresh model**. On resume and inference, saved checkpoint settings take precedence. The implementation is in [tinygpt.py](tinygpt.py).
+
+## Pretraining
+
+For a prepared dataset, use its launcher. It supplies the corpus root, config, tokenizer and checkpoint paths, and a baseline training configuration. Append options to override those defaults. This example uses the `datasets/wiki-mix` download from above and gives the run its own artifacts directory.
 
 ```bash
-python other/download_datasets.py --wikipedia full --output datasets/wikipedia-full
-python other/download_datasets.py --wikipedia 5 --output datasets/wikipedia-5gb
-python other/download_datasets.py --wikipedia-language en=10 --wikipedia-language sv=2 --output datasets/wikipedia-en-sv
-python other/download_datasets.py --ballast-t2 full --output datasets/ballast-t2
+RUN=runs/wiki-mix
+mkdir -p "$RUN"
+bash datasets/wiki-mix/train.sh \
+  --tokenizer "$RUN/tokenizer.json" --model "$RUN/model.pt" \
+  --log-progress "$RUN/progress.csv" \
+  --monitor-layer-norms "$RUN/layer-norms.csv" --monitor-layer-norms-every 100 \
+  --vocab_size 16384 --lower-case false --bpe-max-chars 256 \
+  --bpe-keep-chars 'åäöÅÄÖáéíóúüñ¿¡ÁÉÍÓÚÜÑ' \
+  --d-model 768 --n-heads 12 --num-layers 16 --context-length 512 \
+  --batch-size 16 --epochs 1 --qk-norm \
+  --lr 0.0001 --beta1 0.9 --beta2 0.95 --lr-schedule cosine \
+  --validation-fraction 0.05 --validation-every-steps 1000 \
+  --validation-batches 50 --save-every-steps 1000
 ```
 
-OpenBallast T2 uses the `passages` subset of `OpenBallast/ballast-t2`, pinned
-to a resolved Hub revision and streamed into individual text files. It defaults
-to `full` (the dataset card reports about 92 MB of text); a decimal GB limit is
-also supported. It preserves short definitions, examples and formulas without
-the FineWeb prose filter. The manifest retains passage IDs, source URLs,
-source revisions and license evidence. The dataset card identifies the material
-as OpenStax CC BY 4.0 and notes that figures and math markup were removed during
-upstream preparation, so some cross-references and formulas may be incomplete.
+For a custom corpus, invoke `python main.py` with `--rawdata`, `--data-config`, and your chosen training options directly. A new tokenizer first counts chunks and learns merges. The reader then packs tokens into windows of `context_length + 1` and uses shifted inputs and targets. Each epoch shuffles all complete training windows and visits each once. At batch 16 and context 512, a full optimizer update has 8,192 target tokens.
 
-The same GB/full choices are available in the interactive UI. `full` has no byte
-or article-count cap and streams every English shard to exhaustion. Empty/invalid
-text and exact duplicate documents are omitted; article IDs, titles, and URLs are
-retained in the manifest. Use a fresh folder when switching from an older,
-prose-filtered Wikipedia download.
+The reader caches four-byte token IDs on disk and holds the tokens and shuffle indices in RAM during training. Training and validation have separate caches when a split is enabled. Changes to file selection, paths, sizes, modification times, or tokenizer settings trigger a rebuild. Verbose startup reports scanning, tokenizer preparation, and cache progress.
 
-For FineWeb-Edu this means the complete collection, which is very large;
-for Gutenberg it means all available text books matching the selected languages.
+### Optimizer and learning rate
 
-Gutenberg has no book-count cap. Press **L** to load its compressed CSV catalog
-and choose multiple languages from the ten with the most text titles. Only
-English is selected by default. The language screen uses **Space** to toggle
-and **Enter** to apply; at least one language is required. The line-based wizard
-offers the same choices. The GB cap covers all selected languages together,
-not a separate quota per language. Gutenberg defaults to a soft `0.25` GB target.
-Books are considered in ascending Gutenberg ID order; multilingual books
-matching any selected language are included once. Missing or unusable UTF-8 text
-editions are skipped. If the text endpoint returns HTTP 404, 406 or 410, the
-downloader tries Gutenberg's generated text URL before skipping that title.
-Rate-limit, permission and server errors still stop the run rather than silently
-skipping books. The catalog hash, retrieval time, selected languages and
-skip count are recorded in the summary, with authors and language codes in each
-book's manifest record. The downloaded catalog is reused throughout the run.
+AdamW defaults to a constant learning rate of `0.0003` and betas of `0.9` and `0.999` on a new run. Set `--beta1` and `--beta2` independently. With `--lr-schedule cosine`, `--lr` is the peak. The rate rises linearly over `--warmup-steps` updates, then decays to `--min-lr-ratio` times the peak (default `0.1`).
 
-The downloader streams Hugging Face sources and stores document hashes in SQLite
-to avoid keeping a full-dataset hash set in RAM. It filters FineWeb
-prose, preserves Wikipedia article text and Dolly instruction/context/response pairs (including short
-answers), and keeps Gutenberg book notices. Exact duplicates across selected
-sources are omitted. Dolly is formatted as training text; the trainer still
-performs ordinary next-token prediction. Source revisions, document URLs, hashes
-and actual sizes are recorded under `metadata/`.
+The default warmup is 10% of planned updates, capped at 1,000. Set `--warmup-steps 0` to start at the peak. `--lr-decay-steps` sets the total schedule length **including warmup**. Otherwise the trainer derives it from epochs, windows, and batch size. Once reached, the floor holds for subsequent updates.
 
-Downloads show progress in the terminal. Existing nonempty folders are refused.
-Interrupted downloads retain their text and metadata, with a partial status in
-`metadata/summary.json`. Continue an existing failed or interrupted download with:
+### Device, precision, and compilation
+
+The trainer automatically selects CUDA, then MPS, then CPU according to availability. Use `--device` to choose explicitly. Pretraining `--precision auto` uses BF16 autocast on CUDA devices with native BF16 support and FP32 elsewhere. `--precision bfloat16` requires that support. `--precision float32` selects FP32 execution. Checkpoint weights and optimizer moments use FP32.
+
+| Pretraining setting | Behavior |
+| --- | --- |
+| Fused AdamW | Enabled on CUDA. `--no-fused-adamw` selects standard AdamW, including when resuming. |
+| Compiled training loss | The training forward pass and cross-entropy compile together by default. `--no-compile-loss` uses the eager loss. |
+| `--compile-model` | Also compiles the model for validation. Combined with `--no-compile-loss`, the model compiles and cross-entropy runs eagerly. |
+| `--compile-qk-norm` | Compiles Q/K normalization on a QK-normalized model. For Q/K-only pretraining compilation, add `--no-compile-loss` and omit `--compile-model`. |
+
+For fully eager pretraining, use `--no-compile-loss` and omit both optional compilation flags. Compilation needs a working PyTorch/Inductor toolchain. Initial calls and new batch shapes can incur compilation time. Compare steady-state throughput after warmup. To measure Q/K normalization in isolation, run `python other/benchmark_qk_norm.py` on the training GPU.
+
+## Monitoring and validation
+
+Pretraining prints the step, percentage of the current epoch, cumulative mean training loss, and learning rate. The ten-step throughput figure includes transfers, forward pass, backward pass, and optimizer work. Batch preparation, validation, progress CSV writes, and checkpoint writes take additional wall time.
+
+`--validation-fraction 0.05` holds out 5% of **files** before model training. With the default `--validation-seed 42`, each evaluation uses the same sample of held-out windows. Validation loss is the mean cross-entropy over target tokens. Perplexity is `exp(validation_loss)`. Compare checkpoints using the same tokenizer and evaluation sample. These measures track next-token prediction. Use task prompts to assess factual recall or instruction following.
+
+| Output from the pretraining example | What to read |
+| --- | --- |
+| `progress.csv` | One row per update with batch loss, epoch mean loss, latest validation loss, learning rate used, and gradient norm before clipping. The validation value carries forward between evaluations. |
+| `progress.csv.validation.csv` | One row per evaluation with global step, validation loss, perplexity, and token count. |
+| `layer-norms.csv` | Per-block parameter and gradient L2 norms. `--monitor-layer-norms-every` controls sampling by global step (default 1 when monitoring is enabled). |
+| `layer-norms.csv.parameters.csv` | At the same interval, norms for embeddings, final LayerNorm, and individual parameters in the first three blocks. Measurements precede clipping and the optimizer update. |
+
+Direct `main.py` pretraining defaults to validation disabled. When enabled, it evaluates before the first update, every 1,000 steps, and at epoch end. `--validation-every-steps 0` keeps just the initial and epoch-end checks. `--validation-batches` bounds the cost per check. Enabling a split late can hold out files that a checkpoint has already seen.
 
 ```bash
-python other/download_datasets.py --resume <chosen-folder>
+tail -f "$RUN/progress.csv"
 ```
 
-Resume verifies the manifest, file sizes and hashes, rebuilds deduplication
-metadata, and restores the saved limits and languages. Finished sources are
-reused; already-saved Gutenberg book IDs are skipped before downloading. Partial
-Hugging Face sources replay their recorded revision and skip known documents.
-Invalid manifests or modified/unlisted corpus files stop verification before
-any downloads. Resume also works for folders produced before this flag existed.
-
-Completion creates `training_data.json` and `train.sh`. Start training
-separately with `bash <chosen-folder>/train.sh`.
-
-For terminals without curses, use the line-based multi-selection wizard:
+The plotting script accepts either progress CSV or a norms CSV. These commands save one image for each.
 
 ```bash
-python other/download_datasets.py --plain
+python other/plot_progress.py --input "$RUN/progress.csv" --output "$RUN/training.png"
+python other/plot_progress.py --input "$RUN/progress.csv.validation.csv" --output "$RUN/validation.png"
+python other/plot_progress.py --norms "$RUN/layer-norms.csv" \
+  --series 0 --series 5 --log-gradients --output "$RUN/norms.png"
 ```
 
-Not sure about what data to train on? Under other/ there is a script that downloads
-the top 10 books in text format from Project Gutenberg. If you use the flag --top50 it
-instead downloads the top 50 books. That can serve as a dataset if you don't know 
-what to train on. 
+Omit `--output` for an interactive plot. For a named tensor, pass the `.parameters.csv` file to `--norms` and select, for example, `--series E`. Use separate log paths for separate runs. Compatible older progress headers are upgraded on append, leaving unknown historical values blank.
 
-## English Wikipedia dataset
+## Checkpoints and resume
 
-English Wikipedia is a useful starting point for factual English prose. It teaches
-an encyclopedic style; pretraining alone does not teach chat or instruction following.
-The new preparation script selects the cleaned `20231101.en` snapshot from
-[Wikimedia's Wikipedia dataset](https://huggingface.co/datasets/wikimedia/wikipedia).
-Start with the default 256 MiB subset before scaling up:
+Pretraining saves to `--model` every 1,000 optimizer updates and at each epoch end. `--save-every-steps N` changes the interval. Set it to `0` for epoch-end saves only. Each successful save atomically replaces the previous file. Copy a checkpoint to a separate path when you want to retain a particular step for evaluation.
+
+To continue a run, launch pretraining with the same model, tokenizer, and corpus. A full checkpoint restores weights, architecture, optimizer moments, update counters, and any saved learning-rate schedule. **A mid-epoch checkpoint restarts traversal of that epoch with a fresh shuffle.** Some windows can be seen again. Checkpoint step counters and schedule position continue from the save.
+
+On resume, omitted learning-rate and beta options retain their saved values. An explicit `--lr` overrides the constant rate or the peak of a cosine schedule. Launcher defaults count as explicit arguments. A saved cosine schedule retains its original length even if batch size or epochs change. `--lr-decay-steps` overrides the total from the original schedule start. Enabling cosine on a constant-rate checkpoint starts a schedule at its saved global step. Switching to `--lr-schedule constant` returns to the latest optimizer rate unless you also set `--lr`.
+
+Use `minify` to export a smaller checkpoint for inference or fine-tuning. Choose a new output path.
 
 ```bash
-python -m pip install datasets
-python other/prepare_wikipedia_dataset.py
-bash wikipedia-downloaded-data/train.sh
+python main.py minify --model "$RUN/model.pt" --output "$RUN/model-inference.pt"
 ```
 
-The script downloads from the internet and never reads `fullEnglish/` or other
-local source folders. Output defaults to `wikipedia-downloaded-data`; use
-`--output PATH` to choose another destination.
-The download streams with a seeded, bounded shuffle. Increase `--max-mib 1024`
-for a larger corpus, or use `--max-files 1000` to limit accepted articles.
-Preparation never starts training and refuses to overwrite a nonempty destination.
-The generated launcher uses separate tokenizer/model paths and holds out 5% of
-files for validation. The corpus config accepts only `.txt`; metadata and training
-artifacts are stored outside the corpus.
+The export keeps the original weight precision, model config, progress metadata, and saved response marker. It strips the AdamW state and learning-rate schedule. Keep the full checkpoint for continuing the original pretraining run, and the matching tokenizer for both files.
 
-The script filters recognizable code blocks, code-like paragraphs, markup and
-short fragments, and removes exact cleaned-file duplicates. English Wikipedia can
-still contain foreign quotations and snippets that these heuristics miss. No source
-repositories or books are mixed in. Article URLs and file hashes are recorded in
-`metadata/files.jsonl`. See the
-dataset card for its CC BY-SA/GFDL licensing information.
+## Supervised fine-tuning
 
-## English Wikipedia + 1 GiB of FineWeb-Edu
+Pretraining learns continuations across the whole text. Supervised fine-tuning (SFT) starts from a pretrained checkpoint and teaches it to produce the response to a given instruction. **Only the answer and its end marker contribute to the loss.** The prompt supplies the context needed to predict them. Use the pretrained model's exact whitespace-preserving tokenizer.
 
-Prepare a new mixed corpus and its own training launcher:
+The downloader normalizes Dolly and Alpaca records into one text file per example. Alpaca's `input` becomes optional context, `instruction` becomes the question or task, and `output` becomes the response. Here is a complete example with context.
+
+```text
+### Context
+The library closes at six on Fridays.
+
+### Instruction
+When does the library close on Friday?
+
+### Response
+At six.
+```
+
+Omit the context section for a standalone instruction. The reader also accepts older instruction-first files and places their context first. Long responses are windowed so each answer token is trained once. The trainer appends `\n\n### End Response\n` and saves the marker in the checkpoint. `--response-end-marker` selects another nonempty string the tokenizer can represent exactly.
+
+Download one of `--alpaca`, `--dolly-alpaca`, `--alpaca-gpt4`, `--alpaca-cleaned`, or `--gpt4-llm-cleaned`, or combine them. The wizard also offers the original Dolly 15k. This example fine-tunes the base model from the pretraining section using two sources.
 
 ```bash
-python other/prepare_wikipedia_fineweb_dataset.py
-bash wikipedia-fineweb-data/train.sh
+python other/download_datasets.py --alpaca-gpt4 full --alpaca-cleaned full \
+  --output datasets/instructions
+
+python main.py finetune --data datasets/instructions/corpus \
+  --base-model "$RUN/model.pt" --tokenizer "$RUN/tokenizer.json" \
+  --output "$RUN/instruct.pt" --epochs 3 --batch-size 2 --lr 0.00002 \
+  --validation-every-steps 500 --save-every-steps 500
 ```
 
-The script reuses `wikipedia-downloaded-data` after verifying its manifest and
-file hashes. If absent, it downloads the same 256 MiB English Wikipedia subset
-used by the standalone script. All of the existing subset is included when reused.
-Use `--wikipedia-dir PATH` to choose a different prepared download or
-`--wikipedia-mib 1024` to increase the Wikipedia subset when downloading it anew.
-It does not use `fullEnglish/` or the old books/code corpus.
+`--data` is scanned recursively, so you can point it at one source subdirectory or a corpus containing only formatted examples. Use `main.py finetune` for response-only training. A dataset's `train.sh` performs ordinary next-token pretraining even when its files contain instructions.
 
-FineWeb-Edu is downloaded one cached Parquet shard at a time from `sample-10BT`,
-then read locally in small batches without threaded remote Parquet reads. It uses English language
-metadata and language score >= 0.9. The default `--fineweb-mib 1024` adds up to
-1 GiB (1,073,741,824 bytes) of cleaned UTF-8 text, stopping just below the limit
-to keep whole documents. This is additional to Wikipedia. Compressed download
-sizes, Hub caches and filesystem overhead are not counted. Exact duplicates are
-removed across both sources; prose/code filtering is heuristic, as above.
+Fine-tuning requires a new output path, creates a fresh AdamW optimizer, holds out 5% of examples by default, and counts training windows up front. Epoch completion and throughput appear every 100 steps and at epoch end. Throughput counts input positions, including prompt and padding. To compile fine-tuning, pass `--compile-model` or, on a QK-normalized checkpoint, `--compile-qk-norm`.
 
-The launcher uses width **512**, **8 layers**, **8 heads**, context **512** and an
-8,192-token vocabulary: about **29.7M parameters**. Defaults are batch size 4,
-learning rate 0.0003, 3 epochs and 5% validation. Override, for example, with
-`bash wikipedia-fineweb-data/train.sh --batch-size 2 --epochs 1`.
-It creates fresh model/tokenizer artifacts; existing Wikipedia training artifacts
-are not reused. Model training still holds token IDs and shuffle indices in RAM.
+By default, fine-tuning validates and saves at epoch end. The interval flags in the example add checks and saves every 500 optimizer steps. Progress goes to `<output>.progress.csv` and evaluations to `<output>.progress.csv.validation.csv`. `--log-progress` chooses another base log path. Logs append, but step and epoch numbering start over for each new fine-tuning run. An intermediate checkpoint can serve as the base for another run with a fresh optimizer.
 
-Source URLs, hashes, revisions and actual byte counts are recorded under
-`metadata/`. Existing nonempty output folders are protected. Interrupted mixed
-builds can be verified and continued with:
+## Inference and chat
+
+For a pretrained checkpoint, give `other/inference.py` a text prefix. For an instruction-tuned checkpoint, use the same section headings it saw during fine-tuning. End the prompt immediately after the response heading and newline.
 
 ```bash
-python other/prepare_wikipedia_fineweb_dataset.py --resume
+python other/inference.py --model "$RUN/instruct.pt" --tokenizer "$RUN/tokenizer.json" \
+  --prompt $'### Instruction\nExplain gravity in one sentence.\n\n### Response\n' \
+  --max-new-tokens 100 --temperature 0.7 --top-k 40 --seed 42 --tokens-per-second
 ```
 
-Resume replays cached shards and skips documents already in the manifest. For a
-nearly complete build, finalize the collected text without further network access:
+`--temperature 0` selects the highest-scoring next token. The defaults (`--temperature 1` and `--top-k 0`) sample across the vocabulary. `--max-new-tokens` caps the continuation. The script stops at a generated checkpoint end marker and hides it by default. Use `--show-end-marker` to display it. `--tokens-per-second` writes elapsed generation time, actual generated token count, and throughput to stderr. Timing includes prompt processing and starts after checkpoint loading.
+
+Both `main.py --prompt` and the standalone inference script support sampling controls. For a simple factual completion check, run `python tests/test_factfulness.py --model "$RUN/model.pt" --tokenizer "$RUN/tokenizer.json"`. It scores a small built-in prompt set. To run the software regression suite, use `python -m unittest discover -s tests -v`.
+
+The inference scripts and chat server use a key/value (KV) cache to store attention keys and values per generation by default. After the initial prompt, the model processes one new token per forward pass while the prefix fits. When the window slides, retained tokens shift absolute positions and their representations are recomputed. Pass `--no-kv-cache` to disable this optimization, including in the factuality runner.
+
+### Local chat server
 
 ```bash
-python other/prepare_wikipedia_fineweb_dataset.py --finalize-existing
+python chat_app/server.py --model-dir "$RUN" --model "$RUN/instruct.pt" \
+  --tokenizer "$RUN/tokenizer.json"
 ```
 
-Both recovery modes verify hashes and report progress every 5,000 documents.
-Partial manifest tails and unlisted files from an interrupted write are preserved
-under `metadata/`. Finalization records the actual size, which may be below 1 GiB.
-New builds record their source revision before collection. For an older interrupted
-build, `--fineweb-revision COMMIT` supplies its known revision; otherwise it is
-marked unknown. Completed datasets cannot be overwritten using recovery options.
+Open `http://127.0.0.1:8000`. The browser streams the answer, shows the active checkpoint, and lets you switch between `.pt` files in the model directory that share the supplied tokenizer. Previous turns go under `### Context`, followed by the newest instruction. Older tokens fall outside the model's window as the conversation grows.
 
-## Books and source-code dataset (previous example)
-
-To prepare a complete book and code corpus (20 Rust repositories, five C/C++
-repositories, and Linux), run:
-
-```bash
-python3 other/prepare_books_and_code_dataset.py
-```
-
-The script prompts for a destination folder, downloads or reuses sources, filters
-and deduplicates the text, and records source revisions and licenses. Use
-`--fresh-downloads` to download every source instead of automatically reusing
-local books and Linux. The resulting folder contains its own README and a
-`train.sh` launcher. Preparation requires Python 3.10+ and Git; model training
-requires the dependencies above.
-
-This is the original dataset builder, renamed from `prepare_example_dataset.py`.
-Its books, repository list and preparation behavior are preserved.
-
-## Training on a cloned repository
-
-Use Python 3.10 or newer. Folder scanning is recursive, for both tokenizer
-training and model pretraining. Edit `training_data.json` to choose suffixes
-(case insensitive) and directory names to exclude:
-
-```json
-{
-  "suffixes": [".txt", ".c", ".cpp", ".md", ".h", ".hpp"],
-  "exclude_dirs": [".git", "venv", ".venv", "node_modules", "build", "dist"]
-}
-```
-
-For example, after cloning a repository into `rawdata/my-project`:
-
-```bash
-python main.py --rawdata rawdata/my-project --data-config training_data.json \
-  --tokenizer tokenizers/my-project.json --model models/my-project.pt \
-  --lower-case false --bpe-part 1 --bpe-max-words 100000
-```
-
-Use a fresh tokenizer and model path for a new corpus. Existing tokenizers are
-loaded rather than retrained; they may lack characters in new data. For source
-code, `--lower-case false` preserves case. Newly trained tokenizers preserve
-spaces, tabs, indentation, blank lines, trailing whitespace, and line endings
-(including CRLF). Whitespace uses explicit character tokens, with no synthetic
-end-of-word markers, so decoding reproduces the original formatting.
-
-Symbolic links are skipped. Files are decoded as UTF-8 with replacement for
-invalid bytes; NUL-containing data raises an error identifying the file. Check
-that the suffix list selects text files. Words longer than 4096 characters
-(such as encoded blobs) are omitted in both stages.
-
-The raw corpus now streams from disk. BPE retains at most `--bpe-max-words`
-unique words for merge learning; later unseen words are skipped for merge
-statistics, while their characters remain encodable. `--bpe-part` selects the
-fraction of chunks used for merges; all accepted text is scanned for character
-coverage, and all accepted text is used for model pretraining. The word cap
-reduces memory at the cost of less representative merge statistics; lower it
-if memory is tight. It is a sampling limit, not a fixed RAM budget.
-
-Disk streaming is used for corpus preparation. During model pretraining, all
-context windows across all accepted files share one globally shuffled index.
-Each epoch reshuffles that index and visits every complete window once, so
-batches sample across the dataset rather than walking through one file at a
-time. This is sampling without replacement within each epoch.
-
-Token IDs use four bytes each, and training windows are sliced as needed rather
-than duplicated. Token IDs and shuffle indices still reside in memory, so very
-large corpora can require substantial RAM. Token caches are rebuilt when source
-paths, sizes, modification times, or tokenizer settings change. Old caches
-without metadata are rebuilt once.
-
-Previously saved tokenizers keep their original encoding behavior for checkpoint
-compatibility. To learn formatting, train a new tokenizer and model using fresh
-paths; existing weights cannot be reused with a changed token-to-ID mapping.
-Token caches rebuild automatically for the updated text processing.
-
-Run the corpus/tokenizer and transformer regression tests with:
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-### Supervised fine-tuning with Dolly
-
-Dolly contains instruction/response examples. Start with a **pretrained model**
-and the exact tokenizer that produced its training IDs; a tokenizer with the same
-vocabulary size is not necessarily the same tokenizer. Download Dolly with
-`python other/download_datasets.py`, then run for example:
-
-Alpaca is also available in the downloader, including non-interactively with
-`python other/download_datasets.py --alpaca full --output datasets/alpaca`.
-Its input field becomes a `### Context` section, so the resulting
-`datasets/alpaca/corpus/alpaca` directory can be passed to `--data` below.
-Alpaca is licensed CC BY-NC 4.0; check its dataset card for terms and provenance.
-
-The downloader also offers `--dolly-alpaca`, `--alpaca-gpt4`,
-`--alpaca-cleaned`, and `--gpt4-llm-cleaned`, each accepting `full` or a GB
-limit. They are also available in the interactive source list. Their Alpaca
-`instruction`, `input`, and `output` fields become the same context, instruction,
-and response sections used by the fine-tuning script. For example:
-
-```bash
-python other/download_datasets.py --alpaca-gpt4 full --alpaca-cleaned full --output datasets/alpaca-variants
-python main.py finetune --data datasets/alpaca-variants/corpus --base-model path/to/pretrained-model.pt --tokenizer path/to/tokenizer.json --output models/alpaca-variants.pt
-```
-
-The source revisions and dataset cards are recorded in the download metadata.
-The variants can overlap: exact formatted duplicates are removed across the
-download, but similar examples and shared instructions with different responses
-remain. Check the individual dataset cards for licenses and use restrictions.
-
-```bash
-python main.py finetune --data datasets/dolly-full/corpus/dolly \
-  --base-model path/to/pretrained-model.pt \
-  --tokenizer path/to/pretraining-tokenizer.json \
-  --output models/dolly-sft.pt --epochs 3 --batch-size 2 --lr 0.00002
-```
-
-The output must be a new path. The pretrained weights remain intact. The script
-uses a fresh AdamW optimizer, splits examples into training and validation sets,
-reports response-only loss and saves after each epoch. It masks instruction and
-context tokens from the loss. Long examples are split into windows; each response
-token is trained once with up to the model's context length of preceding tokens.
-Use `--save-every-steps N` to also save every N optimizer steps. Intermediate
-saves atomically replace the checkpoint at `--output`. The default, `0`, saves
-only at epoch end. Fine-tuning can use an intermediate checkpoint as a new base
-with a fresh optimizer. Save the tokenizer alongside the
-fine-tuned checkpoint and retain the Dolly dataset metadata for attribution.
-
-Fine-tuning counts training windows before the first epoch and prints the epoch
-completion percentage and average tokens per second every 100 steps and at
-epoch end. The CSV also records per-step `tokens_per_second`. Throughput counts
-all input positions, including prompt and padding, and measures training-step
-time including any compilation during the step.
-
-Pass `--compile-model` to compile the whole model during fine-tuning, or
-`--compile-qk-norm` to compile only Q/K normalization on a QK-normalized
-checkpoint. If both are given, whole-model compilation takes precedence.
-Different batch shapes may trigger additional compilation.
-
-Fine-tuning writes per-step response loss, cumulative token-weighted loss, learning
-rate and pre-clipping gradient norm to `<output>.progress.csv` by default. Use
-`--log-progress` to select another path. Use `--validation-every-steps N` to
-evaluate the held-out split every N optimizer steps as well as at each epoch
-end. The default, `0`, evaluates only at epoch end. Validation loss, perplexity
-and response-token count are written to `<progress path>.validation.csv`.
-Plot either file with `python other/plot_progress.py --input <path>`; monitor
-updates with `tail -f <progress path>`. Existing logs receive new rows, with
-epoch and step numbering starting over for each fine-tuning run.
-
-Use the same prompt format at inference:
-
-```bash
-python other/inference.py --model models/dolly-sft.pt \
-  --tokenizer path/to/pretraining-tokenizer.json \
-  --prompt $'### Instruction\nExplain gravity.\n\n### Response\n'
-```
-
-Include `### Context\n` and the context text before `### Instruction` when
-needed. Fine-tuning also accepts older files with context after the instruction
-and rearranges them during training. This tokenizer has no dedicated end-of-response token; generation uses
-`--max-new-tokens` and may continue past the answer for older checkpoints. New
-fine-tuning runs append `\n\n### End Response\n` to every target response and
-store it in the checkpoint. Set `--response-end-marker` to another nonempty
-string representable by the existing tokenizer. The chat server and inference
-tool stop when they generate the saved marker; the token limit still applies if
-the model does not produce it. The generic Dolly `train.sh`
-performs ordinary next-token training, not supervised fine-tuning.
-
-Pass `--show-end-marker` to `other/inference.py` to display the marker if it
-was generated. The marker remains hidden by default.
-
-For the Dolly run based on `artifacts-2026-11-16/model.pt`, try the checkpoint
-after it is saved with `bash other/test_dolly.sh 'Explain gravity.'`. Extra
-arguments are passed to the inference tool, for example `--temperature 0
---max-new-tokens 100`. Omit the instruction to enter it interactively.
+Conversations are stored in SQLite and can be deleted from the sidebar. For a separate record of the formatted input and generated output, start the server with `--log-io path/to/generations.jsonl`. That opt-in log retains its own copy when a conversation is deleted. See the [chat app guide](chat_app/details.md) for model selection, storage paths, and server options.
