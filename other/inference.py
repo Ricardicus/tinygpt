@@ -4,6 +4,7 @@ import argparse
 import math
 from pathlib import Path
 import sys
+import time
 
 import torch
 
@@ -11,6 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bpe import BPE
 from main import generate
 from tinygpt import TinyGPT, MOE_DEFAULTS
+
+
+def synchronize_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def main(argv=None):
@@ -25,10 +33,14 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, help="Random seed for repeatable sampling.")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Sampling temperature; 0 is greedy (default: 1).")
+    parser.add_argument("--no-kv-cache", dest="use_kv_cache", action="store_false",
+                        help="Disable KV caching during generation (enabled by default).")
     parser.add_argument("--top-k", type=int, default=0,
                         help="Sample from the top K tokens; 0 uses all tokens (default: 0).")
     parser.add_argument("--show-end-marker", action="store_true",
                         help="Show the checkpoint's response end marker when generated.")
+    parser.add_argument("--tokens-per-second", action="store_true",
+                        help="Print generated token count, elapsed generation time, and tokens/s to stderr.")
     args = parser.parse_args(argv)
     if not math.isfinite(args.temperature) or args.temperature < 0 or args.top_k < 0:
         parser.error("--temperature must be finite and nonnegative; --top-k must be nonnegative")
@@ -69,13 +81,23 @@ def main(argv=None):
     model.load_state_dict(checkpoint["model_state_dict"])
     if args.seed is not None:
         torch.manual_seed(args.seed)
-    result = generate(model, tokenizer, prompt, args.max_new_tokens, args.device,
-                      temperature=args.temperature, top_k=args.top_k,
-                      response_end_marker=checkpoint.get('response_end_marker'),
-                      show_end_marker=args.show_end_marker)
+    if args.tokens_per_second:
+        device = torch.device(args.device)
+        synchronize_device(device)
+        started = time.perf_counter()
+    result, token_count = generate(
+        model, tokenizer, prompt, args.max_new_tokens, args.device,
+        temperature=args.temperature, top_k=args.top_k, response_end_marker=checkpoint.get('response_end_marker'),
+        show_end_marker=args.show_end_marker, use_kv_cache=args.use_kv_cache, return_token_count=True)
+    if args.tokens_per_second:
+        synchronize_device(device)
+        elapsed = time.perf_counter() - started
     if not tokenizer.preserve_whitespace:
         result = result.replace(tokenizer.get_end_of_word_mark(), " ")
     print(result)
+    if args.tokens_per_second:
+        print(f"Generated {token_count} tokens in {elapsed:.3f} s ({token_count / elapsed:.2f} tokens/s)",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":

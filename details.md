@@ -317,6 +317,21 @@ it must be the tokenizer used during training. Omit `--prompt` to enter it
 interactively. Output includes the prompt followed by the generated text.
 Use `--seed 42` for repeatable sampling and `--device cpu` to select the CPU.
 
+Add `--tokens-per-second` to `other/inference.py` for a summary on stderr after
+generation. It divides the actual number of generated tokens (including any
+hidden end marker) by elapsed generation time. Timing includes prompt processing
+and decoding and starts after checkpoint loading.
+
+Both inference scripts and the chat server automatically cache attention keys and
+values for each response. After reading the prompt, the model processes one new
+token per forward pass while the prefix fits in the context window. When the
+window slides, the model recomputes the retained tokens because their learned
+absolute positions have shifted. A prompt that already fills the window
+therefore gets no incremental decoding speedup. The cache lives in device memory
+for the current generation and works with existing checkpoints. Pass
+`--no-kv-cache` to either inference script or to `chat_app/server.py` at startup
+to recompute the current window for every generated token.
+
 For more conservative generation, both `main.py` and `other/inference.py` accept
 `--temperature 0.7 --top-k 40 --seed 42`. Temperature 0 selects the most probable
 token each time; the defaults (temperature 1 and top-k 0) retain unrestricted

@@ -91,12 +91,16 @@ def parseArguments():
         default=default_device(),
         help="Compute device.",
     )
+    parser.add_argument(
+        "--no-kv-cache", dest="use_kv_cache", action="store_false",
+        help="Disable KV caching during generation (enabled by default).",
+    )
 
     return parser.parse_args()
 
 def prompt_response(prompt, model, bpe):
     result = generate(model, bpe, prompt, 30, args.device,
-                      temperature=0.01, top_k=0)
+                      temperature=0.01, top_k=0, use_kv_cache=args.use_kv_cache)
     if not bpe.preserve_whitespace:
         result = result.replace(bpe.get_end_of_word_mark(), " ")
     return result
@@ -209,7 +213,7 @@ tests = [
             "cold",
             "down",
             "small",
-            ["sad", "unhappiness", "not happy"],
+            ["sad", "unhappiness", "not happy", "unhappy"],
             "slow",
             "dark",
             "old",

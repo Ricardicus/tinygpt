@@ -11,10 +11,50 @@ import torch
 
 from bpe import BPE
 from main import generate, main, parse_args, save_checkpoint
-from tinygpt import TinyGPT
+from tinygpt import TinyGPT, generate_token_ids
 
 
 class InferenceTests(unittest.TestCase):
+    def test_no_kv_cache_flag_recomputes_each_window(self):
+        self.assertTrue(parse_args([]).use_kv_cache)
+        options = parse_args(['--no-kv-cache'])
+        self.assertFalse(options.use_kv_cache)
+        model = TinyGPT(20, 4, 12, 3, 1).eval()
+        tokenizer = Mock()
+        tokenizer.encode.return_value = [1, 2]
+        tokenizer.decode.side_effect = list
+        expected = generate(model, tokenizer, 'prompt', 5, temperature=0)
+        with patch.object(model, 'forward', wraps=model.forward) as forward:
+            actual = generate(model, tokenizer, 'prompt', 5, temperature=0, use_kv_cache=options.use_kv_cache)
+        self.assertEqual(actual, expected)
+        self.assertEqual([call.args[0].size(1) for call in forward.call_args_list], [2, 3, 4, 4, 4])
+        self.assertTrue(all(call.kwargs['kv_cache'] is None for call in forward.call_args_list))
+
+    @torch.no_grad()
+    def test_cached_decoding_matches_full_window_logits_and_rebuilds_on_overflow(self):
+        for options in ({}, {'qk_norm': True, 'moe': True}):
+            torch.manual_seed(42)
+            model = TinyGPT(20, 5, 12, 3, 2, **options).eval()
+            for prompt in ([2, 3], [1, 2, 3, 4, 5, 6]):
+                with self.subTest(options=options, prompt=prompt):
+                    history = list(prompt)
+                    observed = []
+                    def capture(module, inputs, output):
+                        observed.append((inputs[0].size(1), output[:, -1].clone()))
+
+                    hook = model.register_forward_hook(capture)
+                    try:
+                        tokens = list(generate_token_ids(model, prompt, 6, 'cpu', 0, 0))
+                    finally:
+                        hook.remove()
+                    lengths = [length for length, _ in observed]
+                    self.assertEqual(lengths, [2, 1, 1, 1, 5, 5] if len(prompt) == 2 else [5] * 6)
+                    for token, (_, logits) in zip(tokens, observed):
+                        reference = model(torch.tensor([history[-5:]]))[:, -1]
+                        torch.testing.assert_close(logits, reference)
+                        self.assertEqual(token, reference.argmax().item())
+                        history.append(token)
+
     def test_show_end_marker_only_when_generated(self):
         class FixedModel(torch.nn.Module):
             context_length = 4
@@ -27,6 +67,8 @@ class InferenceTests(unittest.TestCase):
         tokenizer.decode.side_effect = lambda ids: ''.join(['prompt', 'answer<end>extra'][token] for token in ids)
         model = FixedModel()
         self.assertEqual(generate(model, tokenizer, 'prompt', 2, temperature=0, response_end_marker='<end>'), 'promptanswer')
+        self.assertEqual(generate(model, tokenizer, 'prompt', 2, temperature=0, response_end_marker='<end>',
+                                  return_token_count=True), ('promptanswer', 1))
         self.assertEqual(generate(model, tokenizer, 'prompt', 2, temperature=0, response_end_marker='<end>', show_end_marker=True), 'promptanswer<end>')
         self.assertEqual(generate(model, tokenizer, 'prompt', 0, temperature=0, response_end_marker='<end>', show_end_marker=True), 'prompt')
 
@@ -115,6 +157,10 @@ class InferenceTests(unittest.TestCase):
                        '--prompt', 'Hello', '--max-new-tokens', '7', '--device', 'cpu', '--seed', '42']
             result = subprocess.run(command, cwd=root, text=True, capture_output=True, check=True)
             self.assertEqual(result.stdout, expected + '\n')
+            self.assertNotIn('tokens/s', result.stderr)
+            timed = subprocess.run(command + ['--tokens-per-second'], cwd=root, text=True, capture_output=True, check=True)
+            self.assertEqual(timed.stdout, result.stdout)
+            self.assertRegex(timed.stderr, r'Generated 7 tokens in [\d.]+ s \([\d.]+ tokens/s\)')
             result = subprocess.run(command + ['--prompt', '☃'], cwd=root, text=True, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('Unknown symbol', result.stderr)

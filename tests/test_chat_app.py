@@ -60,6 +60,7 @@ class ChatAppTests(unittest.TestCase):
         server.tokenizer = Tokenizer()
         server.model = Model()
         server.device = 'cpu'
+        server.use_kv_cache = True
         server.lock = threading.Lock()
         server.response_end_marker = '<end>\n'
         self.assertEqual(server.generate([('user', 'hi')], 4, 0, 0), 'answer')

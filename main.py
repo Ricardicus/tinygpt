@@ -17,7 +17,7 @@ from pathlib import Path
 from datareader import PagedDataReader, TextCorpusReader, TokenizedDataReader
 from bpe import BPE, getBPE
 from corpus import load_config, text_chunks
-from tinygpt import TinyGPT, MOE_DEFAULTS
+from tinygpt import TinyGPT, MOE_DEFAULTS, generate_token_ids
 from lr_schedule import resolve_schedule
 
 
@@ -392,44 +392,30 @@ def stream_batches(datareader, bpe, context_length, batch_size):
 
 
 @torch.no_grad()
-def generate(model, bpe, prompt, max_new_tokens=50, device="cpu", temperature=1.0, top_k=0, response_end_marker=None, show_end_marker=False):
-    """Generate text autoregressively from a prompt."""
+def generate(model, bpe, prompt, max_new_tokens=50, device="cpu", temperature=1.0, top_k=0,
+             response_end_marker=None, show_end_marker=False, *, use_kv_cache=True, return_token_count=False):
+    """Generate text, optionally returning (text, number of sampled tokens)."""
     if not math.isfinite(temperature) or temperature < 0 or top_k < 0:
         raise ValueError("Temperature must be finite and nonnegative; top_k must be nonnegative")
     model.eval()
 
     # Encode prompt → token IDs
     ids = bpe.encode(prompt)
-    ids = torch.tensor([ids], dtype=torch.long).to(device)  # (1, C)
-    prompt_length = ids.size(1)
-
-    for _ in range(max_new_tokens):
-        # Trim to context length if too long
-        x = ids[:, -model.context_length :]
-        logits = model(x)  # (1, C, d_model)
-        next_token_logits = logits[:, -1, :]  # last position
-        if temperature == 0:
-            next_id = next_token_logits.argmax(dim=-1, keepdim=True)
-        else:
-            next_token_logits = next_token_logits / temperature
-            if top_k:
-                cutoff = torch.topk(next_token_logits, min(top_k, next_token_logits.size(-1))).values[:, -1:]
-                next_token_logits = next_token_logits.masked_fill(next_token_logits < cutoff, float("-inf"))
-            probs = torch.softmax(next_token_logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
-        ids = torch.cat([ids, next_id], dim=1)
-        if response_end_marker and response_end_marker in bpe.decode(ids[0, prompt_length:].tolist()):
+    generated_ids = []
+    for token in generate_token_ids(model, ids, max_new_tokens, device, temperature, top_k, use_kv_cache=use_kv_cache):
+        generated_ids.append(token)
+        if response_end_marker and response_end_marker in bpe.decode(generated_ids):
             break
 
-    # Decode all tokens back to text
-    generated = bpe.decode(ids[0].tolist())
     if response_end_marker:
-        prefix = bpe.decode(ids[0, :prompt_length].tolist())
-        response = bpe.decode(ids[0, prompt_length:].tolist())
+        prefix = bpe.decode(ids)
+        response = bpe.decode(generated_ids)
         before, separator, _ = response.partition(response_end_marker)
         response = before + (separator if show_end_marker else '')
-        return prefix + response
-    return generated
+        text = prefix + response
+    else:
+        text = bpe.decode(ids + generated_ids)
+    return (text, len(generated_ids)) if return_token_count else text
 
 
 # ---------------------------------------------------------
@@ -615,6 +601,8 @@ def parse_args(argv=None):
                         help="Seed for the file split and validation window sample (default: 42).")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Sampling temperature; lower is less random, 0 is greedy (default: 1).")
+    parser.add_argument("--no-kv-cache", dest="use_kv_cache", action="store_false",
+                        help="Disable KV caching during generation (enabled by default).")
     parser.add_argument("--top-k", type=int, default=0,
                         help="Sample from the top K tokens; 0 uses the full vocabulary (default: 0).")
     parser.add_argument("--seed", type=int, default=None,
@@ -974,7 +962,7 @@ def main(argv=None):
         if args.seed is not None:
             torch.manual_seed(args.seed)
         result = generate(model, bpe, prompt, args.max_new_tokens, args.device,
-                          temperature=args.temperature, top_k=args.top_k)
+                          temperature=args.temperature, top_k=args.top_k, use_kv_cache=args.use_kv_cache)
         print("\n--- Generated Text ---")
         if not bpe.preserve_whitespace:
             result = result.replace(bpe.get_end_of_word_mark(), " ")

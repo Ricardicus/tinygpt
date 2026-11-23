@@ -16,7 +16,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from bpe import BPE
-from tinygpt import MOE_DEFAULTS, TinyGPT
+from tinygpt import MOE_DEFAULTS, TinyGPT, generate_token_ids
 
 
 def format_prompt(messages):
@@ -32,7 +32,8 @@ def format_prompt(messages):
 
 
 class ChatServer(ThreadingHTTPServer):
-    def __init__(self, address, model_path, tokenizer_path, database, device, model_dir=None, log_io=None):
+    def __init__(self, address, model_path, tokenizer_path, database, device, model_dir=None, log_io=None,
+                 *, use_kv_cache=True):
         super().__init__(address, Handler)
         self.database = database
         self.lock = threading.Lock()
@@ -42,6 +43,7 @@ class ChatServer(ThreadingHTTPServer):
             with self.log_io.open('a', encoding='utf-8'):
                 pass
         self.device = device
+        self.use_kv_cache = use_kv_cache
         self.model_dir = Path(model_dir or Path(model_path).parent).resolve()
         self.tokenizer_path = Path(tokenizer_path).resolve()
         self.response_end_marker = None
@@ -102,18 +104,8 @@ class ChatServer(ThreadingHTTPServer):
                 metadata.update(model=self.info['model'], tokenizer=self.info['tokenizer'],
                                 context_length=self.model.context_length, prompt_tokens=len(ids),
                                 initial_model_input=self.tokenizer.decode(ids[-self.model.context_length:]))
-            for _ in range(max_tokens):
-                inputs = torch.tensor([ids[-self.model.context_length:]], dtype=torch.long, device=self.device)
-                logits = self.model(inputs)[0, -1]
-                if temperature == 0:
-                    token = logits.argmax().item()
-                else:
-                    logits = logits / temperature
-                    if top_k:
-                        cutoff = torch.topk(logits, min(top_k, logits.numel())).values[-1]
-                        logits = logits.masked_fill(logits < cutoff, float('-inf'))
-                    token = torch.multinomial(torch.softmax(logits, dim=-1), 1).item()
-                ids.append(token)
+            for token in generate_token_ids(self.model, ids, max_tokens, self.device, temperature, top_k,
+                                            use_kv_cache=self.use_kv_cache):
                 generated.append(token)
                 text = self.tokenizer.decode(generated)
                 if metadata is not None:
@@ -279,6 +271,8 @@ def main():
     parser.add_argument('--database', type=Path, default=Path(__file__).parent / 'chats.sqlite3')
     parser.add_argument('--log-io', type=Path, help='Append prompts and generated responses to this JSONL file')
     parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--no-kv-cache', dest='use_kv_cache', action='store_false',
+                        help='Disable KV caching during generation (enabled by default).')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
     model_dir = args.model_dir.expanduser().resolve() if args.model_dir else None
@@ -293,7 +287,8 @@ def main():
             parser.error('--model-dir contains no .pt files')
         model = models[0]
     model = model or ROOT / 'dolly15k/artifacts/dolly-sft.pt'
-    server = ChatServer(('127.0.0.1', args.port), model, args.tokenizer, args.database, args.device, model_dir, args.log_io)
+    server = ChatServer(('127.0.0.1', args.port), model, args.tokenizer, args.database, args.device, model_dir,
+                        args.log_io, use_kv_cache=args.use_kv_cache)
     print(f'Open http://127.0.0.1:{args.port}', flush=True)
     server.serve_forever()
 

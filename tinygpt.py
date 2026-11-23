@@ -77,6 +77,25 @@ class QKRMSNorm(nn.Module):
         return (value * self.weight.float()).to(x.dtype)
 
 
+class LayerKVCache:
+    """Inference buffers for one attention layer in a single generation."""
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.keys = self.values = None
+
+    def write(self, keys, values, position):
+        if self.keys is None:
+            batch, heads, _, width = keys.shape
+            shape = (batch, heads, self.capacity, width)
+            self.keys = keys.new_empty(shape)
+            self.values = values.new_empty(shape)
+        end = position + keys.size(2)
+        self.keys[:, :, position:end].copy_(keys)
+        self.values[:, :, position:end].copy_(values)
+        return self.keys[:, :, :end], self.values[:, :, :end]
+
+
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, d_model, num_heads, qk_norm=False):
         super().__init__()
@@ -93,7 +112,7 @@ class MultiHeadSelfAttention(nn.Module):
         self.q_norm = QKRMSNorm(self.d_head) if qk_norm else nn.Identity()
         self.k_norm = QKRMSNorm(self.d_head) if qk_norm else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x, kv_cache=None, position=0):
         B, C, D = x.shape  # (batch, context_len, d_model)
 
         # Project once, then split into Q, K, V
@@ -102,8 +121,10 @@ class MultiHeadSelfAttention(nn.Module):
         Q, K, V = qkv[0], qkv[1], qkv[2]  # each (B, num_heads, C, d_head)
         Q, K = self.q_norm(Q), self.k_norm(K)
 
-        # PyTorch selects an optimized causal attention kernel for this device/dtype.
-        attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+        if kv_cache is not None:
+            K, V = kv_cache.write(K, V, position)
+        # Prefill uses a causal mask. A single appended query sees all stored keys.
+        attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=position == 0)
 
         # Recombine heads
         attn_out = attn_out.transpose(1, 2).contiguous().reshape(B, C, D)
@@ -160,8 +181,8 @@ class TransformerBlock(nn.Module):
         self.ln2 = LayerNorm(d_model)
         self.mlp = MixtureOfExperts(d_model, num_experts, moe_top_k) if moe else FeedForward(d_model)
 
-    def forward(self, x, return_aux=False):
-        x = x + self.attn(self.ln1(x))
+    def forward(self, x, return_aux=False, kv_cache=None, position=0):
+        x = x + self.attn(self.ln1(x), kv_cache=kv_cache, position=position)
         if isinstance(self.mlp, MixtureOfExperts):
             residual, aux = self.mlp(self.ln2(x))
         else:
@@ -224,26 +245,67 @@ class TinyGPT(nn.Module):
             layer.attn.q_norm.compile(fullgraph=True)
             layer.attn.k_norm.compile(fullgraph=True)
 
-    def forward(self, token_ids, return_aux=False):
+    def forward(self, token_ids, return_aux=False, *, kv_cache=None, position=0, last_token_only=False):
         B, C = token_ids.shape
+        if position and (kv_cache is None or C != 1):
+            raise ValueError("A nonzero position requires a KV cache and one new token")
 
         # Input embedding
         tok_emb = F.embedding(token_ids, self.E)
-        pos_emb = self.pos_E[:C]
+        pos_emb = self.pos_E[position:position + C]
         x = tok_emb + pos_emb
 
         # Pass through N transformer layers
         aux = x.new_zeros(())
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
+            cache = kv_cache[index] if kv_cache is not None else None
             if return_aux:
-                x, layer_aux = layer(x, return_aux=True)
+                x, layer_aux = layer(x, return_aux=True, kv_cache=cache, position=position)
                 aux = aux + layer_aux
             else:
-                x = layer(x)
+                x = layer(x, kv_cache=cache, position=position)
 
         # Final normalization
-        x = self.final_ln(x)
+        x = self.final_ln(x[:, -1:] if last_token_only else x)
 
         # Weight-tied projection to logits
         logits = x @ self.E.T
         return (logits, aux / max(1, self.num_layers)) if return_aux else logits
+
+
+@torch.no_grad()
+def generate_token_ids(model, prompt_ids, max_new_tokens, device, temperature, top_k, *, use_kv_cache=True):
+    """Yield token IDs, keeping the attention cache local to this generation."""
+    limit = model.context_length
+    window = torch.tensor([prompt_ids[-limit:]], dtype=torch.long, device=device)
+    inputs = window
+    position = 0
+    cache = None
+    if use_kv_cache and isinstance(model, TinyGPT) and window.size(1) < limit and max_new_tokens > 1:
+        capacity = min(limit, window.size(1) + max_new_tokens - 1)
+        cache = [LayerKVCache(capacity) for _ in model.layers]
+
+    for _ in range(max_new_tokens):
+        if isinstance(model, TinyGPT):
+            logits = model(inputs, kv_cache=cache, position=position, last_token_only=True)[:, -1]
+        else:
+            logits = model(inputs)[:, -1]
+        if temperature == 0:
+            token = logits.argmax(dim=-1, keepdim=True)
+        else:
+            logits = logits / temperature
+            if top_k:
+                cutoff = logits.topk(min(top_k, logits.size(-1))).values[:, -1:]
+                logits = logits.masked_fill(logits < cutoff, float("-inf"))
+            token = torch.multinomial(logits.softmax(dim=-1), num_samples=1)
+        yield token.item()
+
+        if window.size(1) == limit:
+            # Sliding changes the absolute position embedding of every retained token.
+            cache = None
+            window = window[:, 1:]
+        window = torch.cat((window, token), dim=1)
+        if cache is None:
+            inputs, position = window, 0
+        else:
+            inputs, position = token, window.size(1) - 1
