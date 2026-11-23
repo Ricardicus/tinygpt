@@ -237,7 +237,7 @@ Older checkpoints without the setting use the original architecture. To enable
 QK normalization, choose a fresh model path; this flag does not convert existing
 models. Both `main.py --prompt` and `other/inference.py` support either format.
 
-To reduce eager Q/K normalization overhead during training, add
+For Q/K-only compilation during pretraining, use `--no-compile-loss` and add
 `--compile-qk-norm` alongside `--qk-norm` (or resume a QK-normalized checkpoint).
 This compiles only the normalization calls with TorchInductor, retaining FP32
 normalization arithmetic and the attention dtype. Initial steps include
@@ -259,16 +259,19 @@ The native variant explicitly keeps the same FP32 arithmetic and epsilon.
 This is a normalization microbenchmark; verify gains with full training throughput
 under the same monitoring settings before drawing conclusions about run time.
 
-Alternatively, use `--compile-model` to compile the entire model with Inductor.
-It takes precedence over `--compile-qk-norm`; do not enable both for extra speed.
-It works with or without QK normalization and keeps checkpoint keys unchanged
-using in-place `model.compile()`. The optimizer, CSV logging, and checkpoint
-writes remain outside compilation. Like QK-only compilation, specify this flag
-again on resume. Initial validation, the first training forward, and the first
-backward report start/finish times and an elapsed-time heartbeat every 15 seconds.
-These messages cover compilation plus execution, not compiler percentage progress.
-Different batch shapes or modes may cause later recompilation. Compare steady-state
-throughput after warmup; compilation can increase startup time and memory use.
+Pretraining compiles the training forward pass and cross-entropy together by
+default. MoE training includes the weighted router auxiliary loss in the backward
+objective and logs cross-entropy. `--no-compile-loss` uses the eager loss.
+The independent `--compile-model` flag compiles the model for validation too
+and still compiles the training model when using eager loss. For fully eager
+pretraining, pass `--no-compile-loss` and omit both model and Q/K compilation
+flags. Compare throughput after warmup because new shapes can trigger compilation.
+
+Pretraining uses fused AdamW on CUDA by default. Pass `--no-fused-adamw` to
+use standard AdamW. Both pretraining options apply on resume. Switching the
+optimizer backend carries over the saved moments, update counters, and optimizer
+hyperparameters. Different floating-point kernels can produce small numerical
+differences and training trajectories can diverge over many updates.
 
 Set AdamW's momentum coefficients with `--beta1 0.9 --beta2 0.95`.
 New runs default to beta1=0.9 and beta2=0.999. On resume, omitted values retain

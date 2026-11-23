@@ -116,6 +116,34 @@ def configure_compilation(model, args):
     return True
 
 
+def pretraining_loss(model, inputs, targets):
+    if model.moe:
+        logits, aux = model(inputs, return_aux=True)
+    else:
+        logits, aux = model(inputs), 0.0
+    loss = nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+    return loss, loss + model.moe_aux_loss_weight * aux
+
+
+def pretraining_optimizer(model, lr, fused, saved_state=None):
+    # None selects PyTorch's usual CUDA foreach / device-specific default.
+    fused_setting = True if fused else None
+    optimizer = optim.AdamW(model.parameters(), lr=lr, fused=fused_setting)
+    if saved_state is not None:
+        # load_state_dict uses the saved groups to place the step counters.
+        # Set the requested backend before loading moments and step counters.
+        groups = [dict(group, fused=fused_setting, foreach=None if fused else group.get("foreach"))
+                  for group in saved_state["param_groups"]]
+        optimizer.load_state_dict({**saved_state, "param_groups": groups})
+        for group in optimizer.param_groups:
+            if not fused and not group["capturable"]:
+                for param in group["params"]:
+                    state = optimizer.state.get(param)
+                    if state:
+                        state["step"] = state["step"].cpu()
+    return optimizer
+
+
 def write_layer_norms(path, model, epoch, global_step):
     """Record block norms and selected individual tensors before clipping/update."""
     def norm(tensors):
@@ -507,6 +535,10 @@ def parse_args(argv=None):
     parser.add_argument("--moe-top-k", type=int, default=2)
     parser.add_argument("--moe-aux-loss-weight", type=float, default=0.01)
     add_compile_arguments(parser)
+    parser.add_argument("--no-fused-adamw", dest="fused_adamw", action="store_false",
+                        help="Use standard AdamW for pretraining (fused AdamW is the CUDA default).")
+    parser.add_argument("--no-compile-loss", dest="compile_loss", action="store_false",
+                        help="Keep pretraining cross-entropy outside compilation (joint forward and loss compilation is on by default).")
     parser.add_argument("--beta1", type=float, default=None,
                         help="AdamW beta1: default 0.9 for new runs; omitted on resume preserves the saved value.")
     parser.add_argument("--beta2", type=float, default=None,
@@ -1168,13 +1200,15 @@ def main(argv=None):
     ).to(args.device)
     print(f"QK normalization: {model.qk_norm}", flush=True)
     print(f"MoE: {model.moe}; experts={model.num_experts}, top-k={model.moe_top_k}, auxiliary weight={model.moe_aux_loss_weight}", flush=True)
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    fused_adamw = args.fused_adamw and torch.device(args.device).type == "cuda"
+    optimizer = pretraining_optimizer(model, args.lr, fused_adamw,
+                                      ckpt_optim if ckpt_state is not None else None)
+    print(f"Fused AdamW: {fused_adamw}", flush=True)
     lr_source = "--lr" if args.lr_explicit else "default"
     global_step = 0
     if ckpt_state is not None:
         model.load_state_dict(ckpt_state)
         if ckpt_optim is not None:
-            optimizer.load_state_dict(ckpt_optim)
             lr_source = "checkpoint"
             if args.lr_explicit:
                 for group in optimizer.param_groups:
@@ -1210,7 +1244,8 @@ def main(argv=None):
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total trainable parameters: {num_params:,}")
 
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = torch.compile(pretraining_loss) if args.compile_loss else pretraining_loss
+    print(f"Compile training forward and loss together: {args.compile_loss}", flush=True)
     model.train()
 
     last_validation_step = None
@@ -1242,7 +1277,7 @@ def main(argv=None):
     # ---------------------------------------------------------
     # --- Training loop ---
     # ---------------------------------------------------------
-    compile_training_pending = compile_enabled
+    compile_training_pending = compile_enabled or args.compile_loss
     for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         total_loss, step = 0.0, 0
@@ -1264,12 +1299,7 @@ def main(argv=None):
             optimizer.zero_grad(set_to_none=True)
             with compilation_progress("first training forward") if compile_training_pending else nullcontext():
                 with precision_context(args.device, dtype):
-                    if model.moe:
-                        logits, aux_loss = model(x, return_aux=True)
-                    else:
-                        logits, aux_loss = model(x), 0.0
-                    loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
-                    objective = loss + model.moe_aux_loss_weight * aux_loss
+                    loss, objective = loss_fn(model, x, y)
             with compilation_progress("first training backward") if compile_training_pending else nullcontext():
                 objective.backward()
             if compile_training_pending:
