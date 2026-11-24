@@ -125,8 +125,7 @@ class CheckpointTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).iterdir()), [path])
 
     def test_interval_saves_epoch_end_and_resume(self):
-        x = torch.tensor([[1, 2, 3, 4]])
-        y = torch.tensor([[2, 3, 4, 5]])
+        windows = torch.tensor([[1, 2, 3, 4, 5]])
         snapshots = []
         real_save = training.save_checkpoint
 
@@ -138,7 +137,7 @@ class CheckpointTests(unittest.TestCase):
             path = Path(directory) / "model.pt"
             log = Path(directory) / "progress.csv"
             args = ["--device", "cpu", "--model", str(path), "--log-progress", str(log), "--d-model", "12", "--n-heads", "3", "--num-layers", "1", "--context-length", "4", "--save-every-steps", "2", "--verbose", "false"]
-            with patch.object(training, "getData", return_value=[]), patch.object(training, "getBPE", return_value=SimpleNamespace(vocab_size=20)), patch.object(training, "TokenizedDataReader", return_value=[]), patch.object(training, "stream_batches", side_effect=lambda *args: iter([(x, y)] * 3)), patch.object(training, "save_checkpoint", side_effect=capture), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(training, "getData", return_value=[]), patch.object(training, "getBPE", return_value=SimpleNamespace(vocab_size=20)), patch.object(training, "TokenizedDataReader", return_value=[]), patch.object(training, "stream_batches", side_effect=lambda *args: iter([windows] * 3)), patch.object(training, "save_checkpoint", side_effect=capture), contextlib.redirect_stdout(io.StringIO()):
                 training.main(args + ["--epochs", "1"])
                 self.assertEqual([(s["epoch"], s["step"], s["global_step"]) for s in snapshots], [(0, 2, 2), (1, 0, 3)])
                 periodic = snapshots[0]

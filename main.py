@@ -328,80 +328,31 @@ def getData(verbose=True, lower_case=True, rawdata_folder="rawdata", oneliners=[
 # Training pipeline (streaming, token-packed)
 # ---------------------------------------------------------
 def stream_batches(datareader, bpe, context_length, batch_size):
-    """
-    Generator that yields batches of (x, y) token tensors.
-
-    If `datareader` is a TokenizedDataReader it already yields
-    pre-tokenized windows of length context_length + 1.
-    Otherwise falls back to on-the-fly encoding.
-    """
-    batch_x, batch_y = [], []
-
-    def flush():
-        nonlocal batch_x, batch_y
-        if batch_x:
-            x_t = torch.tensor(batch_x, dtype=torch.long)
-            y_t = torch.tensor(batch_y, dtype=torch.long)
-            batch_x, batch_y = [], []
-            return x_t, y_t
-        return None
-
+    """Yield packed windows with one extra token for the next-token targets."""
     if isinstance(datareader, TokenizedDataReader):
-        # Fast path: windows are already tokenised
-        for window in datareader:
-            batch_x.append(window[:-1])
-            batch_y.append(window[1:])
-            if len(batch_x) >= batch_size:
-                out = flush()
-                if out is not None:
-                    yield out
-        out = flush()
-        if out is not None:
-            yield out
+        for windows in datareader.window_batches(batch_size):
+            yield torch.as_tensor(windows, dtype=torch.long)
         return
 
-    # Legacy path: read raw text, tokenise on the fly
+    # Raw text windows share one boundary token between consecutive windows.
+    batch = []
     token_buffer = []
-    start_idx = 0
-
     for text in datareader:
         try:
             ids = bpe.encode(text)
         except ValueError:
             continue
-        if not ids:
-            continue
-
         token_buffer.extend(ids)
-
-        while len(token_buffer) - start_idx >= context_length + 1:
-            window = token_buffer[start_idx : start_idx + context_length + 1]
-            batch_x.append(window[:-1])
-            batch_y.append(window[1:])
-            start_idx += context_length
-
-            if len(batch_x) >= batch_size:
-                out = flush()
-                if out is not None:
-                    yield out
-
-        if start_idx > 10 * context_length:
-            token_buffer = token_buffer[start_idx:]
-            start_idx = 0
-
-    while len(token_buffer) - start_idx >= context_length + 1:
-        window = token_buffer[start_idx : start_idx + context_length + 1]
-        batch_x.append(window[:-1])
-        batch_y.append(window[1:])
-        start_idx += context_length
-        if len(batch_x) >= batch_size:
-            out = flush()
-            if out is not None:
-                yield out
-
-    out = flush()
-    if out is not None:
-        yield out
+        start = 0
+        while start + context_length < len(token_buffer):
+            batch.append(token_buffer[start:start + context_length + 1])
+            start += context_length
+            if len(batch) == batch_size:
+                yield torch.tensor(batch, dtype=torch.long)
+                batch = []
+        token_buffer = token_buffer[start:]
+    if batch:
+        yield torch.tensor(batch, dtype=torch.long)
 
 
 @torch.no_grad()
@@ -1272,7 +1223,7 @@ def main(argv=None):
         timing_steps = timing_tokens = 0
         timing_seconds = 0.0
 
-        for x, y in stream_batches(
+        for windows in stream_batches(
             datareader, bpe, args.context_length, args.batch_size
         ):
             if lr_schedule is not None:
@@ -1280,7 +1231,8 @@ def main(argv=None):
                     group["lr"] = lr_schedule.rate(global_step)
             current_lr = optimizer.param_groups[0]["lr"]
             start_time = time.perf_counter()
-            x, y = x.to(args.device), y.to(args.device)
+            windows = windows.to(args.device)
+            x, y = windows[:, :-1], windows[:, 1:]
             optimizer.zero_grad(set_to_none=True)
             with compilation_progress("first training forward") if compile_training_pending else nullcontext():
                 with precision_context(args.device, dtype):

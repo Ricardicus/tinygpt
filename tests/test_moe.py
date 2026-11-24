@@ -69,11 +69,11 @@ class MoETests(unittest.TestCase):
                     for key in MOE_DEFAULTS:
                         del saved['config'][key]
                     torch.save(saved, path)
-                x = torch.tensor([[1, 2, 3, 4]])
+                windows = torch.tensor([[1, 2, 3, 4, 1]])
                 with patch.object(training, 'getData', return_value=[]), \
                      patch.object(training, 'getBPE', return_value=SimpleNamespace(vocab_size=20)), \
                      patch.object(training, 'TokenizedDataReader', return_value=[]), \
-                     patch.object(training, 'stream_batches', return_value=iter([(x, x)])), \
+                     patch.object(training, 'stream_batches', return_value=iter([windows])), \
                      contextlib.redirect_stdout(io.StringIO()):
                     training.main(['--device', 'cpu', '--model', str(path), '--epochs', '1',
                                    '--verbose', 'false', '--no-moe' if enabled else '--moe'])
@@ -83,7 +83,7 @@ class MoETests(unittest.TestCase):
                 restored.load_state_dict(checkpoint['model_state_dict'], strict=True)
                 optimizer = torch.optim.AdamW(restored.parameters())
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                self.assertTrue(torch.isfinite(restored(x)).all())
+                self.assertTrue(torch.isfinite(restored(windows[:, :-1])).all())
 
 
 if __name__ == '__main__':

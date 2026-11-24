@@ -5,6 +5,8 @@ import time
 import hashlib
 import fnmatch
 from array import array
+
+import numpy as np
 from corpus import discover_files, encoded_chunks, text_chunks, filter_excluded_files
 import sys
 import json
@@ -258,11 +260,22 @@ class TokenizedDataReader:
         If ``shuffle`` is *True*, windows are yielded in random order
         (compact in-memory index shuffle).
         """
+        for i in self._window_indices():
+            yield self[i]
+
+    def _window_indices(self):
         indices = array("Q", range(self._n_windows))
         if self.shuffle:
             random.shuffle(indices)
-        for i in indices:
-            yield self[i]
+        return indices
+
+    def window_batches(self, batch_size):
+        """Gather complete cached windows in epoch order, including the final partial batch."""
+        width = self.context_size + 1
+        windows = np.frombuffer(self._tokens, dtype=np.uintc, count=self._n_windows * width).reshape(-1, width)
+        indices = self._window_indices()
+        for start in range(0, len(indices), batch_size):
+            yield windows[indices[start:start + batch_size]]
 
     def __getitem__(self, index: int) -> List[int]:
         if index < 0:

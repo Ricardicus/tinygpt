@@ -86,8 +86,7 @@ class CompilationTests(unittest.TestCase):
         self.assertNotIn('finished failure', text)
 
     def test_whole_model_training_and_resume_preserve_checkpoint_format(self):
-        x = torch.tensor([[1, 2, 3, 4]])
-        y = torch.tensor([[2, 3, 4, 5]])
+        windows = torch.tensor([[1, 2, 3, 4, 5]])
 
         def compile_for_test(model):
             # Compile forward and autograd on CPU without needing CUDA/Inductor.
@@ -101,7 +100,7 @@ class CompilationTests(unittest.TestCase):
             with patch.object(training, 'getData', return_value=[]), \
                     patch.object(training, 'getBPE', return_value=SimpleNamespace(vocab_size=20)), \
                     patch.object(training, 'TokenizedDataReader', return_value=[]), \
-                    patch.object(training, 'stream_batches', side_effect=lambda *a: iter([(x, y)])), \
+                    patch.object(training, 'stream_batches', side_effect=lambda *a: iter([windows])), \
                     patch.object(TinyGPT, 'compile', autospec=True, side_effect=compile_for_test) as compile_model, \
                     patch.object(TinyGPT, 'compile_qk_norms') as compile_qk, \
                     contextlib.redirect_stdout(io.StringIO()) as output:
@@ -116,7 +115,7 @@ class CompilationTests(unittest.TestCase):
             restored.load_state_dict(checkpoint['model_state_dict'], strict=True)
             optimizer = torch.optim.AdamW(restored.parameters())
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.assertTrue(torch.isfinite(restored(x)).all())
+            self.assertTrue(torch.isfinite(restored(windows[:, :-1])).all())
 
 
 if __name__ == '__main__':

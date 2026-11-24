@@ -62,8 +62,7 @@ class ScheduleTests(unittest.TestCase):
                 training.parse_args(flags)
 
     def test_optimizer_rates_and_mid_epoch_resume_match_uninterrupted_training(self):
-        x = torch.tensor([[1, 2, 3, 4]])
-        y = torch.tensor([[2, 3, 4, 5]])
+        windows = torch.tensor([[1, 2, 3, 4, 5]])
         snapshots = []
         save = training.save_checkpoint
 
@@ -82,7 +81,7 @@ class ScheduleTests(unittest.TestCase):
             with patch.object(training, 'getData', return_value=[]), \
                     patch.object(training, 'getBPE', return_value=SimpleNamespace(vocab_size=20)), \
                     patch.object(training, 'TokenizedDataReader', return_value=[None] * 8), \
-                    patch.object(training, 'stream_batches', side_effect=lambda *a: iter([(x, y)] * 4)), \
+                    patch.object(training, 'stream_batches', side_effect=lambda *a: iter([windows] * 4)), \
                     patch.object(training, 'save_checkpoint', side_effect=capture), \
                     contextlib.redirect_stdout(io.StringIO()):
                 training.main(flags + ['--epochs', '2', '--lr-schedule', 'cosine',
