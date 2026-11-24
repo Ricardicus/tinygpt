@@ -155,6 +155,23 @@ For a custom corpus, invoke `python main.py` with `--rawdata`, `--data-config`, 
 
 The reader caches four-byte token IDs on disk and holds the tokens and shuffle indices in RAM during training. Training and validation have separate caches when a split is enabled. Changes to file selection, paths, sizes, modification times, or tokenizer settings trigger a rebuild. Verbose startup reports scanning, tokenizer preparation, and cache progress.
 
+### Count tokens from a previous run
+
+```bash
+python other/count_tokens.py datasets/wiki-mix --context-length 512
+```
+
+This reads the training cache's byte size and checks it against its metadata when available. The total is the saved snapshot, so the command takes the same fast path even if the corpus has since changed. With a held-out split it uses `corpus_train_tokens.bin` and excludes validation. For an unsplit run it uses `corpus_tokens.bin`. If both exist, pass the desired `.bin` path directly. The optional context length also reports complete windows and predicted target tokens per epoch.
+
+For a fresh count, or if the cache is missing, pass the exact saved tokenizer and the original corpus options:
+
+```bash
+python other/count_tokens.py datasets/wiki-mix --tokenizer "$RUN/tokenizer.json" \
+  --lower-case false --validation-fraction 0.05 --validation-seed 42 --context-length 512
+```
+
+Recounting streams the selected training files on CPU. It uses a prepared corpus's adjacent `training_data.json` when available. Supply `--data-config` if your run overrode it. The recount defaults to no validation split and lowercasing, matching direct `main.py` pretraining. Both modes leave the corpus, caches, and checkpoints untouched.
+
 ### Optimizer and learning rate
 
 AdamW defaults to a constant learning rate of `0.0003` and betas of `0.9` and `0.999` on a new run. Set `--beta1` and `--beta2` independently. With `--lr-schedule cosine`, `--lr` is the peak. The rate rises linearly over `--warmup-steps` updates, then decays to `--min-lr-ratio` times the peak (default `0.1`).

@@ -7,7 +7,6 @@ import os
 from itertools import islice
 import time
 import tempfile
-import hashlib
 import math
 import random
 import threading
@@ -16,7 +15,7 @@ from pathlib import Path
 
 from datareader import PagedDataReader, TextCorpusReader, TokenizedDataReader
 from bpe import BPE, getBPE
-from corpus import load_config, text_chunks
+from corpus import load_config, split_validation_files, text_chunks
 from tinygpt import TinyGPT, MOE_DEFAULTS, generate_token_ids
 from lr_schedule import resolve_schedule
 
@@ -44,20 +43,6 @@ def str2bool(v):
     if v in ("no", "false", "f", "0", "n"):
         return False
     raise argparse.ArgumentTypeError("Boolean value expected for --verbose")
-
-
-def split_validation_files(files, folder, fraction, seed):
-    """Deterministically hold out whole files without changing the global RNG."""
-    if len(files) < 2:
-        raise ValueError("Validation requires at least two corpus files; use --validation-fraction 0 to disable it.")
-    root = Path(folder).resolve()
-    ranked = sorted(files, key=lambda p: hashlib.sha256(
-        f"{seed}:{Path(p).resolve().relative_to(root).as_posix()}".encode()
-    ).digest())
-    count = min(len(files) - 1, max(1, round(len(files) * fraction)))
-    held_out = set(ranked[:count])
-    return ([p for p in files if p not in held_out],
-            [p for p in files if p in held_out])
 
 
 def training_dtype(device, precision):

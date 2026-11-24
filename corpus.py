@@ -1,4 +1,5 @@
 """Shared corpus discovery and bounded text streaming."""
+import hashlib
 import json
 import os
 import re
@@ -95,6 +96,20 @@ def discover_files(folder, config=None, verbose=False):
     return files
 
 
+def split_validation_files(files, folder, fraction, seed):
+    """Deterministically hold out whole files without changing the global RNG."""
+    if len(files) < 2:
+        raise ValueError("Validation requires at least two corpus files; use --validation-fraction 0 to disable it.")
+    root = Path(folder).resolve()
+    ranked = sorted(files, key=lambda p: hashlib.sha256(
+        f"{seed}:{Path(p).resolve().relative_to(root).as_posix()}".encode()
+    ).digest())
+    count = min(len(files) - 1, max(1, round(len(files) * fraction)))
+    held_out = set(ranked[:count])
+    return ([p for p in files if p not in held_out],
+            [p for p in files if p in held_out])
+
+
 def text_chunks(path, chunk_size=65536, max_word_chars=4096):
     """Stream text with exact whitespace; discard oversized words (e.g. blobs).
 
@@ -131,3 +146,12 @@ def text_chunks(path, chunk_size=65536, max_word_chars=4096):
                 dropping = True
         if pending:
             yield pending
+
+
+def encoded_chunks(path, tokenizer, lower_case):
+    """Yield a corpus file's token IDs one pretraining chunk at a time."""
+    for text in text_chunks(path):
+        try:
+            yield tokenizer.encode(text.lower() if lower_case else text)
+        except ValueError as error:
+            raise ValueError(f"Cannot tokenize {path}: {error}") from error
