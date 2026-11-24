@@ -42,7 +42,7 @@ For the full option lists, run `python main.py --help`, `python main.py finetune
 
 ### Download a corpus
 
-Run `python other/download_datasets.py` to select sources, limits, and an output directory. Use **Space** to select sources, **E** to edit a limit, **F** for the full source, and **Enter** to review and confirm. **W** sets Wikipedia languages and individual quotas. **L** selects Gutenberg languages. Use `--plain` for a line-based wizard.
+Run `python other/download_datasets.py` to select sources, limits, and an output directory. Use **Space** to select sources, **E** to edit a limit, **F** for the full source, and **Enter** to review and confirm. Highlight Wikipedia, translated FineWeb-Edu, or Gutenberg and press **L** to select its languages. Use `--plain` for a line-based wizard.
 
 For a repeatable multilingual Wikipedia selection, put each language and its quota on the command line. Spanish uses `es` and Swedish uses `sv`.
 
@@ -56,13 +56,16 @@ Limits count saved UTF-8 text in decimal GB. A source can run out before reachin
 
 | Source | What goes into the corpus |
 | --- | --- |
-| Wikipedia | Article text from the pinned November 2023 snapshot, including short entries and lists. `--wikipedia 5` selects up to 5 GB of English. The interactive **W** field also accepts lists such as `en=10,sv=2,es=full`. |
+| Wikipedia | Article text from the pinned November 2023 snapshot, including short entries and lists. `--wikipedia 5` selects up to 5 GB of English. The interactive **L** field accepts lists such as `en=10,sv=2,es=full`. |
 | FineWeb-Edu | Filtered web prose. Select it in the wizard to combine it with Wikipedia or books. |
+| FineWeb-Edu translated | Automatically translated FineWeb-Edu documents, selected by language. Highlight the source, press **L**, and enter quotas such as `swe=10,spa=5`. Language codes follow the [dataset card](https://huggingface.co/datasets/Helsinki-NLP/fineweb-edu-translated), including `swe` for Swedish and `spa` for Spanish. |
 | Project Gutenberg | Whole books with their notices. The wizard offers multiple catalog languages and one shared quota. The final book can take the download over that target. |
 | OpenBallast T2 | OpenStax textbook passages, including short definitions and examples. Use `--ballast-t2 full` or give a GB limit. The manifest records passage IDs and source information. |
 | Dolly and Alpaca variants | One formatted instruction/response example per file. These can be mixed or used individually for [supervised fine-tuning](#supervised-fine-tuning). |
 
 The downloader writes training documents under `corpus/` and source revisions, hashes, URLs, and actual sizes under `metadata/`. It drops exact duplicates across selected sources. Keep the metadata for attribution and consult the recorded dataset cards for the terms of each source.
+
+Select translations directly with `python other/download_datasets.py --fineweb-edu-translated-language swe=10 --fineweb-edu-translated-language spa=5 --output datasets/translated`. Each language has its own cap and corpus directory. The language-specific documents retain their original metadata and the Hub revision is recorded for resume. TUI source totals sum the selected language limits. A `full` language leaves that part of the total unbounded.
 
 A completed download includes `training_data.json` and a `train.sh` launcher. To continue an interrupted download, run `python other/download_datasets.py --resume datasets/wiki-mix`. Resume verifies the saved manifest, file sizes, and hashes. Keep a downloader-managed corpus intact if you plan to resume it.
 

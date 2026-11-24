@@ -98,7 +98,7 @@ class DownloadDatasetsTests(unittest.TestCase):
         import curses
         screen = Mock()
         screen.getmaxyx.return_value = (24, 110)
-        screen.get_wch.side_effect = ['w', '\x15', *'en=1,sv=0.5', '\n', '\n', '\n']
+        screen.get_wch.side_effect = ['l', '\x15', *'en=1,sv=0.5', '\n', '\n', '\n']
         with patch.object(curses, 'wrapper', side_effect=lambda callback: callback(screen)), \
                 patch.object(curses, 'curs_set'), patch.object(builder, 'validate_output', side_effect=Path):
             selected, _, _ = builder.tui_plan()
@@ -107,8 +107,84 @@ class DownloadDatasetsTests(unittest.TestCase):
         self.assertNotIn('wikipedia', selected)
         wikipedia_rows = [call.args[2] for call in screen.addnstr.call_args_list
                           if len(call.args) > 2 and 'Wikipedia (2023-11-01 snapshot)' in str(call.args[2])]
-        self.assertIn('per-language (W)', wikipedia_rows[-1])
+        self.assertIn('1.5 GB (L)', wikipedia_rows[-1])
         self.assertNotIn('0.25 GB', wikipedia_rows[-1])
+
+    def test_translated_languages_download_and_limits(self):
+        selections = builder.translated_selections('swe=1,spa=full,srp_cyrl=0.5')
+        self.assertEqual(selections, {'fineweb-edu-translated@swe': 1_000_000_000,
+                                      'fineweb-edu-translated@spa': None,
+                                      'fineweb-edu-translated@srp_Cyrl': 500_000_000})
+        self.assertEqual(builder.language_total(selections), '1.5 GB + full')
+        for value in ('sv=1', 'swe=1,swe=2', 'swe=-1'):
+            with self.assertRaises(ValueError):
+                builder.translated_selections(value)
+        datasets, hub = Mock(), Mock()
+        hub.HfApi.return_value.dataset_info.return_value.sha = 'pinned'
+        row = {'text': 'Svensk text', 'id': 'one', 'language': 'swe',
+               'metadata': '{"url":"https://example.org"}'}
+        datasets.load_dataset.return_value = [row]
+        with patch.dict('sys.modules', {'datasets': datasets, 'huggingface_hub': hub}):
+            provenance = {}
+            self.assertEqual(list(builder.source_records('fineweb-edu-translated@swe', provenance)), [row])
+        datasets.load_dataset.assert_called_once_with('Helsinki-NLP/fineweb-edu-translated', name='swe',
+                                                      split='train', revision='pinned', streaming=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'translated'
+            with patch.object(builder, 'source_records', return_value=iter([row])):
+                builder.prepare({'fineweb-edu-translated@swe': None}, root)
+            saved = json.loads((root / 'metadata/files.jsonl').read_text())
+            self.assertEqual(saved['metadata'], row['metadata'])
+            self.assertEqual((root / saved['path']).read_text(), 'Svensk text\n\n')
+        with patch.object(builder, 'prepare') as prepare:
+            builder.main(['--fineweb-edu-translated-language', 'swe=1,spa=full', '--output', '/tmp/translated'])
+            prepare.assert_called_once_with({k: v for k, v in selections.items() if not k.endswith('srp_Cyrl')},
+                                           Path('/tmp/translated'))
+
+    def test_tui_translation_selection_and_total(self):
+        import curses
+        screen = Mock()
+        screen.getmaxyx.return_value = (24, 110)
+        screen.get_wch.side_effect = [curses.KEY_UP, ' ', 'l', '\x15', *'swe=2,spa=3', '\n', '\n', '\n']
+        with patch.object(curses, 'wrapper', side_effect=lambda callback: callback(screen)), \
+                patch.object(curses, 'curs_set'), patch.object(builder, 'validate_output', side_effect=Path):
+            selected, _, _ = builder.tui_plan()
+        self.assertEqual(selected['fineweb-edu-translated@swe'], 2_000_000_000)
+        rows = [call.args[2] for call in screen.addnstr.call_args_list if len(call.args) > 2
+                and 'FineWeb-Edu translated' in str(call.args[2])]
+        self.assertIn('5 GB (L)', rows[-1])
+
+    def test_tui_gutenberg_language_selector_uses_highlighted_source(self):
+        import curses
+        screen = Mock()
+        screen.getmaxyx.return_value = (24, 110)
+        screen.get_wch.side_effect = [curses.KEY_DOWN] * 3 + ['l', '\n', '\n']
+        with patch.object(curses, 'wrapper', side_effect=lambda callback: callback(screen)), \
+                patch.object(curses, 'curs_set'), patch.object(builder, 'validate_output', side_effect=Path), \
+                patch.object(builder, 'gutenberg_languages', return_value=[('en', 10), ('sv', 2)]), \
+                patch.object(builder, 'language_screen', return_value=('en', 'sv')) as selector:
+            _, _, languages = builder.tui_plan()
+        selector.assert_called_once()
+        self.assertEqual(languages, ('en', 'sv'))
+
+    def test_translated_language_resume_preserves_config_and_progress(self):
+        name = 'fineweb-edu-translated@swe'
+        def interrupted(source, provenance):
+            provenance.update(revision='saved-revision', config='swe')
+            yield {'text': 'Första texten', 'id': 'first'}
+            raise OSError('offline')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'partial'
+            with patch.object(builder, 'source_records', side_effect=interrupted), self.assertRaises(OSError):
+                builder.prepare({name: None}, root)
+            def resume(source, provenance):
+                self.assertEqual(provenance['revision'], 'saved-revision')
+                return iter([{'text': 'Första texten', 'id': 'first'},
+                             {'text': 'Andra texten', 'id': 'second'}])
+            with patch.object(builder, 'source_records', side_effect=resume):
+                summary = builder.prepare({}, root, resume=True)
+            self.assertEqual(summary['counts'][name]['files'], 2)
+            self.assertEqual(summary['sources'][name]['config'], 'swe')
 
     def test_alpaca_format_download_and_cli(self):
         records = [{'instruction': 'Classify', 'input': 'cat', 'output': 'animal'},
@@ -459,7 +535,7 @@ class DownloadDatasetsTests(unittest.TestCase):
     def test_plain_wizard_reprompts_invalid_values_and_accepts_custom_folder(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "custom"
-            with patch("builtins.input", side_effect=["11", "2,4", "nan", "0.5", "full", str(root), "y"]), \
+            with patch("builtins.input", side_effect=["12", "2,4", "nan", "0.5", "full", str(root), "y"]), \
                     patch.object(builder, "plain_languages", return_value=("en", "fr")):
                 selected, actual_root, languages = builder.plain_plan()
         self.assertEqual(selected, {"dolly": 500_000_000, "gutenberg": None})

@@ -59,12 +59,30 @@ SOURCES = {
                        "config": None, "license": "cc-by-4.0", "url": "https://huggingface.co/datasets/yahma/alpaca-cleaned"},
     "gpt4-llm-cleaned": {"label": "GPT-4 LLM cleaned", "default": "full", "dataset": "teknium/GPT4-LLM-Cleaned",
                          "config": None, "url": "https://huggingface.co/datasets/teknium/GPT4-LLM-Cleaned"},
+    "fineweb-edu-translated": {"label": "FineWeb-Edu translated", "default": "0.25",
+                               "dataset": "Helsinki-NLP/fineweb-edu-translated", "config": None,
+                               "license": "odc-by",
+                               "url": "https://huggingface.co/datasets/Helsinki-NLP/fineweb-edu-translated"},
 }
 
 ALPACA_SOURCES = ('alpaca', 'dolly-alpaca', 'alpaca-gpt4', 'alpaca-cleaned', 'gpt4-llm-cleaned')
+TRANSLATED_LANGUAGES = {
+    code.lower(): code for code in (
+        'bos', 'bul', 'cat', 'ces', 'dan', 'deu', 'ell', 'eng', 'est', 'eus',
+        'fin', 'fra', 'gle', 'glg', 'hrv', 'hun', 'isl', 'ita', 'kat', 'lav',
+        'lit', 'mkd', 'mlt', 'nld', 'nno', 'nob', 'pol', 'por', 'ron', 'slk',
+        'slv', 'spa', 'sqi', 'srp_Cyrl', 'swe', 'tur', 'ukr'
+    )
+}
 
 
 def source_spec(name):
+    if name.startswith('fineweb-edu-translated@'):
+        language = name.split('@', 1)[1]
+        if language not in TRANSLATED_LANGUAGES.values():
+            raise ValueError(f'Unsupported translated FineWeb-Edu language: {language}')
+        return {**SOURCES['fineweb-edu-translated'], 'label': f'FineWeb-Edu translated ({language})',
+                'config': language}
     if name.startswith('wikipedia@'):
         language = name.removeprefix('wikipedia@')
         if not re.fullmatch(r'[a-z][a-z0-9-]{0,19}', language):
@@ -87,6 +105,28 @@ def wikipedia_selections(value):
             raise ValueError(f'Duplicate Wikipedia language: {language}')
         selected[name] = parse_limit(limit)
     return selected
+
+
+def translated_selections(value):
+    selected = {}
+    for item in value.split(','):
+        parts = item.strip().split('=', 1)
+        if len(parts) != 2 or parts[0].strip().lower() not in TRANSLATED_LANGUAGES:
+            raise ValueError('Use translated dataset codes such as swe=1,spa=full (see dataset card)')
+        language = TRANSLATED_LANGUAGES[parts[0].strip().lower()]
+        name = 'fineweb-edu-translated@' + language
+        if name in selected:
+            raise ValueError(f'Duplicate translated FineWeb-Edu language: {language}')
+        selected[name] = parse_limit(parts[1])
+    return selected
+
+
+def language_total(selections):
+    known = sum(value for value in selections.values() if value is not None)
+    size = format(Decimal(known) / 1_000_000_000, 'f')
+    if any(value is None for value in selections.values()):
+        return f'{size} GB + full' if known else 'full'
+    return f'{size} GB'
 
 
 def parse_limit(value):
@@ -142,6 +182,15 @@ def plain_plan():
     languages = plain_languages() if "gutenberg" in selected_names else ("en",)
     selected = {}
     for name in selected_names:
+        if name == 'fineweb-edu-translated':
+            while True:
+                value = input('Translated FineWeb languages (e.g. swe=1,spa=full) [swe=0.25]: ').strip() or 'swe=0.25'
+                try:
+                    selected.update(translated_selections(value))
+                    break
+                except ValueError as error:
+                    print(error)
+            continue
         if name == 'wikipedia':
             while True:
                 value = input('Wikipedia languages and limits (e.g. en=0.25,sv=1) [en=0.25]: ').strip() or 'en=0.25'
@@ -173,12 +222,12 @@ def tui_plan():
 
     def screen(stdscr):
         height, width = stdscr.getmaxyx()
-        if height < len(SOURCES) + 14 or width < 75:
+        if height < len(SOURCES) + 13 or width < 75:
             raise curses.error("Terminal too small")
         curses.curs_set(0)
         stdscr.keypad(True)
         names = list(SOURCES)
-        checked = set(names)
+        checked = set(names) - {'fineweb-edu-translated'}
         limits = {name: source["default"] for name, source in SOURCES.items()}
         cursor = 0
         folder = ""
@@ -186,6 +235,7 @@ def tui_plan():
         reviewing = False
         languages = ("en",)
         wiki_limits = None
+        translated_limits = {'fineweb-edu-translated@swe': parse_limit('0.25')}
 
         def put(row, value, attr=0):
             height, width = stdscr.getmaxyx()
@@ -218,21 +268,28 @@ def tui_plan():
 
         while True:
             stdscr.erase()
-            selected = {name: parse_limit(limits[name]) for name in names if name in checked and not (name == 'wikipedia' and wiki_limits is not None)}
+            selected = {name: parse_limit(limits[name]) for name in names if name in checked and name != 'fineweb-edu-translated' and not (name == 'wikipedia' and wiki_limits is not None)}
             if 'wikipedia' in checked and wiki_limits is not None:
                 selected.update(wiki_limits)
+            if 'fineweb-edu-translated' in checked:
+                selected.update(translated_limits)
             put(0, "TinyGPT | Dataset downloader", curses.A_BOLD)
             put(2, "Up/Down: move   Space: select   A: all/none   E: edit GB   F: full")
-            put(3, "W: Wikipedia languages   L: Gutenberg languages   O: folder   Enter: review   Q: cancel")
+            put(3, "L: languages for highlighted source   O: folder   Enter: review   Q: cancel")
             for index, name in enumerate(names):
                 attr = curses.A_REVERSE if cursor == index else 0
-                limit_label = ('per-language (W)' if name == 'wikipedia' and wiki_limits is not None
-                               else limits[name] + (' GB' if limits[name] != 'full' else ''))
+                if name == 'wikipedia' and wiki_limits is not None:
+                    limit_label = language_total(wiki_limits) + ' (L)'
+                elif name == 'fineweb-edu-translated':
+                    limit_label = language_total(translated_limits) + ' (L)'
+                else:
+                    limit_label = limits[name] + (' GB' if limits[name] != 'full' else '')
                 put(5 + index, f" [{'x' if name in checked else ' '}] {SOURCES[name]['label']:<45} {limit_label}", attr)
             info_row = 6 + len(names)
             put(info_row, "GB = saved UTF-8 text; RAM, network traffic and caches are extra.")
-            put(info_row + 1, "Gutenberg languages: " + ", ".join(languages) + " (L to change; default English)")
-            put(info_row + 2, "Wikipedia: " + (', '.join(f'{key.split("@", 1)[1]}={"full" if value is None else f"{value / 1e9:g}"}' for key, value in wiki_limits.items()) if wiki_limits is not None else 'en=' + limits['wikipedia']) + ' (W to edit)')
+            put(info_row + 1, "Gutenberg: " + ", ".join(languages) + " (L)")
+            put(info_row + 2, "Wikipedia: " + (', '.join(f'{key.split("@", 1)[1]}={"full" if value is None else f"{value / 1e9:g}"}' for key, value in wiki_limits.items()) if wiki_limits is not None else 'en=' + limits['wikipedia']) + ' (L)')
+            put(info_row + 4, "Translations: " + ', '.join(f'{key.split("@", 1)[1]}={"full" if value is None else f"{value / 1e9:g}"}' for key, value in translated_limits.items()) + ' (L)')
             put(info_row + 3, "Folder: " + (folder or (default_folder(selected, languages) if selected else "(select a source)")))
             put(info_row + 5, "REVIEW: Enter starts downloading; B returns to editing." if reviewing else message,
                 curses.A_BOLD)
@@ -259,11 +316,17 @@ def tui_plan():
             elif key in ("a", "A"):
                 checked = set() if len(checked) == len(names) else set(names)
             elif key in ("f", "F"):
+                if names[cursor] == 'fineweb-edu-translated':
+                    message = 'Use L to set per-language limits.'
+                    continue
                 if names[cursor] == 'wikipedia':
                     wiki_limits = None
                 limits[names[cursor]] = "full"
             elif key in ("e", "E"):
                 name = names[cursor]
+                if name == 'fineweb-edu-translated':
+                    message = 'Use L to set per-language limits.'
+                    continue
                 value = edit("GB or full (Ctrl-U clears): ", limits[name])
                 try:
                     cap = parse_limit(value)
@@ -274,21 +337,34 @@ def tui_plan():
                 except ValueError as error:
                     message = str(error)
             elif key in ("l", "L"):
-                put(info_row + 5, "Loading Gutenberg catalog to find its top 10 languages...", curses.A_BOLD)
-                stdscr.refresh()
-                try:
-                    choices = gutenberg_languages()
-                    languages = language_screen(stdscr, choices, languages)
-                    message = ""
-                except (OSError, ValueError) as error:
-                    message = f"Catalog unavailable: {error}"
-            elif key in ('w', 'W'):
-                initial = ','.join(f'{name.split("@", 1)[1]}={"full" if cap is None else format(Decimal(cap) / 1_000_000_000, "f")}' for name, cap in wiki_limits.items()) if wiki_limits is not None else 'en=' + limits['wikipedia']
-                try:
-                    wiki_limits = wikipedia_selections(edit('Wikipedia languages (en=1,sv=full): ', initial))
-                    message = ''
-                except ValueError as error:
-                    message = str(error)
+                name = names[cursor]
+                if name == 'gutenberg':
+                    put(info_row + 5, "Loading Gutenberg catalog to find its top 10 languages...", curses.A_BOLD)
+                    stdscr.refresh()
+                    try:
+                        choices = gutenberg_languages()
+                        languages = language_screen(stdscr, choices, languages)
+                        message = ""
+                    except (OSError, ValueError) as error:
+                        message = f"Catalog unavailable: {error}"
+                elif name in ('wikipedia', 'fineweb-edu-translated'):
+                    selections = wiki_limits if name == 'wikipedia' else translated_limits
+                    initial = (','.join(f'{item.split("@", 1)[1]}={"full" if cap is None else format(Decimal(cap) / 1_000_000_000, "f")}'
+                                        for item, cap in selections.items())
+                               if selections is not None else 'en=' + limits['wikipedia'])
+                    prompt = ('Wikipedia languages (en=1,sv=full): ' if name == 'wikipedia'
+                              else 'Translations (swe=1,spa=full): ')
+                    try:
+                        value = edit(prompt, initial)
+                        if name == 'wikipedia':
+                            wiki_limits = wikipedia_selections(value)
+                        else:
+                            translated_limits = translated_selections(value)
+                        message = ''
+                    except ValueError as error:
+                        message = str(error)
+                else:
+                    message = 'Highlight Wikipedia, translated FineWeb-Edu, or Gutenberg to set languages.'
             elif key in ("o", "O"):
                 folder = edit("Folder (blank = automatic, Ctrl-U clears): ", folder).strip()
             elif key in ("\n", "\r", curses.KEY_ENTER):
@@ -485,7 +561,7 @@ def record_text(name, record):
         parts.append("### Response\n" + response.strip())
         return "\n\n".join(parts) + "\n\n"
     text = record.get("text", "")
-    if name in ("gutenberg", "wikipedia", "ballast-t2") or name.startswith('wikipedia@'):
+    if name in ("gutenberg", "wikipedia", "ballast-t2") or name.startswith(('wikipedia@', 'fineweb-edu-translated@')):
         if not isinstance(text, str):
             return ""
         text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -646,6 +722,8 @@ def prepare(selected, root, languages=("en",), resume=False):
                             metadata_keys += ("chunk_id", "qid", "source_id", "source_url", "revision",
                                               "license_id", "license_evidence", "section")
                         meta = {key: record[key] for key in metadata_keys if key in record}
+                        if name.startswith('fineweb-edu-translated@'):
+                            meta.update({key: record[key] for key in ('language', 'metadata') if key in record})
                         manifest.write(json.dumps({**meta, "kind": name, "path": rel.as_posix(),
                                                    "bytes": len(data), "sha256": digest}, ensure_ascii=False) + "\n")
                         manifest.flush()
@@ -721,6 +799,8 @@ def main(argv=None):
                         help="Download English Wikipedia without prompts: a positive decimal GB amount or full")
     parser.add_argument('--wikipedia-language', action='append', default=[], metavar='CODE=GB_OR_FULL',
                         help='Wikipedia language and per-language limit; repeat or separate with commas')
+    parser.add_argument('--fineweb-edu-translated-language', action='append', default=[], metavar='CODE=GB_OR_FULL',
+                        help='Translated FineWeb-Edu language and limit, e.g. swe=2 or spa=full; repeat or separate with commas')
     parser.add_argument("--ballast-t2", type=parse_limit, default=argparse.SUPPRESS, metavar="GB_OR_FULL",
                         help="Download OpenBallast T2 without prompts: a positive decimal GB amount or full")
     parser.add_argument("--alpaca", type=parse_limit, default=argparse.SUPPRESS, metavar="GB_OR_FULL",
@@ -737,6 +817,11 @@ def main(argv=None):
             choices = wikipedia_selections(item)
             if direct.keys() & choices.keys() or ('wikipedia' in direct and 'wikipedia@en' in choices):
                 raise ValueError('Duplicate Wikipedia language selection')
+            direct.update(choices)
+        for item in args.fineweb_edu_translated_language:
+            choices = translated_selections(item)
+            if direct.keys() & choices.keys():
+                raise ValueError('Duplicate translated FineWeb-Edu language selection')
             direct.update(choices)
     except ValueError as error:
         parser.error(str(error))
